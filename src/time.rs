@@ -1,13 +1,10 @@
-//! RTMP timestamps are 32-bit unsigned integers representing the number of milliseconds from
-//! an unknown epoch.
+//! RTMP timestamps are 32-bit millisecond counters from an unknown epoch.
 //!
-//! Since it's meant to support streams that can go on forever, timestamps have to work with
-//! time values that overflow and underflow a 32 bit integer but still be able to do comparisons.
-//! To support this the `RtmpTimestamp` struct was created to abstract away the calculations
-//! and make it easy to work with RTMP timestamps.
+//! Streams can outlive the 32-bit clock, so raw values wrap. `RtmpTimestamp`
+//! hides the wrap arithmetic and keeps comparison of nearby values simple.
 //!
-//! According to the RTMP spec, times are adjacent if they are within 2<sup>31</sup> - 1 milliseconds
-//! of each other.
+//! Per the RTMP spec, two times are adjacent when they sit within
+//! 2<sup>31</sup> - 1 milliseconds of each other.
 //!
 //! # Examples
 //!

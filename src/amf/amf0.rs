@@ -5,7 +5,7 @@
 // exact reads, strict truncated arrays, property name length enforcement,
 // slice based serialize, borrowed getters, single value helper,
 // and direct conversion to and from Amf3Value.
-use crate::amf_common as common;
+use crate::amf::common;
 use std::io::{self};
 use thiserror::Error;
 

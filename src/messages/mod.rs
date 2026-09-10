@@ -88,8 +88,8 @@ pub enum RtmpMessage {
     /// discard the chunks it has already received.
     Abort { stream_id: u32 },
 
-    /// An acknowledgement sent to confirm how many bytes that has been received since the prevoius
-    /// acknowledgement.
+    /// Confirms how many bytes arrived since the previous acknowledgement.
+    /// The count is cumulative over the connection.
     Acknowledgement { sequence_number: u32 },
 
     /// A command being sent, encoded with amf0 values

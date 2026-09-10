@@ -2,8 +2,8 @@
 // See docs/enhanced-rtmp.md for wire mapping.
 use std::collections::HashMap;
 
-use crate::amf_common as common;
-pub use crate::amf_common::{MAX_COLLECTION_LEN, MAX_DEPTH};
+use crate::amf::common;
+pub use crate::amf::common::{MAX_COLLECTION_LEN, MAX_DEPTH};
 use crate::amf0::Amf0Object;
 use thiserror::Error;
 pub const MAX_STRING_LEN: usize = 4 * 1024 * 1024;
@@ -978,7 +978,7 @@ fn write_blob(
     buf.extend_from_slice(bytes);
     Ok(())
 }
-// Shared wire reads live in amf_common so AMF0 and AMF3 use one
+// Shared wire reads live in amf::common so AMF0 and AMF3 use one
 // implementation. Cursor maps any IO failure to UnexpectedEof to keep
 // truncated payloads strictly typed.
 fn read_exact<R: common::AmfRead>(

@@ -1,16 +1,35 @@
-//! Role-neutral RTMP protocol API: one crate for RTMP wire
-//! protocol plus Enhanced RTMP validation.
+//! Sans-I/O RTMP protocol API with Enhanced RTMP validation.
 //!
-//! The sans-I/O chunking, handshake, message, session, and timestamp machinery
-//! lives in [`chunk_io`], [`handshake`], [`messages`], [`sessions`], and
-//! [`time`]. It derives from RML RTMP (MIT, KallDrexx/rust-media-libs) with
-//! hardening for proxy use (cumulative acknowledgements, resource
-//! limits, interleaved chunk streams, verbatim metadata/connect forwarding);
-//! see `README.md` ("Changes from RML"). Enhanced RTMP media is inspected with
-//! an in-house FLV parser via [`flv`], [`media`], [`metadata`], [`enhanced`],
-//! and [`elementary`]. Original bytes remain authoritative for forwarding; an
-//! elementary-media view of the same tags is available for ingest that does
-//! not wrap FLV.
+//! This crate drives the RTMP state machine. Callers move bytes in and out,
+//! so it embeds in any async runtime or proxy without mandating one.
+//!
+//! Chunk framing lives in [`chunk_io`], the handshake in [`handshake`],
+//! messages in [`messages`], client and server sessions in [`sessions`],
+//! and timestamps in [`time`]. The protocol core derives from RML RTMP
+//! (MIT, KallDrexx/rust-media-libs) with hardening for proxy use:
+//! cumulative acknowledgements, resource limits, interleaved chunk streams,
+//! and verbatim metadata and connect forwarding. See `README.md`
+//! ("Changes from RML") for the full list.
+//!
+//! Enhanced RTMP media is inspected with an in-house FLV parser through
+//! [`flv`], [`media`], [`metadata`], [`enhanced`], and [`elementary`].
+//! Original bytes stay authoritative for forwarding. An elementary-media
+//! view of the same tags serves ingest that does not wrap FLV.
+//!
+//! # Example
+//!
+//! Parse one legacy AAC audio tag and read its classification:
+//!
+//! ```
+//! use bytes::Bytes;
+//! use rtmpx::{EnhancedValidationMode, ValidatedMedia};
+//!
+//! let raw = Bytes::from_static(&[0xAF, 0x00, 0x11, 0x88]);
+//! let media =
+//!     ValidatedMedia::parse_audio(raw.clone(), EnhancedValidationMode::Strict).unwrap();
+//! assert!(media.classification().configuration);
+//! assert_eq!(media.raw(), &raw);
+//! ```
 
 // Protocol core predates strict lints; keep its historical style contained so
 // warnings in the validation code stay visible.
@@ -24,9 +43,6 @@ mod test_utils {
 }
 
 pub mod amf;
-pub mod amf0;
-pub mod amf3;
-pub(crate) mod amf_common;
 #[allow(clippy::all)]
 pub mod chunk_io;
 pub mod elementary;
@@ -44,8 +60,11 @@ pub mod sessions;
 pub mod time;
 
 pub use amf::{AmfEncoding, AmfProperties, AmfRead, AmfValue};
-pub use amf0::{Amf0DeserializationError, Amf0Object, Amf0SerializationError, Amf0Value};
-pub use amf3::{Amf3DeserializationError, Amf3SerializationError, Amf3Value};
+// The AMF codecs live under `amf`. Their modules stay re-exported here so
+// existing `rtmpx::amf0` and `rtmpx::amf3` paths keep working.
+pub use amf::amf0::{Amf0DeserializationError, Amf0Object, Amf0SerializationError, Amf0Value};
+pub use amf::amf3::{Amf3DeserializationError, Amf3SerializationError, Amf3Value};
+pub use amf::{amf0, amf3};
 pub use elementary::{ElementaryCodec, ElementaryUnit};
 pub use enhanced::{EnhancedCapabilities, EnhancedValidationMode};
 pub use media::{

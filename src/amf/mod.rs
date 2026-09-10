@@ -6,15 +6,19 @@
 //! connection, not something a caller can pick when constructing a session, so
 //! it is modelled as [`AmfEncoding`] rather than as a type parameter.
 //!
-//! What generics are good for here is the leaf helpers. Building a status
-//! object or reading a stream key out of a command argument is the same logic
-//! in both encodings and differs only in which constructors it calls, so those
-//! are written once against [`AmfValue`].
+//! Generics serve the leaf helpers. Building a status object or reading a
+//! stream key from a command argument is the same logic in both encodings.
+//! It differs only in the constructors it calls, so it is written once
+//! against [`AmfValue`].
+
+pub mod amf0;
+pub mod amf3;
+pub(crate) mod common;
 
 use indexmap::IndexMap;
 
-use crate::amf0::Amf0Value;
-use crate::amf3::Amf3Value;
+use self::amf0::Amf0Value;
+use self::amf3::Amf3Value;
 
 /// Property view over an object-like AMF value.
 ///
@@ -225,7 +229,7 @@ pub fn status_object<V: AmfValue>(level: &str, code: &str, description: &str) ->
 }
 
 /// Reader extension point for AMF decoders.
-pub use crate::amf_common::AmfRead;
+pub use self::common::AmfRead;
 
 #[cfg(test)]
 mod tests {

@@ -33,21 +33,20 @@ pub use self::result::ServerSessionResult;
 
 /// A session that represents the server side of a single RTMP connection.
 ///
-/// The `ServerSession` encapsulates the process of parsing RTMP chunks coming in from a client
-/// into RTMP messages and performs common server side workflows to handle those messages.  It can
-/// either provide pre-serialized messages to be sent back to the client or events that
-/// parent applications can perform custom logic against (like verifying if a connection request
-/// should be accepted or not).
+/// The `ServerSession` parses inbound RTMP chunks into messages and runs the
+/// common server workflows for them. It answers with pre-serialized messages
+/// or with events that the parent application handles (for example, accept
+/// or reject a connection request).
 ///
-/// The `ServerSession` does not care how RTMP chunks (encoded as bytes) come in or get sent out,
-/// but leaves that up to the application utilizing the `ServerSession`.
+/// The `ServerSession` does not move bytes itself. The application reads
+/// inbound chunk bytes and writes the returned responses.
 ///
-/// Due to the header compression properties of the RTMP chunking protocol it is required that
-/// all bytes **after** the handshake has been completed are passed into the `ServerSession`, that
-/// all responses returned by the `ServerSession` are sent to the client **in order**, and that
-/// no additional bytes are sent to the client.  Any violation of these rules have a high
-/// high probability of causing RTMP chunk parsing errors by the peer or by the `ServerSession`
-/// instance itself.
+/// RTMP chunk headers compress against earlier chunks, so this is required:
+/// pass all bytes received **after** the completed handshake into the
+/// `ServerSession`, send all returned responses to the client **in order**,
+/// and send no other bytes to the client. Any violation of these rules can
+/// cause RTMP chunk parsing errors on the peer or on the `ServerSession`
+/// itself.
 pub struct ServerSession {
     failed: bool,
     start_time: Instant,

@@ -13,14 +13,13 @@ this module is implemented using a clean-room specification found at
 <https://www.cs.cmu.edu/~dst/Adobe/Gallery/RTMPE.txt>.
 
 This handshake module allows for handling both the original and fp9+ handshake methods, and
-determines which method of verification to use based on the packet 1 it receives.  The only
-time this might fail is if a peer only accepts the originally specified RTMP handshake format
-exactly and verifies that bytes 4-7 are zeroes.  At this point in time any (with the prevalence
-of h.264 video) all clients and servers should work against the fp9 method so this should not
-be an issue.
+determines which method of verification to use based on the packet 1 it receives.
+This fails only against a peer that accepts exactly the original RTMP
+handshake and checks that bytes 4-7 are zero. With H.264 video everywhere,
+all current clients and servers use the fp9 method. This is not an issue
+in practice.
 
-**Note:** At this point of time we only accept (and send) command bytes of 3, meaning that
-no encryption is used.
+**Note:** This code only accepts and sends command byte 3. It never encrypts.
 
 */
 
@@ -93,16 +92,15 @@ enum Stage {
 
 /// Struct that handles the handshaking process.
 ///
-/// It should be noted that the current system does not perform validation on the peer's p2 packet.
-/// This is due to the complicated hmac verification.  While this verification was successful when
-/// tested agains OBS, Ffmpeg, Mplayer, and Evostream, but for some reason Flash clients would fail
-/// the hmac verification.
+/// The current code does not validate the peer's p2 packet. The HMAC check
+/// is complex, and although it passed against OBS, FFmpeg, MPlayer, and
+/// Evostream, Flash clients failed it for unknown reasons.
 ///
-/// Due to the documentation on the fp9 handshake being third party, the hmac verification was
-/// removed.  It is now assumed that as long as the peer sent us a p2 packet, and they did not
-/// dicsonnect us after receiving our p2 packet, that the handshake was successful.  This has
-/// allowed us to succeed in handshaking with flash players, and there are still enough checks that
-/// it should be unlikely for too many false positives.
+/// Because the only fp9 handshake description is third-party, the HMAC check
+/// is removed. The handshake counts as successful once the peer sends its p2
+/// packet and stays connected after receiving ours. That is enough to shake
+/// hands with Flash players, and the remaining checks still leave little
+/// room for false positives.
 ///
 /// ## Examples
 ///

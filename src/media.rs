@@ -14,11 +14,26 @@ pub use crate::flv::{ParsedAudio, ParsedVideo};
 
 /// A media payload and its immutable interpretation of the same bytes.
 ///
-/// ```compile_fail
-/// use rtmpx::{ValidatedMedia, EnhancedValidationMode};
+/// `raw` stays authoritative for republishing. The interpretation is a typed
+/// view of those exact bytes, so the two cannot drift apart.
+///
+/// # Example
+///
+/// Parse one Enhanced RTMP Opus frame and confirm the typed view:
+///
+/// ```
 /// use bytes::Bytes;
-/// let mut media = ValidatedMedia::parse_audio(Bytes::from_static(&[0xaf, 1, 0]), EnhancedValidationMode::Strict).unwrap();
-/// media.raw = Bytes::new(); // Would invalidate the interpretation.
+/// use rtmpx::{EnhancedValidationMode, MediaInterpretation, ValidatedMedia};
+///
+/// let raw = Bytes::from_static(b"\x91Opusframe");
+/// let media =
+///     ValidatedMedia::parse_audio(raw.clone(), EnhancedValidationMode::Strict).unwrap();
+/// assert!(media.classification().coded);
+/// assert!(matches!(
+///     media.interpretation(),
+///     MediaInterpretation::Parsed(_)
+/// ));
+/// assert_eq!(media.raw(), &raw);
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValidatedMedia<T> {

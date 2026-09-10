@@ -7,7 +7,7 @@
 //! file demuxer.
 //!
 //! The wire layouts were ported by reference from scuffle-flv 0.2.2 (MIT); no
-//! scuffle code is copied. Deliberate deltas from a full demuxer:
+//! scuffle code is copied. Differences from a full demuxer, by design:
 //!
 //! - Codec configuration records (avcC, hvcC, av1C) are validated
 //!   structurally (magic byte plus length bounds) instead of fully decoded.

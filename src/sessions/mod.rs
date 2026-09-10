@@ -1,15 +1,12 @@
 /*!
-This module contains implemented session abstractions.
+Session abstractions for RTMP clients and servers.
 
-A session is a high level abstraction that makes it simple to create custom RTMP clients and
-servers without having to worry about the exact flow of RTMP messages to perform specific
-actions.  The session has it's own `ChunkSerializer` and `ChunkDeserializer` so consumers only
-have to worry about bytes in and bytes/events out.
+A session hides the RTMP message flow behind bytes in and bytes or events
+out. Each session owns its own `ChunkSerializer` and `ChunkDeserializer`.
+A single session represents one peer of one RTMP connection. A connection
+manager needs one distinct session instance per connection.
 
-A single session represents a single peer in an RTMP connection, so if multiple connections are
-being managed (in any direction) each connection should have its own, distinct, session instance.
-
-It is also expected that a session has been created *after* handshaking has been completed.
+Create a session only after the handshake completes.
 */
 
 pub mod client;

@@ -1,27 +1,23 @@
 /*!
 
-This module contains structs for the serialization and deserialization of RTMP chunks, as described
-in section 5.3 of the [official RTMP specification](https://www.adobe.com/content/dam/acom/en/devnet/rtmp/pdf/rtmp_specification_1.0.pdf).
+Chunk framing for RTMP, as described in section 5.3 of the [official RTMP specification](https://www.adobe.com/content/dam/acom/en/devnet/rtmp/pdf/rtmp_specification_1.0.pdf).
 
-The RTMP chunk format is complicated, and heavily relies on information from previously sent and
-received chunks.  Due to this it is important that every inbound RTMP chunk is deserialized in the
-order it was received, and every outbound RTMP chunk is sent in the order it was received.  It
-also means that a new `ChunkSerializer` or `ChunkDeserializer` cannot be introduced mid-stream, as
-chances are it will cause errors (either locally or on the connected peer).
+RTMP chunks compress their headers against previously sent and received
+chunks. Every inbound chunk must reach the deserializer in the order it
+arrived, and every outbound chunk must reach the peer in the order it was
+created. A `ChunkSerializer` or `ChunkDeserializer` cannot join mid-stream:
+it lacks the history, so it produces errors locally or on the peer.
 
-Inbound bytes that are part of RTMP chunks are deserialized into `MessagePayload`s.  These are data
-structures that contain information about the RTMP message that the chunk contained, such as
-timestamp, type id, the message stream id, etc...
+Inbound chunk bytes become `MessagePayload`s. A payload describes the message
+a chunk carried: timestamp, type id, message stream id, and body.
 
-Outbound RTMP message payloads are serialized into outbound `Packet`s.  These are a thin wrapper
-around the bytes representing the RTMP chunk that was created, but also creates information on if
-the packet is allowed to be dropped or not.  Video and Audio data can uaually be marked as able
-to be dropped in case bandwidth limitations are encountered between the client and the server.  Any
-packet that is *not* marked as being able to be dropped should not be dropped, as that is a pretty
-sure way to cause deserialization errors with the peer.
+Outbound payloads become `Packet`s. A packet wraps the chunk bytes plus a flag
+that tells whether the packet may be dropped. Audio and video packets can
+usually be dropped when bandwidth runs out. Any other packet must not be
+dropped: a gap causes deserialization errors on the peer.
 
-Inbound and outbound binary data relies on the [bytes crate](https://crates.io/crates/bytes) to
-provide input and output buffers with minimal allocations.
+Inbound and outbound buffers use the [bytes crate](https://crates.io/crates/bytes),
+so copies stay minimal.
 
 ## Examples
 
