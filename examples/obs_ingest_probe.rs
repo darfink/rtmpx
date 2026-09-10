@@ -190,7 +190,6 @@ async fn main() -> ProbeResult<()> {
                 }
                 break remaining_bytes;
             }
-            _ => return Err("unsupported protocol result; update the adapter".into()),
         }
     };
 

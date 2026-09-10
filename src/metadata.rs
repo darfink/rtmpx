@@ -35,6 +35,20 @@ pub struct TrackMetadata {
     pub properties: Amf0Object,
 }
 
+impl TrackMetadata {
+    /// Create metadata for one non-default track.
+    ///
+    /// The properties map keeps every declared field, including unknown ones;
+    /// codec is the already-parsed audiocodecid or videocodecid value.
+    pub fn new(track_id: u32, codec: Option<MetadataCodec>, properties: Amf0Object) -> Self {
+        Self {
+            track_id,
+            codec,
+            properties,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum MetadataCodec {

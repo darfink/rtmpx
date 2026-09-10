@@ -116,7 +116,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 break remaining_bytes;
             }
-            _ => return Err("unsupported protocol result; update the adapter".into()),
         }
     };
 
