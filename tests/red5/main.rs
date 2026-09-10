@@ -282,16 +282,42 @@ async fn enhanced_media_body(
     publ.send_video(avc_sequence_header(), 40).await?;
     publ.send_audio(aac_sequence_header(), 40).await?;
 
-    let got = play.collect(1, 1, false).await?;
+    // Red5 may replay the pre-join Enhanced packet as a cached sequence
+    // header, so the first relayed video frame is not always the legacy
+    // header. Wait until the legacy header arrives instead of asserting on
+    // the first packet.
+    let deadline = std::time::Instant::now() + red5.op_timeout;
+    let mut videos: Vec<Vec<u8>> = Vec::new();
+    let mut audios: Vec<Vec<u8>> = Vec::new();
+    while !videos.contains(&avc_sequence_header().to_vec()) || audios.is_empty() {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        for event in play.next_events().await? {
+            match event {
+                ClientSessionEvent::VideoDataReceived { data, .. } => {
+                    videos.push(data.to_vec());
+                }
+                ClientSessionEvent::AudioDataReceived { data, .. } => {
+                    audios.push(data.to_vec());
+                }
+                _ => {}
+            }
+        }
+    }
     assert!(
-        got.video.contains(&avc_sequence_header().to_vec()),
+        videos.contains(&avc_sequence_header().to_vec()),
         "legacy video must still flow after Enhanced input"
+    );
+    assert!(
+        !audios.is_empty(),
+        "legacy audio must still flow after Enhanced input"
     );
     eprintln!(
         "red5 characterization [{tag}]: publish accepted; player saw {} video / {} audio packets (Enhanced relayed: {})",
-        got.video.len(),
-        got.audio.len(),
-        got.video.iter().any(|v| v == &enhanced.to_vec()),
+        videos.len(),
+        audios.len(),
+        videos.iter().any(|v| v == &enhanced.to_vec()),
     );
     Ok(())
 }
