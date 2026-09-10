@@ -197,7 +197,7 @@ fn play(pump: &mut Pump, stream_key: &str) -> u32 {
     assert!(
         pump.take_client_events()
             .iter()
-            .any(|event| matches!(event, ClientSessionEvent::PlaybackRequestAccepted { .. })),
+            .any(|event| matches!(event, ClientSessionEvent::PlaybackRequestAccepted)),
         "client must see Play.Start"
     );
     stream_id

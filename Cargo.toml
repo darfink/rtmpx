@@ -27,13 +27,34 @@ bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
 
 [features]
-# Opt-in live interop suite against a real Red5 server (see tests/red5/README.md).
-# The `red5` integration target is excluded from default runs via
-# `required-features`, so `cargo test` runs only the default suite. Run it with:
+# Opt-in live interop suites, one per third party (see tests/red5/README.md
+# and tests/ffmpeg/README.md).
+# Each live integration target is excluded from default runs via
+# required-features, so plain cargo test runs only the default suite.
 #   cargo test --test red5 --features red5-live
 red5-live = []
+
+# Opt-in live interop suite against real ffmpeg/ffprobe binaries.
+# Same gating, run it with:
+#   cargo test --test ffmpeg --features ffmpeg-live
+ffmpeg-live = []
+
+# Opt-in live interop suite against real GStreamer (gst-launch-1.0).
+# Same gating, run it with:
+#   cargo test --test gstreamer --features gstreamer-live
+gstreamer-live = []
 
 [[test]]
 name = "red5"
 path = "tests/red5/main.rs"
 required-features = ["red5-live"]
+
+[[test]]
+name = "ffmpeg"
+path = "tests/ffmpeg/main.rs"
+required-features = ["ffmpeg-live"]
+
+[[test]]
+name = "gstreamer"
+path = "tests/gstreamer/main.rs"
+required-features = ["gstreamer-live"]

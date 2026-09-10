@@ -77,6 +77,22 @@ AMF0 codec derived from `rml_amf0` 0.3.0.
 - Protocol-core files keep their upstream formatting; do not run `cargo fmt`
   across them.
 
+## Examples
+
+Minimal client and server to copy the sans-I/O glue from:
+
+- examples/publish.rs -- barebone publisher (connect, publish, metadata,
+  audio/video). Media bytes are placeholders; swap in real frames.
+- examples/serve.rs -- barebone listener (handshake, accept, per-frame
+  logging). Accepts ffmpeg, OBS, or the publisher above.
+- examples/obs_ingest_probe.rs -- manual probe that logs exactly what a real
+  OBS build sends, for eyeballing new OBS versions.
+
+Run the listener, then publish into it:
+
+    cargo run --example serve
+    cargo run --example publish -- 127.0.0.1:1935 live demo
+
 ## Enhanced RTMP
 
 Validated against Enhanced RTMP v2 r2 (VSO, 2026-01-31); see

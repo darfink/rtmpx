@@ -179,4 +179,61 @@ mod tests {
             "Third message was not deserialized as expected"
         );
     }
+    #[test]
+    fn can_round_trip_timestamps_across_u32_wraparound() {
+        // A stream that stays live past the u32 millisecond rollover (~49 days)
+        // must keep monotonically advancing timestamps on the wire: the delta
+        // after the wrap is the forward distance mod 2^32, and a later delta
+        // larger than 0xFFFFFF must take the extended-timestamp path.
+        let input1 = MessagePayload {
+            timestamp: RtmpTimestamp::new(u32::MAX - 10),
+            message_stream_id: 1,
+            type_id: 8,
+            data: Bytes::from(vec![0xAF, 0x01, 0x02]),
+        };
+        let input2 = MessagePayload {
+            timestamp: RtmpTimestamp::new(20),
+            message_stream_id: 1,
+            type_id: 8,
+            data: Bytes::from(vec![0xAF, 0x01, 0x03]),
+        };
+        let input3 = MessagePayload {
+            timestamp: RtmpTimestamp::new(20 + 16777225),
+            message_stream_id: 1,
+            type_id: 8,
+            data: Bytes::from(vec![0xAF, 0x01, 0x04]),
+        };
+
+        let mut serializer = ChunkSerializer::new();
+        let packet1 = serializer.serialize(&input1, false, false).unwrap();
+        let packet2 = serializer.serialize(&input2, false, false).unwrap();
+        let packet3 = serializer.serialize(&input3, false, false).unwrap();
+
+        let mut deserializer = ChunkDeserializer::new();
+        let output1 = deserializer
+            .get_next_message(&packet1.bytes)
+            .unwrap()
+            .unwrap();
+        let output2 = deserializer
+            .get_next_message(&packet2.bytes)
+            .unwrap()
+            .unwrap();
+        let output3 = deserializer
+            .get_next_message(&packet3.bytes)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            output1, input1,
+            "Pre-wrap message was not deserialized as expected"
+        );
+        assert_eq!(
+            output2, input2,
+            "Post-wrap message timestamp did not survive the u32 rollover"
+        );
+        assert_eq!(
+            output3, input3,
+            "Large post-wrap delta did not survive the extended-timestamp path"
+        );
+    }
 }

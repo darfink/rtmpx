@@ -1,19 +1,17 @@
 # Red5 live-interop harness (`rtmpx`)
 
-Optional end-to-end suite of `rtmpx` against a real Red5 server, plus real
-`ffmpeg` publishing into our `ServerSession`. It is the only test that talks
-to third-party RTMP implementations instead of to itself.
+Optional end-to-end suite of `rtmpx` against a real Red5 server: our client
+against an independent server implementation. For the other direction (our
+server against an independent encoder and player), see `tests/ffmpeg/README.md`.
 
 ## Why Red5
 
 Unit tests prove self-consistency; they cannot catch a framing rule both sides
 of the same codebase get wrong together. Red5 is an independent Java RTMP
 server (AMF0 + AMF3, plaintext handshake, `live` app relays publisher bytes
-opaquely) and `ffmpeg` is an independent native encoder. Together they cover
-both directions:
-
-- our **client** against an independent **server** (Red5 legs),
-- our **server** against an independent **client** (ffmpeg leg).
+opaquely). This suite covers our **client** against that independent
+**server**; the companion `tests/ffmpeg` suite covers our **server** against
+an independent encoder and player.
 
 AMF3 covers the command/data plane only; media packets are unaffected. So the
 AMF3 legs validate exactly the layer the `objectEncoding` work changed.
@@ -34,8 +32,7 @@ required-features = ["red5-live"]
   built, no network touched.
 - `cargo test --test red5 --features red5-live` builds and runs
   the live suite. It expects Red5 on `RED5_HOST:RED5_PORT` (see below) and
-  fails with a start hint otherwise; the ffmpeg leg skips loudly when no
-  `ffmpeg` binary is on `PATH`.
+  fails with a start hint otherwise.
 
 CI runs the second command against a containerised Red5 (see Workflows).
 
@@ -52,11 +49,15 @@ rtmpx/
   tests/enhanced_loopback.rs  # default suite: Enhanced hvc1/av01 relay byte-exact
   tests/obs_ingest.rs         # default suite: OBS connect/releaseStream/FCPublish sequence
   tests/red5/
-    main.rs                   # live matrix (rows 1-13 below)
-    harness.rs                # async TCP + handshake + ClientSession driver
-    server_harness.rs         # one-shot ServerSession ingesting real ffmpeg / relaying to ffmpeg
+  tests/common/               # shared by the live suites (not a test target)
+    mod.rs                    # Result, stream_key, run backstop, legacy_metadata
+    driver.rs                 # async TCP + handshake + ClientSession driver
+  tests/ffmpeg/               # ffmpeg interop suite (see its README)
+  tests/red5/
+    main.rs                   # live matrix (rows 1-10 below)
+    harness.rs                # Red5 endpoint (RED5_* env) + objectEncoding reader
     fixtures.rs               # legacy AVC/AAC, Enhanced hvc1/av01, AMF3 probe body
-  .github/workflows/ci.yml  # CI: default + live Red5 jobs
+  .github/workflows/ci.yml  # CI: default + live Red5 + live ffmpeg jobs
 ```
 
 ## Matrix
@@ -78,9 +79,6 @@ subscribed, so every `R` test subscribes the player first.
 | 8 | (covered) | AMF3 | Enhanced hvc1 | (folded into row 7 shape) | same characterization shape |
 | 9 | P | AMF0 + AMF3 | caps advertisement | `connect_forwards_enhanced_capabilities_amf0/_amf3` | connect carrying full E-RTMP advertisement (`fourCcList`, `capsEx`, `videoFourCcInfoMap`, `audioFourCcInfoMap`, `videoFunction`) is accepted and publish proceeds |
 | 10 | R | AMF3 | type-15 script data | `amf3_script_data_survives_red5` | `@setDataFrame`/`onMetaData` body with `rtmpxRed5Probe` marker relayed to player; connection stays usable afterwards |
-| 11 | ingest | AMF0 | ffmpeg AVC/AAC | `ffmpeg_publishes_to_our_server` | real ffmpeg lands on `live` app + stream key, `\u22651` metadata event, `\u22652` audio, `\u22655` video, first video is AVC seq header (`17 00`), first audio is AAC (`Ax`), negotiates AMF0 |
-| 12 | ingest | AMF0 | ffmpeg Enhanced HEVC | `ffmpeg_enhanced_publishes_to_our_server` | real ffmpeg libx265 lands `hvc1` FourCC (bytes 1..5, not legacy `17`), at least 2 video; proves our server decodes third-party Enhanced |
-| 13 | egress | AMF0 | our publish -> ffmpeg play | `our_server_relays_to_ffmpeg_player` | our client publishes real FLV-extracted H.264/AAC into our server, ffmpeg plays `rtmp://` and records; ffprobe asserts `h264`+`aac` (`codec_type=video/audio`). Fake fixtures fail here: only valid SPS/PPS passes ffprobe |
 
 Rows 5-8 are characterization, not assertion: Red5 has no Enhanced media
 path, so there is no correct relay behaviour to pin. They prove the
@@ -137,11 +135,13 @@ Red5's stock `live` app needs no config for this suite.
 
 ## Workflows
 
-`.github/workflows/ci.yml` holds both jobs:
+`.github/workflows/ci.yml` holds three jobs:
 
 - `default` runs `cargo test --locked` - no Red5, no network.
-- `red5` starts the pinned Red5 container, waits for port 1935, installs
-  ffmpeg (the Ubuntu `ffmpeg` package also provides `ffprobe`), runs
+- `red5` starts the pinned Red5 container, waits for port 1935, runs
   `cargo test --test red5 --features red5-live`, then dumps Red5 logs.
+- `ffmpeg` installs ffmpeg (the Ubuntu `ffmpeg` package also provides
+  `ffprobe`) and runs `cargo test --test ffmpeg --features ffmpeg-live` -
+  no server container needed.
 
 The workflow runs on PRs, pushes to main, manual dispatch, and a weekly schedule.

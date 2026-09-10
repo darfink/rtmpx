@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
-use super::harness::Result;
+use super::common::Result;
 
 pub struct IngestedMedia {
     pub app: String,
@@ -92,7 +92,7 @@ async fn write_server_results(
                     // Informational only: no outstanding request to accept.
                 }
                 other => {
-                    eprintln!("red5 harness: ignoring ffmpeg event: {other:?}");
+                    eprintln!("ffmpeg harness: ignoring ffmpeg event: {other:?}");
                 }
             },
             ServerSessionResult::UnhandleableMessageReceived(_) => {}
@@ -399,8 +399,9 @@ pub async fn ingest_enhanced_from_ffmpeg(
 /// our server can feed an independent player.
 ///
 /// Shape: loopback TCP server with two sequential connections — first our
-/// `ClientSession` publishes (via `super::harness::Peer`, same driver Red5
-/// uses), then ffmpeg plays (`-c copy` to a temp FLV). Media is the exact
+/// ClientSession publishes (via the shared client driver in tests/common,
+/// the same driver the Red5 suite uses), then ffmpeg plays
+/// (-c copy to a temp FLV). Media is the exact
 /// bytes the server ingested, re-stamped monotonically, so the assertion is
 /// end-to-end: publisher bytes -> server -> ffmpeg file -> ffprobe streams.
 pub struct PlayedFile {
@@ -541,7 +542,7 @@ pub async fn relay_our_publish_to_ffmpeg(
     audio: Vec<bytes::Bytes>,
     wall_clock: Duration,
 ) -> Result<PlayedFile> {
-    use super::harness::{Peer, Red5};
+    use super::common::driver::{Endpoint, Peer};
     use rtmpx::time::RtmpTimestamp;
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -555,20 +556,21 @@ pub async fn relay_our_publish_to_ffmpeg(
     let out_path = temp_flv_path("relay");
     let out_str = out_path.to_string_lossy().to_string();
 
-    // Publisher task: our own client against our own server, same driver as Red5.
+    // Publisher task: our own client against our own server, via the shared driver.
     let pub_key = stream_key.to_string();
     let pub_addr = addr.clone();
     let pub_meta = metadata.clone();
     let pub_video = video.clone();
     let pub_audio = audio.clone();
     let publisher = tokio::spawn(async move {
-        let red5 = Red5 {
+        let endpoint = Endpoint {
             addr: pub_addr,
             app: "live".to_string(),
             op_timeout: Duration::from_secs(15),
+            unreachable_hint: None,
         };
         let (mut peer, _, _) =
-            Peer::connect(&red5, AmfEncoding::Amf0, rtmpx::amf0::Amf0Object::new()).await?;
+            Peer::connect(&endpoint, AmfEncoding::Amf0, rtmpx::amf0::Amf0Object::new()).await?;
         peer.publish(&pub_key).await?;
         peer.send_metadata(&pub_meta).await?;
         for (i, v) in pub_video.iter().enumerate() {

@@ -7,22 +7,6 @@
 
 use bytes::Bytes;
 use rtmpx::amf3::Amf3Value;
-use rtmpx::sessions::StreamMetadata;
-
-/// onMetaData the harness publishes: legacy AVC + AAC hints.
-pub fn legacy_metadata() -> StreamMetadata {
-    let mut m = StreamMetadata::new();
-    m.video_width = Some(1280);
-    m.video_height = Some(720);
-    m.video_codec_id = Some(7); // AVC
-    m.video_frame_rate = Some(30.0);
-    m.audio_codec_id = Some(10); // AAC
-    m.audio_sample_rate = Some(44100);
-    m.audio_channels = Some(2);
-    m.audio_is_stereo = Some(true);
-    m.encoder = Some("rtmpx-red5-harness".to_string());
-    m
-}
 
 /// Legacy AVC sequence header (0x17 0x00) with a plausible
 /// AVCDecoderConfigurationRecord. Red5 relays it; the player compares bytes.

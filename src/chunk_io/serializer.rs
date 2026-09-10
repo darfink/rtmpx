@@ -186,7 +186,13 @@ impl ChunkSerializer {
                         // we risk the peer not being able to deserialize this packet.
                         ChunkHeaderFormat::Full
                     } else {
-                        // TODO: Update to support rtmp time wrap-around
+                        // RTMP timestamps are u32 milliseconds and roll over roughly every
+                        // 49 days. `RtmpTimestamp` subtraction wraps mod 2^32, so for a
+                        // monotonically advancing stream this delta is the forward distance
+                        // even across the rollover (e.g. 20 - (u32::MAX - 10) == 31), and
+                        // the deserializer adds it back with wrapping addition. Pinned by
+                        // `timestamp_delta_wraps_around_u32_boundary` and
+                        // `can_round_trip_timestamps_across_u32_wraparound`.
                         header.timestamp_field =
                             (header.timestamp - previous_header.timestamp).value;
                         get_header_format(&mut header, previous_header)
@@ -1100,6 +1106,51 @@ mod tests {
             &payload_bytes[..bytes_read],
             &message1.data[..],
             "Unexpected payload contents"
+        );
+    }
+    #[test]
+    fn timestamp_delta_wraps_around_u32_boundary() {
+        // A stream that stays live past the u32 millisecond rollover (~49 days):
+        // the message before the wrap sits just below `u32::MAX`, the next one
+        // just above zero. The on-wire delta must be the forward distance mod
+        // 2^32, i.e. 20 - (u32::MAX - 10) == 31, not a backwards jump.
+        let message1 = MessagePayload {
+            timestamp: RtmpTimestamp::new(u32::MAX - 10),
+            type_id: 8,
+            message_stream_id: 1,
+            data: Bytes::from(vec![0xAF, 0x01, 0x02]),
+        };
+        let message2 = MessagePayload {
+            timestamp: RtmpTimestamp::new(20),
+            type_id: 8,
+            message_stream_id: 1,
+            data: Bytes::from(vec![0xAF, 0x01, 0x03]),
+        };
+
+        let mut serializer = ChunkSerializer::new();
+        let packet1 = serializer.serialize(&message1, false, false).unwrap();
+        let packet2 = serializer.serialize(&message2, false, false).unwrap();
+
+        // Audio (type 8) rides chunk stream 5; the first message is a full header.
+        let mut cursor = Cursor::new(packet1.bytes);
+        assert_eq!(
+            cursor.read_u8().unwrap(),
+            5 | 0b00000000,
+            "First chunk after idle must be a full (type 0) header"
+        );
+
+        // Same stream/type/length with a nonzero delta compresses to a
+        // time-delta-only (type 2) header carrying the wrapped delta.
+        let mut cursor = Cursor::new(packet2.bytes);
+        assert_eq!(
+            cursor.read_u8().unwrap(),
+            5 | 0b10000000,
+            "Chunk after wrap-around must stay a time-delta-only (type 2) header"
+        );
+        assert_eq!(
+            cursor.read_u24::<BigEndian>().unwrap(),
+            31,
+            "Delta across the u32 rollover must wrap mod 2^32"
         );
     }
 }
