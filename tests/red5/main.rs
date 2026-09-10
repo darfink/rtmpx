@@ -256,8 +256,9 @@ async fn amf3_script_data_body() -> Result<()> {
         for event in play.next_events().await? {
             if let ClientSessionEvent::StreamMetadataReceived { raw_payload, .. } = event {
                 let bytes = raw_payload.to_vec();
+                let marker = b"rtmpxRed5Probe";
                 assert!(
-                    bytes.windows(11).any(|w| w == b"rtmpxRed5Probe"),
+                    bytes.windows(marker.len()).any(|w| w == marker),
                     "relayed AMF3 metadata must carry our marker field, got {bytes:?}"
                 );
                 return Ok(());

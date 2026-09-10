@@ -70,6 +70,10 @@ AMF0 codec derived from `rml_amf0` 0.3.0.
   authoritative for relay.
 - Also: `deleteStream` accepts GStreamer decimal-string stream ids, clients see
   full result property maps, publish modes match case-insensitively.
+- Playback interop: `play` always sends `start` (`-2.0`, live-first default) -
+  strict servers ignore single-argument `play` -- and script data still
+  arrives when mistyped (client unwraps `@setDataFrame`, type 18 falls back
+  to bare AMF3).
 - Protocol-core files keep their upstream formatting; do not run `cargo fmt`
   across them.
 

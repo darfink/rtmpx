@@ -395,13 +395,18 @@ fn successful_play_request_workflow() {
             assert_eq!(command_object, Amf0Value::Null, "Unexpected command object");
             assert_eq!(
                 additional_arguments.len(),
-                1,
+                2,
                 "Unexpected number of additional arguments"
             );
             assert_eq!(
                 additional_arguments[0],
                 Amf0Value::Utf8String(stream_key.clone()),
                 "Unexpected stream key"
+            );
+            assert_eq!(
+                additional_arguments[1],
+                Amf0Value::Number(-2.0),
+                "Unexpected play start argument (must be -2: live first)"
             );
         }
 
@@ -507,6 +512,66 @@ fn active_play_session_raises_events_when_stream_metadata_changes() {
                 Some(true),
                 "Unexpected audio is stereo value"
             );
+            assert_eq!(
+                metadata.encoder,
+                Some("Test Encoder".to_string()),
+                "Unexpected encoder value"
+            );
+        }
+
+        x => panic!(
+            "Expected stream metadata received event, instead received: {:?}",
+            x
+        ),
+    }
+}
+
+#[test]
+fn active_play_session_unwraps_set_data_frame_metadata() {
+    // Publishers wrap `onMetaData` in `@setDataFrame` (and relays pass
+    // that framing through); the player must unwrap it into a metadata
+    // event instead of ignoring it.
+    let config = ClientSessionConfig::new();
+    let mut deserializer = ChunkDeserializer::new();
+    let mut serializer = ChunkSerializer::new();
+    let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
+    consume_results(&mut deserializer, initial_results);
+
+    perform_successful_connect(
+        "test".to_string(),
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    let stream_id =
+        perform_successful_play_request(config, &mut session, &mut serializer, &mut deserializer);
+
+    let mut properties = Amf0Object::new();
+    properties.insert("width".to_string(), Amf0Value::Number(1920_f64));
+    properties.insert(
+        "encoder".to_string(),
+        Amf0Value::Utf8String("Test Encoder".to_string()),
+    );
+
+    let message = RtmpMessage::Amf0Data {
+        values: vec![
+            Amf0Value::Utf8String("@setDataFrame".to_string()),
+            Amf0Value::Utf8String("onMetaData".to_string()),
+            Amf0Value::Object(properties),
+        ],
+    };
+
+    let payload = message
+        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .unwrap();
+    let packet = serializer.serialize(&payload, false, false).unwrap();
+    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let (_, mut events) = split_results(&mut deserializer, results);
+
+    assert_eq!(events.len(), 1, "Unexpected number of events received");
+    match events.remove(0) {
+        ClientSessionEvent::StreamMetadataReceived { metadata, .. } => {
+            assert_eq!(metadata.video_width, Some(1920), "Unexpected video width");
             assert_eq!(
                 metadata.encoder,
                 Some("Test Encoder".to_string()),
@@ -712,13 +777,18 @@ fn can_receive_audio_data_prior_to_play_request_being_accepted() {
             assert_eq!(command_object, Amf0Value::Null, "Unexpected command object");
             assert_eq!(
                 additional_arguments.len(),
-                1,
+                2,
                 "Unexpected number of additional arguments"
             );
             assert_eq!(
                 additional_arguments[0],
                 Amf0Value::Utf8String(stream_key.clone()),
                 "Unexpected stream key"
+            );
+            assert_eq!(
+                additional_arguments[1],
+                Amf0Value::Number(-2.0),
+                "Unexpected play start argument (must be -2: live first)"
             );
         }
 
@@ -857,13 +927,18 @@ fn can_receive_video_data_prior_to_play_request_being_accepted() {
             assert_eq!(command_object, Amf0Value::Null, "Unexpected command object");
             assert_eq!(
                 additional_arguments.len(),
-                1,
+                2,
                 "Unexpected number of additional arguments"
             );
             assert_eq!(
                 additional_arguments[0],
                 Amf0Value::Utf8String(stream_key.clone()),
                 "Unexpected stream key"
+            );
+            assert_eq!(
+                additional_arguments[1],
+                Amf0Value::Number(-2.0),
+                "Unexpected play start argument (must be -2: live first)"
             );
         }
 
@@ -1889,13 +1964,18 @@ fn perform_successful_play_request(
             assert_eq!(command_object, Amf0Value::Null, "Unexpected command object");
             assert_eq!(
                 additional_arguments.len(),
-                1,
+                2,
                 "Unexpected number of additional arguments"
             );
             assert_eq!(
                 additional_arguments[0],
                 Amf0Value::Utf8String(stream_key.clone()),
                 "Unexpected stream key"
+            );
+            assert_eq!(
+                additional_arguments[1],
+                Amf0Value::Number(-2.0),
+                "Unexpected play start argument (must be -2: live first)"
             );
         }
 

@@ -805,6 +805,21 @@ impl ClientSession {
                 self.handle_amf0_data_on_meta_data(data, timestamp, raw_payload)
             }
 
+            // Encoders wrap `onMetaData` in `@setDataFrame`; unwrap it the
+            // same way the server leg does so playback observes metadata
+            // regardless of which framing the publisher used.
+            Amf0Value::Utf8String(ref value) if value == "@setDataFrame" => {
+                if data.len() < 2 {
+                    return Ok(Vec::new());
+                }
+                match &data[0] {
+                    Amf0Value::Utf8String(name) if name == "onMetaData" => (),
+                    _ => return Ok(Vec::new()),
+                }
+                data.remove(0);
+                self.handle_amf0_data_on_meta_data(data, timestamp, raw_payload)
+            }
+
             _ => Ok(Vec::new()),
         }
     }
@@ -1000,7 +1015,14 @@ impl ClientSession {
                             command_name: "play".to_string(),
                             transaction_id: 0.0,
                             command_object: Amf0Value::Null,
-                            additional_arguments: vec![Amf0Value::Utf8String(stream_key)],
+                            // Always send the `start` argument (-2 = live first, then
+                            // recorded, the RTMP default). Red5 silently ignores a
+                            // single-argument `play`; ffmpeg and other players always
+                            // include `start`, so mirror that for interop.
+                            additional_arguments: vec![
+                                Amf0Value::Utf8String(stream_key),
+                                Amf0Value::Number(-2.0),
+                            ],
                         };
 
                         let play_payload =

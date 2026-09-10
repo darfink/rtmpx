@@ -1,4 +1,5 @@
 use super::types;
+use crate::amf::AmfEncoding;
 use crate::messages::RtmpMessage;
 use crate::messages::{MessageDeserializationError, MessageSerializationError};
 use crate::time::RtmpTimestamp;
@@ -72,7 +73,7 @@ impl MessagePayload {
             15 => types::amf3_data::deserialize(self.data.clone()),
             16 => types::shared_object::deserialize_amf3(self.data.clone()),
             17 => types::amf3_command::deserialize(self.data.clone()),
-            18 => types::amf0_data::deserialize(self.data.clone()),
+            18 => Self::deserialize_data_tolerant(self.data.clone()),
             19 => types::shared_object::deserialize_amf0(self.data.clone()),
             20 => types::amf0_command::deserialize(self.data.clone()),
 
@@ -80,6 +81,28 @@ impl MessagePayload {
                 type_id: self.type_id,
                 data: self.data.clone(),
             }),
+        }
+    }
+
+    /// Type 18 is AMF0 on the wire, but peers in the wild mistype AMF3
+    /// script-data bodies under it (raw AMF3 values, no format selector).
+    /// Try the declared encoding first so well-formed traffic is
+    /// unaffected, then bare AMF3 before giving up instead of killing the
+    /// session on one mistyped message. A mistyped body normalizes to
+    /// `Amf3Data`; the original bytes stay on the payload for relays.
+    fn deserialize_data_tolerant(data: Bytes) -> Result<RtmpMessage, MessageDeserializationError> {
+        match types::amf0_data::deserialize(data.clone()) {
+            Ok(message) => Ok(message),
+            Err(first) => {
+                let mut cursor = std::io::Cursor::new(data);
+                match crate::amf3::deserialize(&mut cursor) {
+                    Ok(values) => Ok(RtmpMessage::Amf3Data {
+                        values,
+                        format: AmfEncoding::Amf3,
+                    }),
+                    Err(_) => Err(first),
+                }
+            }
         }
     }
 
@@ -562,6 +585,73 @@ mod tests {
             RtmpMessage::Amf3Data { values, format } => {
                 assert_eq!(values, vec![crate::amf3::Amf3Value::Double(23.3)]);
                 assert_eq!(format, crate::amf::AmfEncoding::Amf0);
+            }
+            other => panic!("expected AMF3 data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn amf3_values_typed_as_amf0_data_decode() {
+        // A mistyping peer sends raw AMF3 values (no format selector)
+        // under type 18. The declared AMF0 encoding fails first, then
+        // bare AMF3 is tried before giving up.
+        let values = vec![
+            crate::amf3::Amf3Value::String("@setDataFrame".to_string()),
+            crate::amf3::Amf3Value::String("onMetaData".to_string()),
+            crate::amf3::Amf3Value::Double(1.5),
+        ];
+        let payload = MessagePayload {
+            timestamp: RtmpTimestamp::new(0),
+            type_id: 18,
+            message_stream_id: 1,
+            data: Bytes::from(crate::amf3::serialize(&values).unwrap()),
+        };
+        match payload
+            .to_rtmp_message()
+            .expect("AMF3 body on type 18 must decode")
+        {
+            RtmpMessage::Amf3Data {
+                values: got,
+                format,
+            } => {
+                assert_eq!(got, values);
+                assert_eq!(format, crate::amf::AmfEncoding::Amf3);
+            }
+            other => panic!("expected AMF3 data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observed_mistyped_set_data_frame_decodes() {
+        // Exact script-data body observed mistyped as type 18: the AMF3
+        // `@setDataFrame` probe with its marker object.
+        let raw = vec![
+            0x06, 0x1b, 0x40, 0x73, 0x65, 0x74, 0x44, 0x61, 0x74, 0x61, 0x46, 0x72, 0x61, 0x6d,
+            0x65, 0x06, 0x15, 0x6f, 0x6e, 0x4d, 0x65, 0x74, 0x61, 0x44, 0x61, 0x74, 0x61, 0x0a,
+            0x0b, 0x01, 0x1d, 0x72, 0x74, 0x6d, 0x70, 0x78, 0x52, 0x65, 0x64, 0x35, 0x50, 0x72,
+            0x6f, 0x62, 0x65, 0x04, 0x2a, 0x0f, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x65, 0x72, 0x06,
+            0x2f, 0x72, 0x74, 0x6d, 0x70, 0x78, 0x2d, 0x72, 0x65, 0x64, 0x35, 0x2d, 0x68, 0x61,
+            0x72, 0x6e, 0x65, 0x73, 0x73, 0x2d, 0x61, 0x6d, 0x66, 0x33, 0x01,
+        ];
+        let payload = MessagePayload {
+            timestamp: RtmpTimestamp::new(0),
+            type_id: 18,
+            message_stream_id: 1,
+            data: Bytes::from(raw),
+        };
+        match payload
+            .to_rtmp_message()
+            .expect("mistyped probe body must decode")
+        {
+            RtmpMessage::Amf3Data { values, .. } => {
+                assert_eq!(
+                    values[0],
+                    crate::amf3::Amf3Value::String("@setDataFrame".to_string())
+                );
+                assert_eq!(
+                    values[1],
+                    crate::amf3::Amf3Value::String("onMetaData".to_string())
+                );
             }
             other => panic!("expected AMF3 data, got {other:?}"),
         }
