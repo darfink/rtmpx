@@ -1,0 +1,19 @@
+# Local + CI entrypoint for the Red5 live-interop harness.
+# Usage (from the crate root): docker compose -f tests/red5/docker-compose.yml up -d --build
+services:
+  red5:
+    build:
+      context: .
+      dockerfile: red5.dockerfile
+    image: rtmpx-red5:2.0.40
+    container_name: rtmpx-red5
+    ports:
+      - "1935:1935"
+      - "5080:5080"
+    healthcheck:
+      # Red5 takes 10-30 s to boot; probe the RTMP port, not HTTP.
+      test: ["CMD-SHELL", "(exec 3<>/dev/tcp/127.0.0.1/1935) 2>/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s

@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  pull_request:
+    paths:
+      - '**'
+  push:
+    branches: [main]
+
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  default:
+    name: Default suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rtmpx-ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rtmpx-ci-
+
+      - name: Test (default, no Red5/network)
+        run: cargo test --locked
+
+  red5:
+    name: Red5 interop (live)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rtmpx-red5-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rtmpx-red5-
+
+      - name: Install ffmpeg (independent encoder leg)
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+
+      - name: Start pinned Red5
+        run: docker compose -f tests/red5/docker-compose.yml up -d --build
+
+      - name: Wait for Red5 RTMP (port 1935)
+        run: |
+          for _ in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/1935) 2>/dev/null; then
+              echo "Red5 RTMP is up"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Red5 never opened 1935" >&2
+          docker compose -f tests/red5/docker-compose.yml logs red5
+          exit 1
+
+      - name: Red5 interop (live, third-party peers)
+        run: cargo test --test red5 --features red5-live --locked
+        env:
+          RED5_HOST: 127.0.0.1
+          RED5_PORT: "1935"
+          RED5_APP: live
+
+      - name: Red5 logs
+        if: always()
+        run: docker compose -f tests/red5/docker-compose.yml logs red5
+
+      - name: Stop Red5
+        if: always()
+        run: docker compose -f tests/red5/docker-compose.yml down -v

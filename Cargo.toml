@@ -1,0 +1,39 @@
+[package]
+name = "rtmpx"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+description = "Sans-I/O (Enhanced) RTMP protocol API with AMF0/AMF3"
+repository = "https://github.com/darfink/rtmpx"
+readme = "README.md"
+keywords = ["rtmp", "amf", "flv", "streaming", "media"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+bytes = "1"
+indexmap = "2"
+scuffle-flv = "0.2.2"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+byteorder = "1.3"
+rand = "0.8"
+hmac = "0.10"
+sha2 = "0.9"
+
+[dev-dependencies]
+pretty_assertions = "1"
+bytes = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
+
+[features]
+# Opt-in live interop suite against a real Red5 server (see tests/red5/README.md).
+# The `red5` integration target is excluded from default runs via
+# `required-features`, so `cargo test` runs only the default suite. Run it with:
+#   cargo test --test red5 --features red5-live
+red5-live = []
+
+[[test]]
+name = "red5"
+path = "tests/red5/main.rs"
+required-features = ["red5-live"]
