@@ -71,6 +71,7 @@ impl Pump {
                 }
                 ClientSessionResult::RaisedEvent(event) => self.client_events.push(event),
                 ClientSessionResult::UnhandleableMessageReceived(_) => {}
+                #[allow(unreachable_patterns)]
                 _ => panic!("unexpected future protocol variant"),
             }
         }
@@ -93,6 +94,7 @@ impl Pump {
                 }
                 ServerSessionResult::RaisedEvent(event) => self.server_events.push(event),
                 ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                #[allow(unreachable_patterns)]
                 _ => panic!("unexpected future protocol variant"),
             }
         }
@@ -388,6 +390,7 @@ fn feed_server(
             }
             ServerSessionResult::RaisedEvent(event) => events.push(event),
             ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            #[allow(unreachable_patterns)]
             _ => panic!("unexpected future protocol variant"),
         }
     }

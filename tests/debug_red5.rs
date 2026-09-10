@@ -37,6 +37,7 @@ async fn run_debug(encoding: AmfEncoding, tag: &str) {
                 carry = remaining_bytes;
                 break;
             }
+            #[allow(unreachable_patterns)]
             _ => panic!("unexpected future protocol variant"),
         }
     }
@@ -113,6 +114,7 @@ async fn run_debug(encoding: AmfEncoding, tag: &str) {
                             ClientSessionResult::UnhandleableMessageReceived(m) => {
                                 eprintln!("[{tag}]   unhandleable: {m:?}")
                             }
+                            #[allow(unreachable_patterns)]
                             &_ => panic!("unexpected future protocol variant"),
                         }
                     }
@@ -213,6 +215,7 @@ async fn pump_flight(
                     ClientSessionResult::UnhandleableMessageReceived(m) => {
                         eprintln!("[{tag}]   unhandleable: {m:?}")
                     }
+                    #[allow(unreachable_patterns)]
                     &_ => panic!("unexpected future protocol variant"),
                 }
             }
@@ -254,6 +257,7 @@ async fn debug_amf3_publish_flow() {
                 carry = remaining_bytes;
                 break;
             }
+            #[allow(unreachable_patterns)]
             _ => panic!("unexpected future protocol variant"),
         }
     }

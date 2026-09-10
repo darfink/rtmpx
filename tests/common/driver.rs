@@ -84,6 +84,7 @@ impl Peer {
                 }
                 ClientSessionResult::RaisedEvent(event) => events.push(event),
                 ClientSessionResult::UnhandleableMessageReceived(_) => {}
+                #[allow(unreachable_patterns)]
                 _ => panic!("unexpected future protocol variant"),
             }
         }
@@ -172,6 +173,7 @@ impl Peer {
                     }
                     return Ok(());
                 }
+                #[allow(unreachable_patterns)]
                 _ => panic!("unexpected future protocol variant"),
             }
         }
