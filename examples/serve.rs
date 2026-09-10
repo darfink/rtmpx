@@ -17,7 +17,9 @@
 //! send_video_data / send_audio_data is the natural next step (the relay
 //! test in tests/ffmpeg shows the fan-out side).
 use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rtmpx::sessions::{ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult};
+use rtmpx::sessions::{
+    ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -129,7 +131,11 @@ async fn handle_one(
             stream.flush().await?;
         }
         ServerSessionResult::RaisedEvent(event) => match event {
-            ServerSessionEvent::ConnectionRequested { request_id, app_name, .. } => {
+            ServerSessionEvent::ConnectionRequested {
+                request_id,
+                app_name,
+                ..
+            } => {
                 println!("connect: app '{app_name}'");
                 follow.extend(session.accept_request(request_id)?);
             }
@@ -150,14 +156,18 @@ async fn handle_one(
                     metadata.encoder,
                 );
             }
-            ServerSessionEvent::AudioDataReceived { data, timestamp, .. } => {
+            ServerSessionEvent::AudioDataReceived {
+                data, timestamp, ..
+            } => {
                 stats.audio_frames += 1;
                 stats.audio_bytes += data.len() as u64;
                 if stats.audio_frames == 1 {
                     println!("first audio: {} bytes @ {}", data.len(), timestamp.value);
                 }
             }
-            ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
+            ServerSessionEvent::VideoDataReceived {
+                data, timestamp, ..
+            } => {
                 stats.video_frames += 1;
                 stats.video_bytes += data.len() as u64;
                 if stats.video_frames == 1 {

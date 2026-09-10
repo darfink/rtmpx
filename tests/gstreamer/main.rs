@@ -299,7 +299,9 @@ pub async fn ingest_from_gst(stream_key: &str, wall_clock: Duration) -> Result<I
 
 async fn gstreamer_ingest_body() -> Result<()> {
     if !gst_available() {
-        eprintln!("gstreamer harness: SKIP gstreamer_publishes_to_our_server (no gst-launch-1.0 on PATH)");
+        eprintln!(
+            "gstreamer harness: SKIP gstreamer_publishes_to_our_server (no gst-launch-1.0 on PATH)"
+        );
         return Ok(());
     }
     let key = stream_key("gstreamer");
@@ -330,10 +332,17 @@ async fn gstreamer_ingest_body() -> Result<()> {
         !got.audio.iter().any(Vec::is_empty) && !got.video.iter().any(Vec::is_empty),
         "media payloads must be non-empty"
     );
-    assert_eq!(got.negotiated, AmfEncoding::Amf0, "gstreamer negotiates AMF0");
+    assert_eq!(
+        got.negotiated,
+        AmfEncoding::Amf0,
+        "gstreamer negotiates AMF0"
+    );
     // First video packet of an H.264 RTMP stream is the AVC sequence header.
     assert_eq!(got.video[0][0], 0x17, "first video must be keyframe AVC");
-    assert_eq!(got.video[0][1], 0x00, "first video must be a sequence header");
+    assert_eq!(
+        got.video[0][1], 0x00,
+        "first video must be a sequence header"
+    );
     assert_eq!(
         got.audio[0][0] & 0xF0,
         0xA0,

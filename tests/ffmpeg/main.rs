@@ -71,7 +71,9 @@ async fn ffmpeg_publishes_to_our_server() {
 
 async fn ffmpeg_enhanced_ingest_body() -> Result<()> {
     if !server_harness::ffmpeg_available().await {
-        eprintln!("ffmpeg harness: SKIP ffmpeg_enhanced_publishes_to_our_server (no ffmpeg on PATH)");
+        eprintln!(
+            "ffmpeg harness: SKIP ffmpeg_enhanced_publishes_to_our_server (no ffmpeg on PATH)"
+        );
         return Ok(());
     }
     let key = stream_key("ffmpeg-hvc1");

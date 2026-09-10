@@ -52,7 +52,6 @@ AMF0 codec derived from `rml_amf0` 0.3.0.
 - The AMF0 codec is hardened (depth/collection caps, exact reads, strict arrays, long-string/date/xml/typed-object/avmplus markers, no `drain(..3)` panic) with `rml_amf0` kept as an alias; a new AMF3 codec converts losslessly both ways; Enhanced RTMP is validated via `scuffle-flv` with original bytes authoritative for relay.
 - Also: `deleteStream` accepts GStreamer decimal-string stream ids, clients see full result property maps, publish modes match case-insensitively.
 - Playback interop: `play` always sends `start` (`-2.0`, live-first default) - strict servers ignore single-argument `play` -- and script data still arrives when mistyped (client unwraps `@setDataFrame`, type 18 falls back to bare AMF3).
-- Protocol-core files keep their upstream formatting; do not run `cargo fmt` across them.
 
 ## Examples
 

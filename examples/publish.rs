@@ -75,8 +75,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:1935".to_string());
-    let app = std::env::args().nth(2).unwrap_or_else(|| "live".to_string());
-    let stream_key = std::env::args().nth(3).unwrap_or_else(|| "demo".to_string());
+    let app = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "live".to_string());
+    let stream_key = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "demo".to_string());
     let mut buf = vec![0u8; 16 * 1024];
 
     let mut stream = TcpStream::connect(&addr).await?;
