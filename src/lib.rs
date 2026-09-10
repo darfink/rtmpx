@@ -7,8 +7,8 @@
 //! hardening for proxy use (cumulative acknowledgements, resource
 //! limits, interleaved chunk streams, verbatim metadata/connect forwarding);
 //! see `README.md` ("Changes from RML"). Enhanced RTMP media is inspected with
-//! `scuffle-flv` via [`media`], [`metadata`], [`enhanced`], and
-//! [`elementary`]. Original bytes remain authoritative for forwarding; an
+//! an in-house FLV parser via [`flv`], [`media`], [`metadata`], [`enhanced`],
+//! and [`elementary`]. Original bytes remain authoritative for forwarding; an
 //! elementary-media view of the same tags is available for ingest that does
 //! not wrap FLV.
 
@@ -31,6 +31,7 @@ pub(crate) mod amf_common;
 pub mod chunk_io;
 pub mod elementary;
 pub mod enhanced;
+pub mod flv;
 #[allow(clippy::all)]
 pub mod handshake;
 pub mod media;
@@ -42,7 +43,6 @@ pub mod sessions;
 #[allow(clippy::all)]
 pub mod time;
 
-pub use self::amf0 as rml_amf0;
 pub use amf::{AmfEncoding, AmfProperties, AmfValue};
 pub use amf0::{Amf0DeserializationError, Amf0Object, Amf0SerializationError, Amf0Value};
 pub use amf3::{Amf3DeserializationError, Amf3SerializationError, Amf3Value};

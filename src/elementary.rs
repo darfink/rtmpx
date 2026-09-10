@@ -1,40 +1,25 @@
 //! Elementary access units from validated RTMP media.
 //!
-//! `scuffle-flv` stays inside this crate. Callers receive length-prefixed video,
-//! raw AAC or Opus, and decoder-configuration records (`avcC` / `hvcC` / `av1C` /
-//! AudioSpecificConfig / OpusHead) without seeing Annex-B, ADTS, or FLV tag layout.
+//! The in-house FLV parser stays inside this crate. Callers receive
+//! length-prefixed video, raw AAC or Opus, and decoder-configuration records
+//! (avcC / hvcC / av1C / AudioSpecificConfig / OpusHead) without seeing
+//! Annex-B, ADTS, or FLV tag layout. Sequence-start bytes are forwarded as raw
+//! slices of the input; nothing is re-serialized.
 
 use bytes::Bytes;
-use scuffle_flv::{
-    audio::{
-        body::{
-            AudioTagBody,
-            enhanced::{AudioPacket, ExAudioTagBody},
-            legacy::{LegacyAudioTagBody, aac::AacAudioData},
-        },
-        header::enhanced::AudioFourCc,
-    },
-    video::{
-        body::{
-            VideoTagBody,
-            enhanced::{
-                ExVideoTagBody, VideoPacket, VideoPacketCodedFrames, VideoPacketSequenceStart,
-            },
-            legacy::LegacyVideoTagBody,
-        },
-        header::{
-            VideoFrameType, VideoTagHeaderData,
-            enhanced::VideoFourCc,
-            legacy::{LegacyVideoTagHeader, LegacyVideoTagHeaderAvcPacket},
-        },
-    },
-};
 
 use crate::{
-    MediaInterpretation, ParsedAudio, ParsedVideo, ValidatedMedia, media::MediaValidationError,
+    MediaInterpretation, ParsedAudio, ParsedVideo, ValidatedMedia,
+    flv::{
+        AudioFourCc, AudioPacket, AudioTagBody, EnhancedAudioBody, EnhancedVideoBody,
+        LegacyAudioBody, LegacyAvcPacket, LegacyVideoBody, LegacyVideoHeader,
+        VIDEO_FRAME_GENERATED_KEY, VIDEO_FRAME_KEY, VideoFourCc, VideoPacket, VideoTagBody,
+        VideoTagHeaderData,
+    },
+    media::MediaValidationError,
 };
 
-/// Codecs this ingest path can present as elementary access units.
+// Codecs this ingest path can present as elementary access units.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ElementaryCodec {
     Avc,
@@ -54,20 +39,20 @@ impl ElementaryCodec {
     }
 }
 
-/// One validated RTMP message, reduced to decoder config or a coded sample.
+// One validated RTMP message, reduced to decoder config or a coded sample.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ElementaryUnit {
     Configuration {
         codec: ElementaryCodec,
         extradata: Bytes,
-        /// Enhanced RTMP track id when the message names one; legacy is `None`.
+        // Enhanced RTMP track id when the message names one; legacy is None.
         track_id: Option<u8>,
     },
     Sample {
         codec: ElementaryCodec,
         payload: Bytes,
         keyframe: bool,
-        /// Composition offset in milliseconds on the RTMP clock. Audio is 0.
+        // Composition offset in milliseconds on the RTMP clock. Audio is 0.
         composition_time_offset: i32,
         track_id: Option<u8>,
     },
@@ -80,7 +65,7 @@ impl ElementaryUnit {
         }
     }
 
-    /// Enhanced RTMP track id when the message names one; legacy is `None`.
+    // Enhanced RTMP track id when the message names one; legacy is None.
     pub fn track_id(&self) -> Option<u8> {
         match self {
             Self::Configuration { track_id, .. } | Self::Sample { track_id, .. } => *track_id,
@@ -89,12 +74,12 @@ impl ElementaryUnit {
 }
 
 impl ValidatedMedia<ParsedAudio> {
-    /// Maps a validated audio message onto elementary units.
-    ///
-    /// Unmapped codecs (MP3, AC-3, …) and sequence-end / channel-config
-    /// signalling yield an empty list so the session can ignore them. One
-    /// Enhanced tag may carry several tracks; each mapped track is its own
-    /// unit so a packed `ManyTracks` message does not drop siblings.
+    // Maps a validated audio message onto elementary units.
+    //
+    // Unmapped codecs (MP3, AC-3, and friends) and sequence-end /
+    // channel-config signalling yield an empty list so the session can ignore
+    // them. One Enhanced tag may carry several tracks; each mapped track is
+    // its own unit so a packed ManyTracks message does not drop siblings.
     pub fn elementary_units(&self) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
         match &self.interpretation {
             MediaInterpretation::Opaque { reason } => Err(MediaValidationError::Malformed {
@@ -102,14 +87,14 @@ impl ValidatedMedia<ParsedAudio> {
                 reason: reason.clone(),
             }),
             MediaInterpretation::Parsed(parsed) => match &parsed.body {
-                AudioTagBody::Legacy(LegacyAudioTagBody::Aac(AacAudioData::SequenceHeader(_))) => {
+                AudioTagBody::Legacy(LegacyAudioBody::AacSequenceHeader(_)) => {
                     Ok(vec![ElementaryUnit::Configuration {
                         codec: ElementaryCodec::Aac,
                         extradata: slice_after(&self.raw, LEGACY_AAC_HEADER_BYTES, "audio")?,
                         track_id: None,
                     }])
                 }
-                AudioTagBody::Legacy(LegacyAudioTagBody::Aac(AacAudioData::Raw(_))) => {
+                AudioTagBody::Legacy(LegacyAudioBody::AacRaw(_)) => {
                     Ok(vec![ElementaryUnit::Sample {
                         codec: ElementaryCodec::Aac,
                         payload: slice_after(&self.raw, LEGACY_AAC_HEADER_BYTES, "audio")?,
@@ -124,16 +109,16 @@ impl ValidatedMedia<ParsedAudio> {
         }
     }
 
-    /// The first mapped unit, when the tag carries only one.
+    // The first mapped unit, when the tag carries only one.
     pub fn elementary_unit(&self) -> Result<Option<ElementaryUnit>, MediaValidationError> {
         Ok(self.elementary_units()?.into_iter().next())
     }
 }
 
 impl ValidatedMedia<ParsedVideo> {
-    /// Maps a validated video message onto elementary units.
-    ///
-    /// A packed Enhanced `ManyTracks` tag yields one unit per mapped track.
+    // Maps a validated video message onto elementary units.
+    //
+    // A packed Enhanced ManyTracks tag yields one unit per mapped track.
     pub fn elementary_units(&self) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
         match &self.interpretation {
             MediaInterpretation::Opaque { reason } => Err(MediaValidationError::Malformed {
@@ -141,12 +126,12 @@ impl ValidatedMedia<ParsedVideo> {
                 reason: reason.clone(),
             }),
             MediaInterpretation::Parsed(parsed) => {
-                let keyframe = parsed.header.frame_type == VideoFrameType::KeyFrame
-                    || parsed.header.frame_type == VideoFrameType::GeneratedKeyFrame;
+                let keyframe = parsed.header.frame_type == VIDEO_FRAME_KEY
+                    || parsed.header.frame_type == VIDEO_FRAME_GENERATED_KEY;
                 match (&parsed.header.data, &parsed.body) {
                     (
-                        VideoTagHeaderData::Legacy(LegacyVideoTagHeader::AvcPacket(
-                            LegacyVideoTagHeaderAvcPacket::SequenceHeader,
+                        VideoTagHeaderData::Legacy(LegacyVideoHeader::AvcPacket(
+                            LegacyAvcPacket::SequenceHeader,
                         )),
                         _,
                     ) => Ok(vec![ElementaryUnit::Configuration {
@@ -155,17 +140,17 @@ impl ValidatedMedia<ParsedVideo> {
                         track_id: None,
                     }]),
                     (
-                        VideoTagHeaderData::Legacy(LegacyVideoTagHeader::AvcPacket(
-                            LegacyVideoTagHeaderAvcPacket::Nalu {
+                        VideoTagHeaderData::Legacy(LegacyVideoHeader::AvcPacket(
+                            LegacyAvcPacket::Nalu {
                                 composition_time_offset,
                             },
                         )),
-                        VideoTagBody::Legacy(LegacyVideoTagBody::Other { .. }),
+                        VideoTagBody::Legacy(LegacyVideoBody::Other(_)),
                     ) => Ok(vec![ElementaryUnit::Sample {
                         codec: ElementaryCodec::Avc,
                         payload: slice_after(&self.raw, LEGACY_AVC_HEADER_BYTES, "video")?,
                         keyframe,
-                        composition_time_offset: signed_cts(*composition_time_offset),
+                        composition_time_offset: *composition_time_offset,
                         track_id: None,
                     }]),
                     (_, VideoTagBody::Enhanced(body)) => enhanced_video(body, keyframe),
@@ -175,7 +160,7 @@ impl ValidatedMedia<ParsedVideo> {
         }
     }
 
-    /// The first mapped unit, when the tag carries only one.
+    // The first mapped unit, when the tag carries only one.
     pub fn elementary_unit(&self) -> Result<Option<ElementaryUnit>, MediaValidationError> {
         Ok(self.elementary_units()?.into_iter().next())
     }
@@ -198,32 +183,17 @@ fn slice_after(
     Ok(raw.slice(header_bytes..))
 }
 
-/// FLV stores composition time as signed 24-bit; the demuxer surfaces it as `u32`.
-fn signed_cts(value: u32) -> i32 {
-    let value = value & 0x00ff_ffff;
-    if value & 0x0080_0000 == 0 {
-        value as i32
-    } else {
-        (value | 0xff00_0000) as i32
-    }
-}
-
-fn enhanced_audio(body: &ExAudioTagBody) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
+fn enhanced_audio(body: &EnhancedAudioBody) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
     match body {
-        ExAudioTagBody::NoMultitrack {
-            audio_four_cc,
-            packet,
-        } => Ok(audio_packet(*audio_four_cc, packet, None)?
-            .into_iter()
-            .collect()),
-        ExAudioTagBody::ManyTracks(tracks) => {
+        EnhancedAudioBody::NoMultitrack { four_cc, packet } => {
+            Ok(audio_packet(*four_cc, packet, None)?.into_iter().collect())
+        }
+        EnhancedAudioBody::ManyTracks(tracks) => {
             let mut units = Vec::with_capacity(tracks.len());
             for track in tracks {
-                if let Some(unit) = audio_packet(
-                    track.audio_four_cc,
-                    &track.packet,
-                    Some(track.audio_track_id),
-                )? {
+                if let Some(unit) =
+                    audio_packet(track.four_cc, &track.packet, Some(track.track_id))?
+                {
                     units.push(unit);
                 }
             }
@@ -233,26 +203,22 @@ fn enhanced_audio(body: &ExAudioTagBody) -> Result<Vec<ElementaryUnit>, MediaVal
 }
 
 fn enhanced_video(
-    body: &ExVideoTagBody<'_>,
+    body: &EnhancedVideoBody,
     keyframe: bool,
 ) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
     match body {
-        ExVideoTagBody::Command => Ok(Vec::new()),
-        ExVideoTagBody::NoMultitrack {
-            video_four_cc,
-            packet,
-        } => Ok(video_packet(*video_four_cc, packet, keyframe, None)?
-            .into_iter()
-            .collect()),
-        ExVideoTagBody::ManyTracks(tracks) => {
+        EnhancedVideoBody::Command => Ok(Vec::new()),
+        EnhancedVideoBody::NoMultitrack { four_cc, packet } => {
+            Ok(video_packet(*four_cc, packet, keyframe, None)?
+                .into_iter()
+                .collect())
+        }
+        EnhancedVideoBody::ManyTracks(tracks) => {
             let mut units = Vec::with_capacity(tracks.len());
             for track in tracks {
-                if let Some(unit) = video_packet(
-                    track.video_four_cc,
-                    &track.packet,
-                    keyframe,
-                    Some(track.video_track_id),
-                )? {
+                if let Some(unit) =
+                    video_packet(track.four_cc, &track.packet, keyframe, Some(track.track_id))?
+                {
                     units.push(unit);
                 }
             }
@@ -266,18 +232,18 @@ fn audio_packet(
     packet: &AudioPacket,
     track_id: Option<u8>,
 ) -> Result<Option<ElementaryUnit>, MediaValidationError> {
-    let codec = match four_cc {
-        AudioFourCc::Aac => ElementaryCodec::Aac,
-        AudioFourCc::Opus => ElementaryCodec::Opus,
+    let codec = match four_cc.0 {
+        v if v == *b"mp4a" => ElementaryCodec::Aac,
+        v if v == *b"Opus" => ElementaryCodec::Opus,
         _ => return Ok(None),
     };
     match packet {
-        AudioPacket::SequenceStart { header_data } => Ok(Some(ElementaryUnit::Configuration {
+        AudioPacket::SequenceStart(data) => Ok(Some(ElementaryUnit::Configuration {
             codec,
-            extradata: header_data.clone(),
+            extradata: data.clone(),
             track_id,
         })),
-        AudioPacket::CodedFrames { data } => Ok(Some(ElementaryUnit::Sample {
+        AudioPacket::CodedFrames(data) => Ok(Some(ElementaryUnit::Sample {
             codec,
             payload: data.clone(),
             keyframe: true,
@@ -290,43 +256,33 @@ fn audio_packet(
 
 fn video_packet(
     four_cc: VideoFourCc,
-    packet: &VideoPacket<'_>,
+    packet: &VideoPacket,
     keyframe: bool,
     track_id: Option<u8>,
 ) -> Result<Option<ElementaryUnit>, MediaValidationError> {
-    let codec = match four_cc {
-        VideoFourCc::Avc => ElementaryCodec::Avc,
-        VideoFourCc::Hevc => ElementaryCodec::Hevc,
-        VideoFourCc::Av1 => ElementaryCodec::Av1,
+    let codec = match four_cc.0 {
+        v if v == *b"avc1" => ElementaryCodec::Avc,
+        v if v == *b"hvc1" => ElementaryCodec::Hevc,
+        v if v == *b"av01" => ElementaryCodec::Av1,
         _ => return Ok(None),
     };
     match packet {
-        VideoPacket::SequenceStart(start) => Ok(Some(ElementaryUnit::Configuration {
+        VideoPacket::SequenceStart(data) => Ok(Some(ElementaryUnit::Configuration {
             codec,
-            extradata: sequence_start_bytes(start)?,
+            extradata: data.clone(),
             track_id,
         })),
-        VideoPacket::CodedFrames(frames) => {
-            let (payload, composition_time_offset) = match frames {
-                VideoPacketCodedFrames::Avc {
-                    composition_time_offset,
-                    data,
-                }
-                | VideoPacketCodedFrames::Hevc {
-                    composition_time_offset,
-                    data,
-                } => (data.clone(), *composition_time_offset),
-                VideoPacketCodedFrames::Other(data) => (data.clone(), 0),
-            };
-            Ok(Some(ElementaryUnit::Sample {
-                codec,
-                payload,
-                keyframe,
-                composition_time_offset,
-                track_id,
-            }))
-        }
-        VideoPacket::CodedFramesX { data } => Ok(Some(ElementaryUnit::Sample {
+        VideoPacket::CodedFrames {
+            composition_time_offset,
+            data,
+        } => Ok(Some(ElementaryUnit::Sample {
+            codec,
+            payload: data.clone(),
+            keyframe,
+            composition_time_offset: *composition_time_offset,
+            track_id,
+        })),
+        VideoPacket::CodedFramesX(data) => Ok(Some(ElementaryUnit::Sample {
             codec,
             payload: data.clone(),
             keyframe,
@@ -334,42 +290,6 @@ fn video_packet(
             track_id,
         })),
         _ => Ok(None),
-    }
-}
-
-fn sequence_start_bytes(start: &VideoPacketSequenceStart) -> Result<Bytes, MediaValidationError> {
-    match start {
-        VideoPacketSequenceStart::Avc(record) => {
-            let mut bytes = Vec::new();
-            record
-                .build(&mut bytes)
-                .map_err(|error| MediaValidationError::Malformed {
-                    kind: "video",
-                    reason: format!("could not serialize avcC: {error}"),
-                })?;
-            Ok(Bytes::from(bytes))
-        }
-        VideoPacketSequenceStart::Hevc(record) => {
-            let mut bytes = Vec::new();
-            record
-                .mux(&mut bytes)
-                .map_err(|error| MediaValidationError::Malformed {
-                    kind: "video",
-                    reason: format!("could not serialize hvcC: {error}"),
-                })?;
-            Ok(Bytes::from(bytes))
-        }
-        VideoPacketSequenceStart::Av1(record) => {
-            let mut bytes = Vec::new();
-            record
-                .mux(&mut bytes)
-                .map_err(|error| MediaValidationError::Malformed {
-                    kind: "video",
-                    reason: format!("could not serialize av1C: {error}"),
-                })?;
-            Ok(Bytes::from(bytes))
-        }
-        VideoPacketSequenceStart::Other(bytes) => Ok(bytes.clone()),
     }
 }
 

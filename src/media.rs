@@ -1,43 +1,23 @@
-use std::io::Cursor;
-
 use bytes::Bytes;
-use scuffle_flv::{
-    audio::{
-        AudioData,
-        body::{
-            AudioTagBody,
-            enhanced::{AudioPacket, ExAudioTagBody},
-            legacy::{LegacyAudioTagBody, aac::AacAudioData},
-        },
-        header::{
-            AudioTagHeader,
-            enhanced::{AudioPacketModEx, ExAudioTagHeaderContent},
-        },
-    },
-    video::{
-        VideoData,
-        body::{
-            VideoTagBody,
-            enhanced::{ExVideoTagBody, VideoPacket},
-            legacy::LegacyVideoTagBody,
-        },
-        header::{
-            VideoFrameType, VideoTagHeaderData,
-            enhanced::{ExVideoTagHeaderContent, VideoPacketModEx},
-            legacy::{LegacyVideoTagHeader, LegacyVideoTagHeaderAvcPacket},
-        },
-    },
-};
 use thiserror::Error;
 
-use crate::EnhancedValidationMode;
+use crate::{
+    EnhancedValidationMode,
+    flv::{
+        AudioHeaderContent, AudioPacket, AudioTagBody, AudioTagHeader, EnhancedAudioBody,
+        EnhancedVideoBody, LegacyAudioBody, LegacyAvcPacket, LegacyVideoBody, LegacyVideoHeader,
+        VIDEO_FRAME_KEY, VideoHeaderContent, VideoPacket, VideoTagBody, VideoTagHeaderData,
+    },
+};
 
-/// A raw media payload plus its typed FLV interpretation.
+pub use crate::flv::{ParsedAudio, ParsedVideo};
+
+// A raw media payload plus its typed FLV interpretation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValidatedMedia<T> {
-    /// Original RTMP message body. This is authoritative for republishing.
+    // Original RTMP message body. This is authoritative for republishing.
     pub raw: Bytes,
-    /// Parsed interpretation, or an opaque reason in passthrough mode.
+    // Parsed interpretation, or an opaque reason in passthrough mode.
     pub interpretation: MediaInterpretation<T>,
 }
 
@@ -47,19 +27,14 @@ pub enum MediaInterpretation<T> {
     Opaque { reason: String },
 }
 
-/// Owned typed audio interpretation from `scuffle-flv`.
-pub type ParsedAudio = AudioData;
-/// Owned typed video interpretation from `scuffle-flv`.
-pub type ParsedVideo = VideoData<'static>;
-
-/// Media facts needed by relays without exposing FLV parser internals.
+// Media facts needed by relays without exposing FLV parser internals.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MediaClassification {
-    /// The message contains one or more coded media frames.
+    // The message contains one or more coded media frames.
     pub coded: bool,
-    /// The message carries a codec configuration/sequence header.
+    // The message carries a codec configuration/sequence header.
     pub configuration: bool,
-    /// A coded video message is marked as a keyframe.
+    // A coded video message is marked as a keyframe.
     pub keyframe: bool,
 }
 
@@ -74,8 +49,7 @@ impl ValidatedMedia<ParsedAudio> {
         raw: Bytes,
         mode: EnhancedValidationMode,
     ) -> Result<Self, MediaValidationError> {
-        let mut reader = Cursor::new(raw.clone());
-        match AudioData::demux(&mut reader) {
+        match ParsedAudio::demux(&raw) {
             Ok(parsed) => finish_audio(raw, parsed, mode),
             Err(error) if mode == EnhancedValidationMode::Passthrough => Ok(Self {
                 raw,
@@ -90,26 +64,25 @@ impl ValidatedMedia<ParsedAudio> {
         }
     }
 
-    /// Classify a validated audio message. Opaque passthrough messages are
-    /// deliberately left unclassified rather than guessed from raw bytes.
+    // Classify a validated audio message. Opaque passthrough messages are
+    // deliberately left unclassified rather than guessed from raw bytes.
     pub fn classification(&self) -> MediaClassification {
         let MediaInterpretation::Parsed(parsed) = &self.interpretation else {
             return MediaClassification::default();
         };
         match &parsed.body {
-            AudioTagBody::Legacy(LegacyAudioTagBody::Aac(AacAudioData::SequenceHeader(_))) => {
+            AudioTagBody::Legacy(LegacyAudioBody::AacSequenceHeader(_)) => MediaClassification {
+                configuration: true,
+                ..Default::default()
+            },
+            AudioTagBody::Legacy(LegacyAudioBody::AacRaw(_) | LegacyAudioBody::Other(_)) => {
                 MediaClassification {
-                    configuration: true,
+                    coded: true,
                     ..Default::default()
                 }
             }
-            AudioTagBody::Legacy(LegacyAudioTagBody::Aac(AacAudioData::Raw(_)))
-            | AudioTagBody::Legacy(LegacyAudioTagBody::Other { .. }) => MediaClassification {
-                coded: true,
-                ..Default::default()
-            },
             AudioTagBody::Enhanced(body) => classify_enhanced_audio(body),
-            AudioTagBody::Legacy(LegacyAudioTagBody::Aac(AacAudioData::Unknown { .. })) => {
+            AudioTagBody::Legacy(LegacyAudioBody::AacUnknown { .. }) => {
                 MediaClassification::default()
             }
         }
@@ -121,8 +94,7 @@ impl ValidatedMedia<ParsedVideo> {
         raw: Bytes,
         mode: EnhancedValidationMode,
     ) -> Result<Self, MediaValidationError> {
-        let mut reader = Cursor::new(raw.clone());
-        match VideoData::demux(&mut reader) {
+        match ParsedVideo::demux(&raw) {
             Ok(parsed) => finish_video(raw, parsed, mode),
             Err(error) if mode == EnhancedValidationMode::Passthrough => Ok(Self {
                 raw,
@@ -137,16 +109,16 @@ impl ValidatedMedia<ParsedVideo> {
         }
     }
 
-    /// Classify a validated video message across legacy and Enhanced RTMP.
+    // Classify a validated video message across legacy and Enhanced RTMP.
     pub fn classification(&self) -> MediaClassification {
         let MediaInterpretation::Parsed(parsed) = &self.interpretation else {
             return MediaClassification::default();
         };
-        let keyframe = parsed.header.frame_type == VideoFrameType::KeyFrame;
+        let keyframe = parsed.header.frame_type == VIDEO_FRAME_KEY;
         match (&parsed.header.data, &parsed.body) {
             (
-                VideoTagHeaderData::Legacy(LegacyVideoTagHeader::AvcPacket(
-                    LegacyVideoTagHeaderAvcPacket::SequenceHeader,
+                VideoTagHeaderData::Legacy(LegacyVideoHeader::AvcPacket(
+                    LegacyAvcPacket::SequenceHeader,
                 )),
                 _,
             ) => MediaClassification {
@@ -154,29 +126,27 @@ impl ValidatedMedia<ParsedVideo> {
                 ..Default::default()
             },
             (
-                VideoTagHeaderData::Legacy(LegacyVideoTagHeader::AvcPacket(
-                    LegacyVideoTagHeaderAvcPacket::Nalu { .. },
-                )),
+                VideoTagHeaderData::Legacy(LegacyVideoHeader::AvcPacket(LegacyAvcPacket::Nalu {
+                    ..
+                })),
                 _,
             ) => MediaClassification {
                 coded: true,
                 keyframe,
                 configuration: false,
             },
-            (VideoTagHeaderData::Legacy(LegacyVideoTagHeader::AvcPacket(_)), _) => {
+            (VideoTagHeaderData::Legacy(LegacyVideoHeader::AvcPacket(_)), _) => {
                 MediaClassification::default()
             }
-            (VideoTagHeaderData::Legacy(LegacyVideoTagHeader::VideoCommand(_)), _)
-            | (_, VideoTagBody::Legacy(LegacyVideoTagBody::Command)) => {
-                MediaClassification::default()
-            }
-            (_, VideoTagBody::Legacy(LegacyVideoTagBody::AvcVideoPacketSeqHdr(_))) => {
+            (VideoTagHeaderData::Legacy(LegacyVideoHeader::VideoCommand(_)), _)
+            | (_, VideoTagBody::Legacy(LegacyVideoBody::Command)) => MediaClassification::default(),
+            (_, VideoTagBody::Legacy(LegacyVideoBody::AvcSequenceHeader(_))) => {
                 MediaClassification {
                     configuration: true,
                     ..Default::default()
                 }
             }
-            (_, VideoTagBody::Legacy(LegacyVideoTagBody::Other { .. })) => MediaClassification {
+            (_, VideoTagBody::Legacy(LegacyVideoBody::Other(_))) => MediaClassification {
                 coded: true,
                 keyframe,
                 configuration: false,
@@ -186,16 +156,16 @@ impl ValidatedMedia<ParsedVideo> {
     }
 }
 
-fn classify_enhanced_audio(body: &ExAudioTagBody) -> MediaClassification {
+fn classify_enhanced_audio(body: &EnhancedAudioBody) -> MediaClassification {
     let mut classification = MediaClassification::default();
     let mut classify = |packet: &AudioPacket| match packet {
-        AudioPacket::SequenceStart { .. } => classification.configuration = true,
-        AudioPacket::CodedFrames { .. } => classification.coded = true,
+        AudioPacket::SequenceStart(_) => classification.configuration = true,
+        AudioPacket::CodedFrames(_) => classification.coded = true,
         _ => {}
     };
     match body {
-        ExAudioTagBody::NoMultitrack { packet, .. } => classify(packet),
-        ExAudioTagBody::ManyTracks(tracks) => {
+        EnhancedAudioBody::NoMultitrack { packet, .. } => classify(packet),
+        EnhancedAudioBody::ManyTracks(tracks) => {
             for track in tracks {
                 classify(&track.packet);
             }
@@ -204,26 +174,26 @@ fn classify_enhanced_audio(body: &ExAudioTagBody) -> MediaClassification {
     classification
 }
 
-fn classify_enhanced_video(body: &ExVideoTagBody<'_>, keyframe: bool) -> MediaClassification {
+fn classify_enhanced_video(body: &EnhancedVideoBody, keyframe: bool) -> MediaClassification {
     let mut classification = MediaClassification::default();
-    let mut classify = |packet: &VideoPacket<'_>| match packet {
+    let mut classify = |packet: &VideoPacket| match packet {
         VideoPacket::SequenceStart(_) | VideoPacket::Mpeg2TsSequenceStart(_) => {
             classification.configuration = true;
         }
-        VideoPacket::CodedFrames(_) | VideoPacket::CodedFramesX { .. } => {
+        VideoPacket::CodedFrames { .. } | VideoPacket::CodedFramesX(_) => {
             classification.coded = true;
             classification.keyframe |= keyframe;
         }
         _ => {}
     };
     match body {
-        ExVideoTagBody::NoMultitrack { packet, .. } => classify(packet),
-        ExVideoTagBody::ManyTracks(tracks) => {
+        EnhancedVideoBody::NoMultitrack { packet, .. } => classify(packet),
+        EnhancedVideoBody::ManyTracks(tracks) => {
             for track in tracks {
                 classify(&track.packet);
             }
         }
-        ExVideoTagBody::Command => {}
+        EnhancedVideoBody::Command => {}
     }
     classification
 }
@@ -274,27 +244,22 @@ fn validate_audio_unknowns(parsed: &ParsedAudio) -> Result<(), String> {
     let AudioTagHeader::Enhanced(header) = &parsed.header else {
         return Ok(());
     };
-    if header
-        .audio_packet_mod_exs
-        .iter()
-        .any(|value| matches!(value, AudioPacketModEx::Other { .. }))
-    {
+    if header.has_unknown_modex {
         return Err("unknown audio ModEx type".to_owned());
     }
-    if matches!(header.content, ExAudioTagHeaderContent::Unknown { .. }) {
+    if matches!(header.content, AudioHeaderContent::Unknown { .. }) {
         return Err("unknown audio multitrack type".to_owned());
     }
     let AudioTagBody::Enhanced(body) = &parsed.body else {
         return Ok(());
     };
     match body {
-        ExAudioTagBody::NoMultitrack {
-            audio_four_cc,
-            packet,
-        } => validate_audio_track(audio_four_cc.0, packet),
-        ExAudioTagBody::ManyTracks(tracks) => tracks
+        EnhancedAudioBody::NoMultitrack { four_cc, packet } => {
+            validate_audio_track(four_cc.0, packet)
+        }
+        EnhancedAudioBody::ManyTracks(tracks) => tracks
             .iter()
-            .try_for_each(|track| validate_audio_track(track.audio_four_cc.0, &track.packet)),
+            .try_for_each(|track| validate_audio_track(track.four_cc.0, &track.packet)),
     }
 }
 
@@ -316,33 +281,27 @@ fn validate_video_unknowns(parsed: &ParsedVideo) -> Result<(), String> {
     let VideoTagHeaderData::Enhanced(header) = &parsed.header.data else {
         return Ok(());
     };
-    if header
-        .video_packet_mod_exs
-        .iter()
-        .any(|value| matches!(value, VideoPacketModEx::Other { .. }))
-    {
+    if header.has_unknown_modex {
         return Err("unknown video ModEx type".to_owned());
     }
-    if matches!(header.content, ExVideoTagHeaderContent::Unknown { .. }) {
+    if matches!(header.content, VideoHeaderContent::Unknown { .. }) {
         return Err("unknown video multitrack type".to_owned());
     }
     let VideoTagBody::Enhanced(body) = &parsed.body else {
         return Ok(());
     };
     match body {
-        ExVideoTagBody::Command => Ok(()),
-        ExVideoTagBody::NoMultitrack {
-            video_four_cc,
-            packet,
-        } => validate_video_track(video_four_cc.0, packet),
-        ExVideoTagBody::ManyTracks(tracks) => tracks
+        EnhancedVideoBody::Command => Ok(()),
+        EnhancedVideoBody::NoMultitrack { four_cc, packet } => {
+            validate_video_track(four_cc.0, packet)
+        }
+        EnhancedVideoBody::ManyTracks(tracks) => tracks
             .iter()
-            .try_for_each(|track| validate_video_track(track.video_four_cc.0, &track.packet)),
+            .try_for_each(|track| validate_video_track(track.four_cc.0, &track.packet)),
     }
 }
 
-fn validate_video_track(four_cc: [u8; 4], packet: &VideoPacket<'_>) -> Result<(), String> {
-    // v2 r2 adds VVC (`vvc1`) beyond scuffle-flv 0.2.2's named constants.
+fn validate_video_track(four_cc: [u8; 4], packet: &VideoPacket) -> Result<(), String> {
     const KNOWN: [[u8; 4]; 6] = [*b"vp08", *b"vp09", *b"av01", *b"avc1", *b"hvc1", *b"vvc1"];
     if !KNOWN.contains(&four_cc) {
         return Err(format!(
@@ -537,5 +496,50 @@ mod tests {
         )
         .unwrap();
         assert!(audio_frame.classification().coded);
+    }
+
+    #[test]
+    fn every_prefix_is_strict_error_or_parsed_and_never_panics() {
+        let corpus: &[&[u8]] = &[
+            b"\x90Opusconfig",
+            b"\x91Opusframe",
+            b"\x92Opus",
+            b"\x94mp4a\x00\x02",
+            b"\x95\x02Opus\x00",
+            b"\x90vp08config",
+            b"\x91av01frame",
+            b"\x92hvc1",
+            b"\x93av01frame",
+            b"\x92zzzz",
+            b"\x98hvc1",
+            b"\x92vvc1",
+            &[0xaf, 0x00, 0x11, 0x88],
+            &[0x2f, 0xff, 0xfb],
+        ];
+        for tag in corpus {
+            for len in 0..=tag.len() {
+                let raw = Bytes::copy_from_slice(&tag[..len]);
+                let strict =
+                    ValidatedMedia::parse_audio(raw.clone(), EnhancedValidationMode::Strict);
+                let passthrough =
+                    ValidatedMedia::parse_audio(raw.clone(), EnhancedValidationMode::Passthrough);
+                if strict.is_ok() {
+                    assert!(passthrough.is_ok(), "prefix {len} of {tag:?}");
+                }
+                if let Ok(media) = &passthrough {
+                    let _ = media.classification();
+                }
+                let strict =
+                    ValidatedMedia::parse_video(raw.clone(), EnhancedValidationMode::Strict);
+                let passthrough =
+                    ValidatedMedia::parse_video(raw.clone(), EnhancedValidationMode::Passthrough);
+                if strict.is_ok() {
+                    assert!(passthrough.is_ok(), "prefix {len} of {tag:?}");
+                }
+                if let Ok(media) = &passthrough {
+                    let _ = media.classification();
+                }
+            }
+        }
     }
 }
