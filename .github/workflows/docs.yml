@@ -40,6 +40,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+      - name: Add root redirect to crate docs
+        # cargo doc emits the crate at <root>/rtmpx/ with no root index,
+        # so Pages would serve a blank page at the site root without this.
+        run: printf '%s\n' '<!doctype html>' '<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=./rtmpx/">' '<title>Redirecting to rtmpx docs</title></head>' '<body><p>Redirecting to <a href="./rtmpx/">crate docs</a>.</p></body></html>' > target/doc/index.html
+
       - name: Upload pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
