@@ -71,6 +71,7 @@ fn feed_server(
             }
             ServerSessionResult::RaisedEvent(event) => events.push(event),
             ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            _ => panic!("unexpected future protocol variant"),
         }
     }
     (responses, events)

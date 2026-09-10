@@ -20,7 +20,7 @@ async fn run_debug(encoding: AmfEncoding, tag: &str) {
     let c0c1 = hs.generate_outbound_p0_and_p1().unwrap();
     stream.write_all(&c0c1).await.unwrap();
     let mut buf = vec![0u8; 65536];
-    let mut carry = Vec::new();
+    let carry;
     loop {
         let n = stream.read(&mut buf).await.unwrap();
         match hs.process_bytes(&buf[..n]).unwrap() {
@@ -37,6 +37,7 @@ async fn run_debug(encoding: AmfEncoding, tag: &str) {
                 carry = remaining_bytes;
                 break;
             }
+            _ => panic!("unexpected future protocol variant"),
         }
     }
     let mut config = ClientSessionConfig::new();
@@ -53,7 +54,7 @@ async fn run_debug(encoding: AmfEncoding, tag: &str) {
     let mut de = ChunkDeserializer::new();
     // NOTE: ChunkDeserializer buffers internally: feed each flight once, then
     // drain with empty slices (re-feeding the same bytes corrupts the stream).
-    let mut feed =
+    let feed =
         |label: &str, bytes: &[u8], session: &mut ClientSession, de: &mut ChunkDeserializer| {
             eprintln!("[{tag}] {label}: {} bytes", bytes.len());
             let mut pending: Option<&[u8]> = Some(bytes);
@@ -112,6 +113,7 @@ async fn run_debug(encoding: AmfEncoding, tag: &str) {
                             ClientSessionResult::UnhandleableMessageReceived(m) => {
                                 eprintln!("[{tag}]   unhandleable: {m:?}")
                             }
+                            &_ => panic!("unexpected future protocol variant"),
                         }
                     }
                 }
@@ -211,6 +213,7 @@ async fn pump_flight(
                     ClientSessionResult::UnhandleableMessageReceived(m) => {
                         eprintln!("[{tag}]   unhandleable: {m:?}")
                     }
+                    &_ => panic!("unexpected future protocol variant"),
                 }
             }
         }
@@ -234,7 +237,7 @@ async fn debug_amf3_publish_flow() {
     let c0c1 = hs.generate_outbound_p0_and_p1().unwrap();
     stream.write_all(&c0c1).await.unwrap();
     let mut buf = vec![0u8; 65536];
-    let mut carry = Vec::new();
+    let carry;
     loop {
         let n = stream.read(&mut buf).await.unwrap();
         match hs.process_bytes(&buf[..n]).unwrap() {
@@ -251,6 +254,7 @@ async fn debug_amf3_publish_flow() {
                 carry = remaining_bytes;
                 break;
             }
+            _ => panic!("unexpected future protocol variant"),
         }
     }
     let mut config = ClientSessionConfig::new();

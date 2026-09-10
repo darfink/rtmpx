@@ -7,6 +7,7 @@ use std::io;
 /// An enumeration defining all the possible errors that could occur while serializing
 /// RTMP messages into RTMP chunks.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ChunkSerializationError {
     /// Te RTMP specification states that a message cannot be more than 16,777,215 bytes, even
     /// when split across multiple RTMP chunks.  This error is returned if an RTMP message is passed
@@ -14,6 +15,7 @@ pub enum ChunkSerializationError {
     #[error(
         "The current message has a length of {size} bytes, which is over the allowed size of 16777215 bytes"
     )]
+    #[non_exhaustive]
     MessageTooLong { size: u32 },
 
     /// The RTMP spec does not allow chunk sizes more than 2,147,483,647 (since it's encoded in only
@@ -22,6 +24,7 @@ pub enum ChunkSerializationError {
     #[error(
         "An invalid chunk size was specified.  Chunk size must be greater than 0 and less than 2147483647"
     )]
+    #[non_exhaustive]
     InvalidMaxChunkSize { attempted_chunk_size: u32 },
 
     /// An I/O error occurred while writing the output buffer

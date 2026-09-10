@@ -12,23 +12,35 @@ use crate::{
 
 pub use crate::flv::{ParsedAudio, ParsedVideo};
 
-// A raw media payload plus its typed FLV interpretation.
+/// A media payload and its immutable interpretation of the same bytes.
+///
+/// ```compile_fail
+/// use rtmpx::{ValidatedMedia, EnhancedValidationMode};
+/// use bytes::Bytes;
+/// let mut media = ValidatedMedia::parse_audio(Bytes::from_static(&[0xaf, 1, 0]), EnhancedValidationMode::Strict).unwrap();
+/// media.raw = Bytes::new(); // Would invalidate the interpretation.
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValidatedMedia<T> {
     // Original RTMP message body. This is authoritative for republishing.
-    pub raw: Bytes,
+    raw: Bytes,
     // Parsed interpretation, or an opaque reason in passthrough mode.
-    pub interpretation: MediaInterpretation<T>,
+    interpretation: MediaInterpretation<T>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum MediaInterpretation<T> {
     Parsed(T),
-    Opaque { reason: String },
+    #[non_exhaustive]
+    Opaque {
+        reason: String,
+    },
 }
 
 // Media facts needed by relays without exposing FLV parser internals.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct MediaClassification {
     // The message contains one or more coded media frames.
     pub coded: bool,
@@ -39,8 +51,13 @@ pub struct MediaClassification {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MediaValidationError {
+    #[error("expected at most one elementary unit, found {count}")]
+    #[non_exhaustive]
+    MultipleUnits { count: usize },
     #[error("malformed Enhanced/legacy FLV {kind} payload: {reason}")]
+    #[non_exhaustive]
     Malformed { kind: &'static str, reason: String },
 }
 
@@ -313,6 +330,21 @@ fn validate_video_track(four_cc: [u8; 4], packet: &VideoPacket) -> Result<(), St
         return Err("unknown video packet type".to_owned());
     }
     Ok(())
+}
+
+impl<T> ValidatedMedia<T> {
+    /// Original message body, authoritative for forwarding.
+    pub fn raw(&self) -> &Bytes {
+        &self.raw
+    }
+    /// Immutable interpretation of the original body.
+    pub fn interpretation(&self) -> &MediaInterpretation<T> {
+        &self.interpretation
+    }
+    /// Consume this value without copying its bytes or interpretation.
+    pub fn into_parts(self) -> (Bytes, MediaInterpretation<T>) {
+        (self.raw, self.interpretation)
+    }
 }
 
 #[cfg(test)]

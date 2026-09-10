@@ -1,4 +1,4 @@
-//! Data-event preservation coverage for the rtmpx migration.
+//! Data-event preservation coverage: script data must survive ingest and relay.
 //!
 //! The listener must forward data events, not just audio and video. Captions
 //! arrive as AMF0 script-data messages such as onCaption, and metadata
@@ -72,6 +72,7 @@ fn feed_server(
             }
             ServerSessionResult::RaisedEvent(event) => events.push(event),
             ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            _ => panic!("unexpected future protocol variant"),
         }
     }
     (responses, events)
@@ -237,15 +238,10 @@ fn oncaption_style_data_message_is_preserved_verbatim() {
         "onCaption chunk must raise exactly one event"
     );
     match &events[0] {
-        ServerSessionEvent::StreamDataReceived {
-            raw_payload,
-            timestamp: event_timestamp,
-            ..
-        } => {
-            assert_eq!(
-                *event_timestamp, timestamp,
-                "caption timestamp must survive"
-            );
+        ServerSessionEvent::StreamDataReceived { message, .. } => {
+            let raw_payload = message.payload().clone();
+            let event_timestamp = message.timestamp();
+            assert_eq!(event_timestamp, timestamp, "caption timestamp must survive");
             assert_eq!(
                 raw_payload, &expected,
                 "onCaption bytes must survive verbatim"
@@ -288,11 +284,14 @@ fn metadata_raw_payload_is_preserved_verbatim() {
         "onMetaData chunk must raise exactly one event"
     );
     match &events[0] {
-        ServerSessionEvent::StreamMetadataChanged {
-            raw_payload,
-            raw_metadata,
-            ..
-        } => {
+        ServerSessionEvent::StreamMetadataChanged { message, .. } => {
+            let raw_metadata = message
+                .metadata()
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let raw_payload = message.payload().clone();
             assert_eq!(
                 raw_payload, &expected,
                 "onMetaData bytes must survive verbatim"
@@ -352,6 +351,7 @@ fn feed_client(
             }
             ClientSessionResult::RaisedEvent(event) => events.push(event),
             ClientSessionResult::UnhandleableMessageReceived(_) => {}
+            _ => panic!("unexpected future protocol variant"),
         }
     }
     (responses, events)
@@ -494,7 +494,7 @@ fn publishing_client(stream_id: u32, stream_key: &str) -> ClientSession {
     assert!(
         matches!(
             events.first(),
-            Some(ClientSessionEvent::PublishRequestAccepted)
+            Some(ClientSessionEvent::PublishRequestAccepted { .. })
         ),
         "publish must be accepted, got {events:?}"
     );
@@ -522,7 +522,11 @@ fn client_raw_data_payload_round_trips_to_server_verbatim() {
     .clone();
 
     let result = client
-        .publish_raw_data_payload(wire.clone(), timestamp)
+        .publish_data(rtmpx::sessions::DataMessage::new(
+            rtmpx::sessions::DataMessageType::Amf0,
+            timestamp,
+            wire.clone(),
+        ))
         .expect("raw data publish must build");
     let packet_bytes = match result {
         ClientSessionResult::OutboundResponse(packet) => packet.bytes,
@@ -536,15 +540,10 @@ fn client_raw_data_payload_round_trips_to_server_verbatim() {
         "caption packet must raise exactly one event"
     );
     match &events[0] {
-        ServerSessionEvent::StreamDataReceived {
-            raw_payload,
-            timestamp: event_timestamp,
-            ..
-        } => {
-            assert_eq!(
-                *event_timestamp, timestamp,
-                "caption timestamp must survive"
-            );
+        ServerSessionEvent::StreamDataReceived { message, .. } => {
+            let raw_payload = message.payload().clone();
+            let event_timestamp = message.timestamp();
+            assert_eq!(event_timestamp, timestamp, "caption timestamp must survive");
             assert_eq!(
                 raw_payload, &wire,
                 "caption bytes must survive client and server verbatim"

@@ -245,8 +245,8 @@ async fn amf3_script_data_body() -> Result<()> {
             return Err("player never saw the AMF3 @setDataFrame probe".to_string());
         }
         for event in play.next_events().await? {
-            if let ClientSessionEvent::StreamMetadataReceived { raw_payload, .. } = event {
-                let bytes = raw_payload.to_vec();
+            if let ClientSessionEvent::StreamMetadataReceived { message, .. } = event {
+                let bytes = message.payload().to_vec();
                 let marker = b"rtmpxRed5Probe";
                 assert!(
                     bytes.windows(marker.len()).any(|w| w == marker),

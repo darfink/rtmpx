@@ -3,6 +3,7 @@ use crate::amf0::{Amf0Object, Amf0Value};
 /// Enhanced RTMP structural validation policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum EnhancedValidationMode {
     /// Reject malformed Enhanced FLV structures and invalid capability fields.
     #[default]
@@ -29,6 +30,7 @@ impl std::str::FromStr for EnhancedValidationMode {
 /// but [`Self::forwardable_properties`] deliberately excludes connection-local
 /// values such as `tcUrl` and `flashVer`.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct EnhancedCapabilities {
     pub caps_ex: Option<Amf0Value>,
     pub four_cc_list: Option<Amf0Value>,

@@ -45,6 +45,7 @@ const U29_MASK: u32 = 0x1FFF_FFFF;
 /// with [`Amf3DeserializationError::CyclicReference`], and the serializer never
 /// needs to emit object references for correctness (see [`serialize`]).
 #[derive(PartialEq, Debug, Clone)]
+#[non_exhaustive]
 pub enum Amf3Value {
     Undefined,
     Null,
@@ -316,6 +317,7 @@ impl From<crate::amf0::Amf0Value> for Amf3Value {
     }
 }
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Amf3SerializationError {
     #[error("AMF3 string too long: {0} bytes")]
     StringTooLong(usize),
@@ -331,6 +333,7 @@ pub enum Amf3SerializationError {
     Io(#[from] std::io::Error),
 }
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Amf3DeserializationError {
     #[error("AMF3 input ended unexpectedly")]
     UnexpectedEof,
@@ -435,7 +438,7 @@ pub fn serialize(values: &[Amf3Value]) -> Result<Vec<u8>, Amf3SerializationError
 pub fn serialize_single(value: &Amf3Value) -> Result<Vec<u8>, Amf3SerializationError> {
     serialize(std::slice::from_ref(value))
 }
-pub fn deserialize<R: common::AmfRead>(
+pub fn deserialize<R: crate::amf::AmfRead>(
     cursor: &mut R,
 ) -> Result<Vec<Amf3Value>, Amf3DeserializationError> {
     let mut ctx = DecodeContext::default();
@@ -445,7 +448,7 @@ pub fn deserialize<R: common::AmfRead>(
     }
     Ok(out)
 }
-pub fn deserialize_single<R: common::AmfRead>(
+pub fn deserialize_single<R: crate::amf::AmfRead>(
     cursor: &mut R,
 ) -> Result<Amf3Value, Amf3DeserializationError> {
     let mut ctx = DecodeContext::default();
@@ -465,7 +468,7 @@ fn read_optional_value<R: common::AmfRead>(
     }
     read_value_with_marker(cursor, ctx, depth, probe[0]).map(Some)
 }
-pub fn decode_avmplus_wrapped<R: common::AmfRead>(
+pub fn decode_avmplus_wrapped<R: crate::amf::AmfRead>(
     cursor: &mut R,
 ) -> Result<Amf3Value, Amf3DeserializationError> {
     let marker = common::read_u8(cursor).map_err(|_| Amf3DeserializationError::UnexpectedEof)?;

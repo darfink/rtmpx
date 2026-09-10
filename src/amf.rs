@@ -26,6 +26,7 @@ pub type AmfProperties<V> = IndexMap<String, V>;
 /// Which AMF version a peer negotiated, and therefore which encoding this side
 /// uses for the values it originates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[non_exhaustive]
 pub enum AmfEncoding {
     #[default]
     Amf0,
@@ -222,6 +223,9 @@ pub fn status_object<V: AmfValue>(level: &str, code: &str, description: &str) ->
         ("description".to_string(), V::string(description)),
     ])
 }
+
+/// Reader extension point for AMF decoders.
+pub use crate::amf_common::AmfRead;
 
 #[cfg(test)]
 mod tests {

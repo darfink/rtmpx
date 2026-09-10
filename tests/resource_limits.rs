@@ -44,20 +44,14 @@ fn rejects_zero_chunk_sizes_and_acknowledgement_windows() {
 
 #[test]
 fn rejects_oversized_declared_messages_before_allocating_the_payload() {
-    let limits = ChunkDeserializerConfig {
-        maximum_message_size: 32,
-        ..ChunkDeserializerConfig::default()
-    };
+    let limits = ChunkDeserializerConfig::default().with_maximum_message_size(32);
     let mut parser = ChunkDeserializer::with_config(limits);
     assert!(parser.get_next_message(&full_chunk(3, 33, &[])).is_err());
 }
 
 #[test]
 fn bounds_tracked_chunk_stream_ids() {
-    let limits = ChunkDeserializerConfig {
-        maximum_tracked_chunk_streams: 1,
-        ..ChunkDeserializerConfig::default()
-    };
+    let limits = ChunkDeserializerConfig::default().with_maximum_tracked_chunk_streams(1);
     let mut parser = ChunkDeserializer::with_config(limits);
     assert!(
         parser
@@ -70,10 +64,7 @@ fn bounds_tracked_chunk_stream_ids() {
 
 #[test]
 fn bounds_concurrent_partial_messages() {
-    let limits = ChunkDeserializerConfig {
-        maximum_partial_messages: 1,
-        ..ChunkDeserializerConfig::default()
-    };
+    let limits = ChunkDeserializerConfig::default().with_maximum_partial_messages(1);
     let mut parser = ChunkDeserializer::with_config(limits);
     assert!(
         parser
@@ -90,10 +81,7 @@ fn bounds_concurrent_partial_messages() {
 
 #[test]
 fn bounds_total_buffered_wire_and_payload_bytes() {
-    let limits = ChunkDeserializerConfig {
-        maximum_buffered_bytes: 10,
-        ..ChunkDeserializerConfig::default()
-    };
+    let limits = ChunkDeserializerConfig::default().with_maximum_buffered_bytes(10);
     let mut parser = ChunkDeserializer::with_config(limits);
     assert!(parser.get_next_message(&[0; 11]).is_err());
 }

@@ -6,7 +6,11 @@ use thiserror::Error;
 /// Error state when a server session encounters an error
 /// Represents the type of error that occurred
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ServerSessionError {
+    /// An earlier input error terminated this session. Close its transport.
+    #[error("session terminated after an input error")]
+    SessionFailed,
     /// Encountered when an error occurs while deserializing the incoming byte data
     #[error("An error occurred deserializing incoming data: {0}")]
     ChunkDeserializationError(#[from] ChunkDeserializationError),
@@ -44,5 +48,6 @@ pub enum ServerSessionError {
 
     /// An action was attempted to be performed on a inactive stream
     #[error("The '{action}' action was attempted on non-existant stream id {stream_id}")]
+    #[non_exhaustive]
     ActionAttemptedOnInactiveStream { action: String, stream_id: u32 },
 }

@@ -58,6 +58,7 @@ async fn serve_one(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Err
                 }
                 break remaining_bytes;
             }
+            _ => return Err("unsupported protocol result; update the adapter".into()),
         }
     };
 
@@ -181,6 +182,7 @@ async fn handle_one(
             }
         },
         ServerSessionResult::UnhandleableMessageReceived(_) => {}
+        _ => return Err("unsupported protocol result; update the adapter".into()),
     }
     Ok(())
 }

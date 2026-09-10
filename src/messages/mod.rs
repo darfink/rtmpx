@@ -22,6 +22,7 @@ use bytes::Bytes;
 
 /// The type of bandwidth limiting that is being requested
 #[derive(Eq, PartialEq, Debug, Clone)]
+#[non_exhaustive]
 pub enum PeerBandwidthLimitType {
     /// Peer should limit its output bandwidth to the indicated window size
     Hard,
@@ -36,6 +37,7 @@ pub enum PeerBandwidthLimitType {
 
 /// Events and notifications that are raised with the peer
 #[derive(Eq, PartialEq, Debug, Clone)]
+#[non_exhaustive]
 pub enum UserControlEventType {
     /// Notifies the client that a stream has become functional
     StreamBegin,
@@ -76,6 +78,7 @@ pub enum UserControlEventType {
 
 /// An enumeration of all types of RTMP messages that are supported
 #[derive(PartialEq, Debug, Clone)]
+#[non_exhaustive]
 pub enum RtmpMessage {
     /// This type of message is used when an RTMP message is encountered with a type id that
     /// we do not know about

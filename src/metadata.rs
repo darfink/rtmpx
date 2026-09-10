@@ -1,3 +1,4 @@
+use crate::sessions::DataMessage;
 use std::collections::BTreeMap;
 
 use crate::amf0::{Amf0Object, Amf0Value};
@@ -8,14 +9,16 @@ use crate::{EnhancedValidationMode, MediaInterpretation};
 
 /// A typed `onMetaData` view plus the exact encoded AMF payload.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ValidatedMetadata {
     /// Original RTMP message body, authoritative for forwarding and demuxing.
-    pub raw: Bytes,
-    pub interpretation: MediaInterpretation<ParsedMetadata>,
+    message: DataMessage,
+    interpretation: MediaInterpretation<ParsedMetadata>,
 }
 
 /// Owned v2 r2 metadata, including descriptors for non-default tracks.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct ParsedMetadata {
     /// Every top-level property, including values unknown to this crate.
     pub properties: Amf0Object,
@@ -25,6 +28,7 @@ pub struct ParsedMetadata {
 
 /// Metadata for one non-default track. Unknown fields remain in `properties`.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct TrackMetadata {
     pub track_id: u32,
     pub codec: Option<MetadataCodec>,
@@ -32,6 +36,7 @@ pub struct TrackMetadata {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum MetadataCodec {
     /// Legacy FLV numeric codec identifier.
     Legacy(f64),
@@ -46,6 +51,7 @@ pub enum MetadataCodec {
 /// which properties they send, and some omit the message entirely. Callers must
 /// treat a missing field as "unknown" rather than as a fault.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct EncoderSummary {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
@@ -187,28 +193,48 @@ fn codec_label(value: f64, kind: TrackKind) -> Option<String> {
 
 #[derive(Debug, Error)]
 #[error("malformed Enhanced RTMP metadata: {reason}")]
+#[non_exhaustive]
 pub struct MetadataValidationError {
     reason: String,
 }
 
 impl ValidatedMetadata {
+    /// Decode and validate metadata from the original encoded message.
     pub fn parse(
-        raw: Bytes,
-        values: Vec<(String, Amf0Value)>,
+        message: DataMessage,
         mode: EnhancedValidationMode,
     ) -> Result<Self, MetadataValidationError> {
-        let properties = values.into_iter().collect::<Amf0Object>();
-        match parse_metadata(properties) {
+        let parsed = message
+            .metadata()
+            .map_err(|e| e.to_string())
+            .and_then(|p| {
+                p.ok_or_else(|| "message does not contain onMetaData properties".to_string())
+            })
+            .and_then(parse_metadata);
+        match parsed {
             Ok(parsed) => Ok(Self {
-                raw,
+                message,
                 interpretation: MediaInterpretation::Parsed(parsed),
             }),
             Err(reason) if mode == EnhancedValidationMode::Passthrough => Ok(Self {
-                raw,
+                message,
                 interpretation: MediaInterpretation::Opaque { reason },
             }),
             Err(reason) => Err(MetadataValidationError { reason }),
         }
+    }
+    /// Original encoded message, including its wire type and timestamp.
+    pub fn message(&self) -> &DataMessage {
+        &self.message
+    }
+    pub fn raw(&self) -> &Bytes {
+        self.message.payload()
+    }
+    pub fn interpretation(&self) -> &MediaInterpretation<ParsedMetadata> {
+        &self.interpretation
+    }
+    pub fn into_parts(self) -> (DataMessage, MediaInterpretation<ParsedMetadata>) {
+        (self.message, self.interpretation)
     }
 }
 
@@ -454,7 +480,6 @@ mod tests {
 
     #[test]
     fn parses_v2_track_maps_and_preserves_unknown_fields() {
-        let raw = Bytes::from_static(b"encoded metadata");
         let values = vec![
             (
                 "videoTrackIdInfoMap".into(),
@@ -477,10 +502,21 @@ mod tests {
                 )])),
             ),
         ];
-        let metadata =
-            ValidatedMetadata::parse(raw.clone(), values, EnhancedValidationMode::Strict)
-                .expect("valid track maps parse");
-        assert_eq!(metadata.raw, raw);
+        let raw = Bytes::from(
+            crate::amf0::serialize(&[
+                Amf0Value::Utf8String("onMetaData".into()),
+                Amf0Value::Object(values.into_iter().collect()),
+            ])
+            .unwrap(),
+        );
+        let message = DataMessage::new(
+            crate::sessions::DataMessageType::Amf0,
+            crate::time::RtmpTimestamp::new(0),
+            raw.clone(),
+        );
+        let metadata = ValidatedMetadata::parse(message.clone(), EnhancedValidationMode::Strict)
+            .expect("valid track maps parse");
+        assert_eq!(metadata.raw(), &raw);
         let MediaInterpretation::Parsed(metadata) = metadata.interpretation else {
             panic!("valid metadata must be typed");
         };
@@ -500,7 +536,6 @@ mod tests {
 
     #[test]
     fn malformed_track_maps_are_strict_or_opaque() {
-        let raw = Bytes::from_static(b"raw");
         let values = vec![(
             "videoTrackIdInfoMap".into(),
             Amf0Value::Object(Amf0Object::from([(
@@ -508,14 +543,23 @@ mod tests {
                 Amf0Value::Object(Amf0Object::new()),
             )])),
         )];
-        assert!(
-            ValidatedMetadata::parse(raw.clone(), values.clone(), EnhancedValidationMode::Strict)
-                .is_err()
+        let raw = Bytes::from(
+            crate::amf0::serialize(&[
+                Amf0Value::Utf8String("onMetaData".into()),
+                Amf0Value::Object(values.into_iter().collect()),
+            ])
+            .unwrap(),
         );
+        let message = DataMessage::new(
+            crate::sessions::DataMessageType::Amf0,
+            crate::time::RtmpTimestamp::new(0),
+            raw.clone(),
+        );
+        assert!(ValidatedMetadata::parse(message.clone(), EnhancedValidationMode::Strict).is_err());
         let metadata =
-            ValidatedMetadata::parse(raw.clone(), values, EnhancedValidationMode::Passthrough)
+            ValidatedMetadata::parse(message.clone(), EnhancedValidationMode::Passthrough)
                 .expect("passthrough keeps malformed metadata");
-        assert_eq!(metadata.raw, raw);
+        assert_eq!(metadata.raw(), &raw);
         assert!(matches!(
             metadata.interpretation,
             MediaInterpretation::Opaque { .. }

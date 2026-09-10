@@ -84,6 +84,7 @@ impl Peer {
                 }
                 ClientSessionResult::RaisedEvent(event) => events.push(event),
                 ClientSessionResult::UnhandleableMessageReceived(_) => {}
+                _ => panic!("unexpected future protocol variant"),
             }
         }
         self.stream
@@ -171,6 +172,7 @@ impl Peer {
                     }
                     return Ok(());
                 }
+                _ => panic!("unexpected future protocol variant"),
             }
         }
     }
@@ -226,13 +228,14 @@ impl Peer {
                         ClientSessionEvent::ConnectionRequestAccepted {
                             command_object,
                             additional_properties,
+                            ..
                         } => {
                             return Ok::<(Amf0Object, Amf0Object), String>((
                                 command_object,
                                 additional_properties,
                             ));
                         }
-                        ClientSessionEvent::ConnectionRequestRejected { description } => {
+                        ClientSessionEvent::ConnectionRequestRejected { description, .. } => {
                             return Err(format!("server rejected connect: {description}"));
                         }
                         _ => {}
@@ -260,7 +263,7 @@ impl Peer {
                 let mut events = Vec::new();
                 self.read_results(&mut events).await?;
                 for event in events {
-                    if matches!(event, ClientSessionEvent::PublishRequestAccepted) {
+                    if matches!(event, ClientSessionEvent::PublishRequestAccepted { .. }) {
                         return Ok::<(), String>(());
                     }
                 }
@@ -282,7 +285,7 @@ impl Peer {
                 let mut events = Vec::new();
                 self.read_results(&mut events).await?;
                 for event in events {
-                    if matches!(event, ClientSessionEvent::PlaybackRequestAccepted) {
+                    if matches!(event, ClientSessionEvent::PlaybackRequestAccepted { .. }) {
                         return Ok::<(), String>(());
                     }
                 }
@@ -319,8 +322,12 @@ impl Peer {
     pub async fn send_raw_amf3_data(&mut self, body: Bytes, timestamp: u32) -> Result<()> {
         let result = self
             .session
-            .publish_raw_amf3_data_payload(body, RtmpTimestamp::new(timestamp))
-            .map_err(|e| format!("publish_raw_amf3_data_payload failed: {e:?}"))?;
+            .publish_data(rtmpx::sessions::DataMessage::new(
+                rtmpx::sessions::DataMessageType::Amf3,
+                RtmpTimestamp::new(timestamp),
+                body,
+            ))
+            .map_err(|e| format!("publish_data failed: {e:?}"))?;
         self.write_results(vec![result], &mut Vec::new()).await
     }
 
@@ -347,6 +354,7 @@ impl Peer {
                             got.audio.push(data.to_vec());
                         }
                         ClientSessionEvent::StreamMetadataReceived { .. } => {
+
                             got.meta += 1;
                         }
                         _ => {}

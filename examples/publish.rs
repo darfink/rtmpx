@@ -41,6 +41,7 @@ async fn send(
         }
         ClientSessionResult::RaisedEvent(event) => Ok(Some(event)),
         ClientSessionResult::UnhandleableMessageReceived(_) => Ok(None),
+        _ => Err("unsupported protocol result; update the adapter".into()),
     }
 }
 
@@ -60,7 +61,7 @@ async fn wait_for_event(
         for result in session.handle_input(&buf[..n])? {
             if let Some(event) = send(stream, result).await? {
                 match event {
-                    ClientSessionEvent::ConnectionRequestRejected { description } => {
+                    ClientSessionEvent::ConnectionRequestRejected { description, .. } => {
                         return Err(format!("server rejected {what}: {description}").into());
                     }
                     _ => return Ok(()),
@@ -115,6 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 break remaining_bytes;
             }
+            _ => return Err("unsupported protocol result; update the adapter".into()),
         }
     };
 

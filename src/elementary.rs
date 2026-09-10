@@ -21,6 +21,7 @@ use crate::{
 
 // Codecs this ingest path can present as elementary access units.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ElementaryCodec {
     Avc,
     Hevc,
@@ -41,13 +42,16 @@ impl ElementaryCodec {
 
 // One validated RTMP message, reduced to decoder config or a coded sample.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ElementaryUnit {
+    #[non_exhaustive]
     Configuration {
         codec: ElementaryCodec,
         extradata: Bytes,
         // Enhanced RTMP track id when the message names one; legacy is None.
         track_id: Option<u8>,
     },
+    #[non_exhaustive]
     Sample {
         codec: ElementaryCodec,
         payload: Bytes,
@@ -81,7 +85,7 @@ impl ValidatedMedia<ParsedAudio> {
     // them. One Enhanced tag may carry several tracks; each mapped track is
     // its own unit so a packed ManyTracks message does not drop siblings.
     pub fn elementary_units(&self) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
-        match &self.interpretation {
+        match self.interpretation() {
             MediaInterpretation::Opaque { reason } => Err(MediaValidationError::Malformed {
                 kind: "audio",
                 reason: reason.clone(),
@@ -90,14 +94,14 @@ impl ValidatedMedia<ParsedAudio> {
                 AudioTagBody::Legacy(LegacyAudioBody::AacSequenceHeader(_)) => {
                     Ok(vec![ElementaryUnit::Configuration {
                         codec: ElementaryCodec::Aac,
-                        extradata: slice_after(&self.raw, LEGACY_AAC_HEADER_BYTES, "audio")?,
+                        extradata: slice_after(self.raw(), LEGACY_AAC_HEADER_BYTES, "audio")?,
                         track_id: None,
                     }])
                 }
                 AudioTagBody::Legacy(LegacyAudioBody::AacRaw(_)) => {
                     Ok(vec![ElementaryUnit::Sample {
                         codec: ElementaryCodec::Aac,
-                        payload: slice_after(&self.raw, LEGACY_AAC_HEADER_BYTES, "audio")?,
+                        payload: slice_after(self.raw(), LEGACY_AAC_HEADER_BYTES, "audio")?,
                         keyframe: true,
                         composition_time_offset: 0,
                         track_id: None,
@@ -109,9 +113,13 @@ impl ValidatedMedia<ParsedAudio> {
         }
     }
 
-    // The first mapped unit, when the tag carries only one.
+    /// Return zero or one mapped unit. Multiple units produce an error.
     pub fn elementary_unit(&self) -> Result<Option<ElementaryUnit>, MediaValidationError> {
-        Ok(self.elementary_units()?.into_iter().next())
+        let units = self.elementary_units()?;
+        if units.len() > 1 {
+            return Err(MediaValidationError::MultipleUnits { count: units.len() });
+        }
+        Ok(units.into_iter().next())
     }
 }
 
@@ -120,7 +128,7 @@ impl ValidatedMedia<ParsedVideo> {
     //
     // A packed Enhanced ManyTracks tag yields one unit per mapped track.
     pub fn elementary_units(&self) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
-        match &self.interpretation {
+        match self.interpretation() {
             MediaInterpretation::Opaque { reason } => Err(MediaValidationError::Malformed {
                 kind: "video",
                 reason: reason.clone(),
@@ -136,7 +144,7 @@ impl ValidatedMedia<ParsedVideo> {
                         _,
                     ) => Ok(vec![ElementaryUnit::Configuration {
                         codec: ElementaryCodec::Avc,
-                        extradata: slice_after(&self.raw, LEGACY_AVC_HEADER_BYTES, "video")?,
+                        extradata: slice_after(self.raw(), LEGACY_AVC_HEADER_BYTES, "video")?,
                         track_id: None,
                     }]),
                     (
@@ -148,7 +156,7 @@ impl ValidatedMedia<ParsedVideo> {
                         VideoTagBody::Legacy(LegacyVideoBody::Other(_)),
                     ) => Ok(vec![ElementaryUnit::Sample {
                         codec: ElementaryCodec::Avc,
-                        payload: slice_after(&self.raw, LEGACY_AVC_HEADER_BYTES, "video")?,
+                        payload: slice_after(self.raw(), LEGACY_AVC_HEADER_BYTES, "video")?,
                         keyframe,
                         composition_time_offset: *composition_time_offset,
                         track_id: None,
@@ -160,9 +168,13 @@ impl ValidatedMedia<ParsedVideo> {
         }
     }
 
-    // The first mapped unit, when the tag carries only one.
+    /// Return zero or one mapped unit. Multiple units produce an error.
     pub fn elementary_unit(&self) -> Result<Option<ElementaryUnit>, MediaValidationError> {
-        Ok(self.elementary_units()?.into_iter().next())
+        let units = self.elementary_units()?;
+        if units.len() > 1 {
+            return Err(MediaValidationError::MultipleUnits { count: units.len() });
+        }
+        Ok(units.into_iter().next())
     }
 }
 

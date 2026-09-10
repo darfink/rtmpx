@@ -4,6 +4,7 @@ use crate::messages::MessagePayload;
 
 /// A single result that is returned when a server session processes some bytes
 #[derive(PartialEq, Debug)]
+#[non_exhaustive]
 pub enum ServerSessionResult {
     /// A packet that is slated to be sent to the peer.  This packet should *ALWAYS* be sent
     /// in the order it consumed and can only be dropped if it has explicitly been marked as

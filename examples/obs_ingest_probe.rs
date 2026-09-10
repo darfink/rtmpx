@@ -48,6 +48,7 @@ async fn write_results(
                     app_name,
                     request_id,
                     additional_properties,
+                    ..
                 } => {
                     println!("[connect] app={app_name} request={request_id}");
                     for (k, v) in additional_properties.iter() {
@@ -74,11 +75,12 @@ async fn write_results(
                     video += v;
                 }
                 ServerSessionEvent::StreamMetadataChanged {
+                    message,
                     metadata,
                     stream_key,
-                    is_amf3,
                     ..
                 } => {
+                    let is_amf3 = message.wire_type() == rtmpx::sessions::DataMessageType::Amf3;
                     meta += 1;
                     println!(
                         "[metadata #{meta}] key={stream_key} amf3={is_amf3} width={:?} height={:?} vcodec={:?} acodec={:?} encoder={:?}",
@@ -121,6 +123,7 @@ async fn write_results(
                 other => println!("[event] {other:?}"),
             },
             ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            _ => return Err("unsupported protocol result; update the adapter".into()),
         }
     }
     stream.flush().await?;
@@ -187,6 +190,7 @@ async fn main() -> ProbeResult<()> {
                 }
                 break remaining_bytes;
             }
+            _ => return Err("unsupported protocol result; update the adapter".into()),
         }
     };
 

@@ -71,6 +71,7 @@ impl Pump {
                 }
                 ClientSessionResult::RaisedEvent(event) => self.client_events.push(event),
                 ClientSessionResult::UnhandleableMessageReceived(_) => {}
+                _ => panic!("unexpected future protocol variant"),
             }
         }
         if bytes.is_empty() {
@@ -92,6 +93,7 @@ impl Pump {
                 }
                 ServerSessionResult::RaisedEvent(event) => self.server_events.push(event),
                 ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                _ => panic!("unexpected future protocol variant"),
             }
         }
         if bytes.is_empty() {
@@ -163,7 +165,7 @@ fn publish(pump: &mut Pump, stream_key: &str) {
     assert!(
         pump.take_client_events()
             .iter()
-            .any(|event| matches!(event, ClientSessionEvent::PublishRequestAccepted)),
+            .any(|event| matches!(event, ClientSessionEvent::PublishRequestAccepted { .. })),
         "client must see Publish.Start"
     );
 }
@@ -171,7 +173,7 @@ fn publish(pump: &mut Pump, stream_key: &str) {
 // Drive a second pump to Playing so relayed media can be pushed through
 // ServerSession::send_video_data and observed on the player. Returns the
 // server-side stream id to send on.
-fn play(pump: &mut Pump, stream_key: &str) -> u32 {
+fn play(pump: &mut Pump, stream_key: &str) -> rtmpx::sessions::StreamId {
     let out = pump
         .client
         .request_playback(stream_key.to_string())
@@ -197,7 +199,7 @@ fn play(pump: &mut Pump, stream_key: &str) -> u32 {
     assert!(
         pump.take_client_events()
             .iter()
-            .any(|event| matches!(event, ClientSessionEvent::PlaybackRequestAccepted)),
+            .any(|event| matches!(event, ClientSessionEvent::PlaybackRequestAccepted { .. })),
         "client must see Play.Start"
     );
     stream_id
@@ -316,7 +318,9 @@ fn extended_timestamps_survive_ingest_and_relay() {
         .take_client_events()
         .into_iter()
         .filter_map(|event| match event {
-            ClientSessionEvent::VideoDataReceived { data, timestamp } => Some((data, timestamp)),
+            ClientSessionEvent::VideoDataReceived {
+                data, timestamp, ..
+            } => Some((data, timestamp)),
             _ => None,
         })
         .collect();
@@ -384,6 +388,7 @@ fn feed_server(
             }
             ServerSessionResult::RaisedEvent(event) => events.push(event),
             ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            _ => panic!("unexpected future protocol variant"),
         }
     }
     (responses, events)
@@ -668,7 +673,7 @@ fn connect_rejection_is_error_reply() {
     assert!(
         pump.take_client_events().iter().any(|event| matches!(
             event,
-            ClientSessionEvent::ConnectionRequestRejected { description } if description == "no entry"
+            ClientSessionEvent::ConnectionRequestRejected { description, .. } if description == "no entry"
         )),
         "client must surface the connect rejection"
     );
@@ -736,7 +741,7 @@ fn publish_rejection_is_onstatus_error() {
     assert!(
         pump.take_client_events().iter().any(|event| matches!(
             event,
-            ClientSessionEvent::UnhandleableOnStatusCode { code } if code == "NetStream.Publish.Denied"
+            ClientSessionEvent::PublishRequestRejected { status, .. } if status.code() == Some("NetStream.Publish.Denied")
         )),
         "client must surface the publish refusal code"
     );
@@ -801,7 +806,7 @@ fn play_rejection_is_onstatus_error() {
     assert!(
         pump.take_client_events().iter().any(|event| matches!(
             event,
-            ClientSessionEvent::UnhandleableOnStatusCode { code } if code == "NetStream.Play.Failed"
+            ClientSessionEvent::PlaybackRequestRejected { status, .. } if status.code() == Some("NetStream.Play.Failed")
         )),
         "client must surface the play refusal code"
     );
@@ -919,4 +924,231 @@ fn amf3_framed_play_rejection_is_amf3_command() {
         }
         other => panic!("type-17 play refusal must be an AMF3 command, saw {other:?}"),
     }
+}
+
+#[test]
+fn requests_are_exclusive_while_pending_and_cancellation_releases_created_streams() {
+    use rtmpx::sessions::ClientState;
+    for publishing in [false, true] {
+        let mut pump = Pump::new(
+            ClientSessionConfig::default(),
+            ServerSessionConfig::default(),
+        );
+        let connect_result = pump.client.request_connection("live".into()).unwrap();
+        assert_eq!(pump.client.state(), &ClientState::ConnectionRequested);
+        assert!(pump.client.request_connection("again".into()).is_err());
+        assert!(!pump.client.is_failed());
+        pump.push_client(vec![connect_result]);
+        let id = pump
+            .take_server_events()
+            .into_iter()
+            .find_map(|e| match e {
+                ServerSessionEvent::ConnectionRequested { request_id, .. } => Some(request_id),
+                _ => None,
+            })
+            .unwrap();
+        let accepted = pump.server.accept_request(id).unwrap();
+        assert!(pump.server.accept_request(id).is_err());
+        assert!(!pump.server.is_failed());
+        pump.push_server(accepted);
+        pump.take_client_events();
+
+        let request = if publishing {
+            pump.client
+                .request_publishing("demo".into(), PublishRequestType::Live)
+                .unwrap()
+        } else {
+            pump.client.request_playback("demo".into()).unwrap()
+        };
+        assert_eq!(
+            pump.client.state(),
+            if publishing {
+                &ClientState::CreatingPublishStream
+            } else {
+                &ClientState::CreatingPlayStream
+            }
+        );
+        assert!(pump.client.request_playback("overlap".into()).is_err());
+        assert!(
+            pump.client
+                .request_publishing("overlap".into(), PublishRequestType::Live)
+                .is_err()
+        );
+        let cancel = if publishing {
+            pump.client.stop_publishing()
+        } else {
+            pump.client.stop_playback()
+        }
+        .unwrap();
+        assert!(cancel.is_empty());
+        assert_eq!(
+            pump.client.state(),
+            if publishing {
+                &ClientState::CancellingPublish
+            } else {
+                &ClientState::CancellingPlay
+            }
+        );
+        assert!(pump.client.request_playback("too-soon".into()).is_err());
+        // Deliver the request after cancellation. Its response must delete the newly
+        // allocated stream and must never issue a play/publish command.
+        pump.push_client(vec![request]);
+        assert_eq!(pump.client.state(), &ClientState::Connected);
+        assert_eq!(pump.client.active_stream_id(), None);
+        assert!(pump.take_server_events().is_empty());
+        assert!(pump.take_client_events().is_empty());
+        publish(&mut pump, "next");
+        assert_eq!(pump.client.state(), &ClientState::Publishing);
+    }
+}
+
+#[test]
+fn script_messages_relay_both_directions_without_changing_wire_type_or_bytes() {
+    use rtmpx::sessions::{DataMessage, DataMessageType};
+    let mut ingest = Pump::new(
+        ClientSessionConfig::default(),
+        ServerSessionConfig::default(),
+    );
+    connect(&mut ingest, "live");
+    publish(&mut ingest, "demo");
+    let source_id = ingest.client.active_stream_id().unwrap();
+    let mut playback = Pump::new(
+        ClientSessionConfig::default(),
+        ServerSessionConfig::default(),
+    );
+    connect(&mut playback, "live");
+    let destination_id = play(&mut playback, "demo");
+    for metadata in [false, true] {
+        let values = vec![
+            Amf0Value::Utf8String(if metadata { "onMetaData" } else { "onCaption" }.into()),
+            Amf0Value::Object(Amf0Object::from([(
+                "vendor".into(),
+                Amf0Value::Utf8String("retained".into()),
+            )])),
+        ];
+        let amf0 = rtmpx::amf0::serialize(&values).unwrap();
+        let amf3 =
+            rtmpx::amf3::serialize(&values.iter().map(Amf0Value::to_amf3).collect::<Vec<_>>())
+                .unwrap();
+        let mut wrapped0 = vec![0];
+        wrapped0.extend_from_slice(&amf0);
+        let mut wrapped3 = vec![3];
+        wrapped3.extend_from_slice(&amf3);
+        for (wire_type, bytes) in [
+            (DataMessageType::Amf0, amf0),
+            (DataMessageType::Amf3, wrapped0),
+            (DataMessageType::Amf3, wrapped3),
+            // Deliberately mistyped bare AMF3: interpretation must not change type 18.
+            (DataMessageType::Amf0, amf3),
+            (DataMessageType::Amf0, vec![0xff, 0xfe]),
+        ] {
+            let original = DataMessage::new(
+                wire_type,
+                RtmpTimestamp::new(0xffff_fffe),
+                Bytes::from(bytes),
+            );
+            let sent = ingest.client.publish_data(original.clone()).unwrap();
+            ingest.push_client(vec![sent]);
+            let received = ingest
+                .take_server_events()
+                .into_iter()
+                .find_map(|e| match e {
+                    ServerSessionEvent::StreamMetadataChanged {
+                        stream_id, message, ..
+                    }
+                    | ServerSessionEvent::StreamDataReceived {
+                        stream_id, message, ..
+                    } => {
+                        assert_eq!(stream_id, source_id);
+                        Some(message)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(received, original);
+            let packet = playback.server.send_data(destination_id, received).unwrap();
+            playback.push_server(vec![ServerSessionResult::OutboundResponse(packet)]);
+            let received = playback
+                .take_client_events()
+                .into_iter()
+                .find_map(|e| match e {
+                    ClientSessionEvent::StreamMetadataReceived { message, .. }
+                    | ClientSessionEvent::StreamDataReceived { message, .. } => Some(message),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(received, original);
+            // Republish the client-observed message back into a server session.
+            let sent = ingest.client.publish_data(received).unwrap();
+            ingest.push_client(vec![sent]);
+            assert!(ingest.take_server_events().into_iter().any(|e| match e {
+                ServerSessionEvent::StreamMetadataChanged { message, .. }
+                | ServerSessionEvent::StreamDataReceived { message, .. } => message == original,
+                _ => false,
+            }));
+        }
+    }
+}
+
+#[test]
+fn rejection_and_completion_preserve_status_and_allow_another_request() {
+    use rtmpx::sessions::ClientState;
+    let mut pump = Pump::new(
+        ClientSessionConfig::default(),
+        ServerSessionConfig::default(),
+    );
+    connect(&mut pump, "live");
+    for publishing in [false, true] {
+        let request = if publishing {
+            pump.client
+                .request_publishing("denied".into(), PublishRequestType::Live)
+                .unwrap()
+        } else {
+            pump.client.request_playback("denied".into()).unwrap()
+        };
+        pump.push_client(vec![request]);
+        let (id, stream_id) = pump
+            .take_server_events()
+            .into_iter()
+            .find_map(|e| match e {
+                ServerSessionEvent::PlayStreamRequested {
+                    request_id,
+                    stream_id,
+                    ..
+                }
+                | ServerSessionEvent::PublishStreamRequested {
+                    request_id,
+                    stream_id,
+                    ..
+                } => Some((request_id, stream_id)),
+                _ => None,
+            })
+            .unwrap();
+        // A vendor code is still a rejection when level=error.
+        let rejected = pump
+            .server
+            .reject_request(id, "Vendor.PermissionDenied", "Access requires a token")
+            .unwrap();
+        pump.push_server(rejected);
+        assert!(pump.take_client_events().into_iter().any(|e| match e {
+            ClientSessionEvent::PlaybackRequestRejected { status, .. }
+            | ClientSessionEvent::PublishRequestRejected { status, .. } => {
+                status.code() == Some("Vendor.PermissionDenied")
+                    && status.description() == Some("Access requires a token")
+                    && status.stream_id() == Some(stream_id)
+                    && status.properties().get("level")
+                        == Some(&Amf0Value::Utf8String("error".into()))
+            }
+            _ => false,
+        }));
+        assert_eq!(pump.client.state(), &ClientState::Connected);
+        assert_eq!(pump.client.active_stream_id(), None);
+    }
+    let stream_id = play(&mut pump, "working");
+    let finished = pump.server.finish_playing(stream_id).unwrap();
+    pump.push_server(vec![ServerSessionResult::OutboundResponse(finished)]);
+    assert!(pump.take_client_events().into_iter().any(|e| matches!(e,
+        ClientSessionEvent::PlaybackFinished { status, .. } if status.code() == Some("NetStream.Play.Complete"))));
+    assert_eq!(pump.client.state(), &ClientState::Connected);
+    publish(&mut pump, "after-completion");
 }

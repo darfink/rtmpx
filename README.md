@@ -44,7 +44,7 @@ Based on `rml_rtmp` 0.8.0 (upstream master `953fc41d`, 2023-05-31), with the
 AMF0 codec derived from `rml_amf0` 0.3.0.
 
 - `ClientSession::request_connection_with_properties` merges extra AMF0 properties into the `connect` command object, so a proxy can forward the E-RTMP capability advertisement (`fourCcList`, `capsEx`, FourCC info maps). `request_connection` delegates to it, upstream behaviour unchanged.
-- `ServerSession` keeps the original metadata bytes (`raw_metadata`) and exposes unconsumed connect fields (`additional_properties`), so proxies relay metadata and connect properties verbatim instead of dropping them.
+- `ServerSession` keeps the original metadata message (`DataMessage`) and exposes unconsumed connect fields (`additional_properties`), so proxies relay metadata and connect properties verbatim instead of dropping them.
 - Acknowledgements are cumulative (total bytes received, per spec) and fall back to the advertised window when the peer never sends one (ffmpeg never does); overshoot is kept modulo the window, zero windows are rejected.
 - Timestamp deltas across the u32 rollover (~49 days of continuous streaming) are computed with wrapping arithmetic, so long-lived publishes keep correct deltas past the boundary; pinned by round-trip regression tests.
 - The deserializer keeps partial payloads per chunk stream (fixing corruption when messages interleave), turns a shrinking message length into `MessageLengthSmallerThanBufferedPayload` instead of panicking, and bounds chunk size, message size, tracked streams, concurrent partials, and buffered bytes; `Abort` releases the target partial.

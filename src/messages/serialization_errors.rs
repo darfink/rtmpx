@@ -9,6 +9,7 @@ use crate::amf3::Amf3SerializationError as Amf3Error;
 /// Enumeration that represents the various errors that may occur while trying to
 /// serialize a RTMP message into a raw RTMP payload.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MessageSerializationError {
     /// An invalid chunk size value was provided
     #[error("Cannot serialize a SetChunkSize message with a size of 2147483648 or greater")]

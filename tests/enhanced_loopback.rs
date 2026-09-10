@@ -53,6 +53,7 @@ impl Pump {
                 }
                 ClientSessionResult::RaisedEvent(event) => self.client_events.push(event),
                 ClientSessionResult::UnhandleableMessageReceived(_) => {}
+                _ => panic!("unexpected future protocol variant"),
             }
         }
         if bytes.is_empty() {
@@ -74,6 +75,7 @@ impl Pump {
                 }
                 ServerSessionResult::RaisedEvent(event) => self.server_events.push(event),
                 ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                _ => panic!("unexpected future protocol variant"),
             }
         }
         if bytes.is_empty() {
@@ -151,7 +153,7 @@ fn publish(pump: &mut Pump, stream_key: &str) {
     assert!(
         pump.take_client_events()
             .iter()
-            .any(|event| matches!(event, ClientSessionEvent::PublishRequestAccepted)),
+            .any(|event| matches!(event, ClientSessionEvent::PublishRequestAccepted { .. })),
         "client must see Publish.Start"
     );
 }
@@ -159,7 +161,7 @@ fn publish(pump: &mut Pump, stream_key: &str) {
 /// Drive a second pump to Playing so we can push relayed media through
 /// `ServerSession::send_video_data` and observe it on the player.
 /// Returns the server-side stream id to send on.
-fn play(pump: &mut Pump, stream_key: &str) -> u32 {
+fn play(pump: &mut Pump, stream_key: &str) -> rtmpx::sessions::StreamId {
     let out = pump
         .client
         .request_playback(stream_key.to_string())
@@ -188,7 +190,7 @@ fn play(pump: &mut Pump, stream_key: &str) -> u32 {
     assert!(
         pump.take_client_events()
             .iter()
-            .any(|event| matches!(event, ClientSessionEvent::PlaybackRequestAccepted)),
+            .any(|event| matches!(event, ClientSessionEvent::PlaybackRequestAccepted { .. })),
         "client must see Play.Start"
     );
     stream_id

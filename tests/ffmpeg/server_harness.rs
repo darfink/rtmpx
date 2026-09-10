@@ -96,6 +96,7 @@ async fn write_server_results(
                 }
             },
             ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            _ => panic!("unexpected future protocol variant"),
         }
     }
     stream
@@ -147,6 +148,7 @@ async fn server_handshake(stream: &mut TcpStream, read_buf: &mut [u8]) -> Result
                 }
                 return Ok(remaining_bytes);
             }
+            _ => panic!("unexpected future protocol variant"),
         }
     }
 }
@@ -642,7 +644,7 @@ pub async fn relay_our_publish_to_ffmpeg(
             write_server_results(&mut stream, results, &mut session, &mut collected).await?;
         }
         if collected.video.len() < video.len() || collected.audio.len() < audio.len() {
-            let _ = publisher.abort();
+            publisher.abort();
             return Err(format!(
                 "our publisher did not land: got {} video / {} audio, want {} / {}",
                 collected.video.len(),
@@ -694,7 +696,7 @@ pub async fn relay_our_publish_to_ffmpeg(
         let (mut session, initial) = ServerSession::new(ServerSessionConfig::new())
             .map_err(|e| format!("server init failed: {e:?}"))?;
         debug_assert!(initial.is_empty());
-        let mut play_stream_id: Option<u32> = None;
+        let mut play_stream_id: Option<rtmpx::sessions::StreamId> = None;
         let mut sent = false;
         // Handle the player's connect + play, then push the ingested media.
         let mut pending: Vec<u8> = carry;
@@ -751,6 +753,7 @@ pub async fn relay_our_publish_to_ffmpeg(
                             _ => {}
                         },
                         ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                        _ => panic!("unexpected future protocol variant"),
                     }
                 }
                 stream
@@ -758,57 +761,57 @@ pub async fn relay_our_publish_to_ffmpeg(
                     .await
                     .map_err(|e| format!("flush player failed: {e}"))?;
             }
-            if let Some(sid) = play_stream_id {
-                if !sent {
-                    let meta_packet = session
-                        .send_metadata(sid, &metadata)
-                        .map_err(|e| format!("send_metadata failed: {e:?}"))?;
+            if let Some(sid) = play_stream_id
+                && !sent
+            {
+                let meta_packet = session
+                    .send_metadata(sid, &metadata)
+                    .map_err(|e| format!("send_metadata failed: {e:?}"))?;
+                stream
+                    .write_all(&meta_packet.bytes)
+                    .await
+                    .map_err(|e| format!("write meta failed: {e}"))?;
+                for (i, v) in ingested_video.iter().enumerate() {
+                    let p = session
+                        .send_video_data(
+                            sid,
+                            bytes::Bytes::from(v.clone()),
+                            RtmpTimestamp::new((i as u32) * 40),
+                            false,
+                        )
+                        .map_err(|e| format!("send_video failed: {e:?}"))?;
                     stream
-                        .write_all(&meta_packet.bytes)
+                        .write_all(&p.bytes)
                         .await
-                        .map_err(|e| format!("write meta failed: {e}"))?;
-                    for (i, v) in ingested_video.iter().enumerate() {
-                        let p = session
-                            .send_video_data(
-                                sid,
-                                bytes::Bytes::from(v.clone()),
-                                RtmpTimestamp::new((i as u32) * 40),
-                                false,
-                            )
-                            .map_err(|e| format!("send_video failed: {e:?}"))?;
-                        stream
-                            .write_all(&p.bytes)
-                            .await
-                            .map_err(|e| format!("write video failed: {e}"))?;
-                    }
-                    for (i, a) in ingested_audio.iter().enumerate() {
-                        let p = session
-                            .send_audio_data(
-                                sid,
-                                bytes::Bytes::from(a.clone()),
-                                RtmpTimestamp::new((i as u32) * 23),
-                                false,
-                            )
-                            .map_err(|e| format!("send_audio failed: {e:?}"))?;
-                        stream
-                            .write_all(&p.bytes)
-                            .await
-                            .map_err(|e| format!("write audio failed: {e}"))?;
-                    }
-                    stream
-                        .flush()
-                        .await
-                        .map_err(|e| format!("flush media failed: {e}"))?;
-                    sent = true;
+                        .map_err(|e| format!("write video failed: {e}"))?;
                 }
+                for (i, a) in ingested_audio.iter().enumerate() {
+                    let p = session
+                        .send_audio_data(
+                            sid,
+                            bytes::Bytes::from(a.clone()),
+                            RtmpTimestamp::new((i as u32) * 23),
+                            false,
+                        )
+                        .map_err(|e| format!("send_audio failed: {e:?}"))?;
+                    stream
+                        .write_all(&p.bytes)
+                        .await
+                        .map_err(|e| format!("write audio failed: {e}"))?;
+                }
+                stream
+                    .flush()
+                    .await
+                    .map_err(|e| format!("flush media failed: {e}"))?;
+                sent = true;
             }
             // Poll ffmpeg liveness; exit once it is done writing.
-            match child
+            if child
                 .try_wait()
                 .map_err(|e| format!("ffmpeg wait failed: {e}"))?
+                .is_some()
             {
-                Some(_) => break,
-                None => {}
+                break;
             }
             match timeout(Duration::from_millis(300), stream.read(&mut read_buf)).await {
                 Ok(Ok(n)) if n > 0 => {
@@ -846,7 +849,7 @@ pub async fn relay_our_publish_to_ffmpeg(
         .unwrap_or_default();
     let _ = child.kill();
     let _ = child.wait();
-    let _ = publisher.abort();
+    publisher.abort();
     serve?;
     let probe = ffprobe_streams(&out_path)
         .await

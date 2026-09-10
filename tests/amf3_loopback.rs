@@ -62,6 +62,7 @@ impl Pump {
                 }
                 ClientSessionResult::RaisedEvent(event) => self.client_events.push(event),
                 ClientSessionResult::UnhandleableMessageReceived(_) => {}
+                _ => panic!("unexpected future protocol variant"),
             }
         }
         if bytes.is_empty() {
@@ -84,6 +85,7 @@ impl Pump {
                 }
                 ServerSessionResult::RaisedEvent(event) => self.server_events.push(event),
                 ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                _ => panic!("unexpected future protocol variant"),
             }
         }
         if bytes.is_empty() {
@@ -191,7 +193,7 @@ fn connect_and_publish(pump: &mut Pump, stream_key: &str) {
     assert!(
         pump.take_client_events()
             .iter()
-            .any(|event| matches!(event, ClientSessionEvent::PublishRequestAccepted)),
+            .any(|event| matches!(event, ClientSessionEvent::PublishRequestAccepted { .. })),
         "client must see Publish.Start"
     );
 }
@@ -276,8 +278,11 @@ fn amf3_client_publishes_into_our_server() {
         .iter()
         .find_map(|event| match event {
             ServerSessionEvent::StreamMetadataChanged {
-                metadata, is_amf3, ..
-            } => Some((metadata.clone(), *is_amf3)),
+                metadata, message, ..
+            } => Some((
+                metadata.clone(),
+                message.wire_type() == rtmpx::sessions::DataMessageType::Amf3,
+            )),
             _ => None,
         })
         .expect("metadata must raise StreamMetadataChanged");
@@ -318,18 +323,21 @@ fn amf3_client_publishes_into_our_server() {
     let probe = amf3_probe_body();
     let out = pump
         .client
-        .publish_raw_amf3_data_payload(probe.clone(), RtmpTimestamp::new(0))
+        .publish_data(rtmpx::sessions::DataMessage::new(
+            rtmpx::sessions::DataMessageType::Amf3,
+            RtmpTimestamp::new(0),
+            probe.clone(),
+        ))
         .expect("amf3 data must build");
     pump.push_client(vec![out]);
     let events = pump.take_server_events();
     let probe_event = events
         .iter()
         .find_map(|event| match event {
-            ServerSessionEvent::StreamMetadataChanged {
-                raw_payload,
-                is_amf3,
-                ..
-            } => Some((raw_payload.clone(), *is_amf3)),
+            ServerSessionEvent::StreamMetadataChanged { message, .. } => Some((
+                message.payload().clone(),
+                message.wire_type() == rtmpx::sessions::DataMessageType::Amf3,
+            )),
             _ => None,
         })
         .expect("amf3 setDataFrame must raise StreamMetadataChanged");

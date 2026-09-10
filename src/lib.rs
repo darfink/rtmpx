@@ -43,7 +43,7 @@ pub mod sessions;
 #[allow(clippy::all)]
 pub mod time;
 
-pub use amf::{AmfEncoding, AmfProperties, AmfValue};
+pub use amf::{AmfEncoding, AmfProperties, AmfRead, AmfValue};
 pub use amf0::{Amf0DeserializationError, Amf0Object, Amf0SerializationError, Amf0Value};
 pub use amf3::{Amf3DeserializationError, Amf3SerializationError, Amf3Value};
 pub use elementary::{ElementaryCodec, ElementaryUnit};

@@ -24,6 +24,7 @@ pub type Amf0Object = indexmap::IndexMap<String, Amf0Value>;
 /// [`Amf0DeserializationError::UnknownMarker`]; no RTMP encoder in practice
 /// emits it, and a typed error is preferable to inventing sharing.
 #[derive(PartialEq, Debug, Clone)]
+#[non_exhaustive]
 pub enum Amf0Value {
     Number(f64),
     Boolean(bool),
@@ -122,6 +123,7 @@ pub(crate) mod markers {
     pub const UTF_8_EMPTY_MARKER: u16 = 0;
 }
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Amf0DeserializationError {
     #[error("AMF0 unknown marker: {marker}")]
     UnknownMarker { marker: u8 },
@@ -141,6 +143,7 @@ pub enum Amf0DeserializationError {
     StringParseError(#[from] std::string::FromUtf8Error),
 }
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Amf0SerializationError {
     #[error("AMF0 string length greater than 65535")]
     NormalStringTooLong,
@@ -299,7 +302,7 @@ struct ObjectProperty {
     label: String,
     value: Amf0Value,
 }
-pub fn deserialize<R: common::AmfRead>(
+pub fn deserialize<R: crate::amf::AmfRead>(
     bytes: &mut R,
 ) -> Result<Vec<Amf0Value>, Amf0DeserializationError> {
     let mut results = Vec::new();
@@ -308,7 +311,7 @@ pub fn deserialize<R: common::AmfRead>(
     }
     Ok(results)
 }
-pub fn deserialize_single<R: common::AmfRead>(
+pub fn deserialize_single<R: crate::amf::AmfRead>(
     bytes: &mut R,
 ) -> Result<Amf0Value, Amf0DeserializationError> {
     match read_next_value(bytes, 0)? {

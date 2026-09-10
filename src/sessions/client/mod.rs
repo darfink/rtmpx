@@ -11,7 +11,7 @@ mod tests;
 
 pub use self::config::ClientSessionConfig;
 pub use self::errors::ClientSessionError;
-pub use self::events::ClientSessionEvent;
+pub use self::events::{ClientSessionEvent, CommandStatus};
 pub use self::publish_request_type::PublishRequestType;
 pub use self::result::ClientSessionResult;
 pub use self::state::ClientState;
@@ -20,13 +20,13 @@ use self::outstanding_transaction::{OutstandingTransaction, TransactionPurpose};
 use crate::amf::AmfEncoding;
 use crate::amf0::{Amf0Object, Amf0Value};
 use crate::chunk_io::{ChunkDeserializationError, ChunkDeserializer, ChunkSerializer, Packet};
-use crate::messages::{MessagePayload, RtmpMessage, UserControlEventType};
-use crate::sessions::StreamMetadata;
+use crate::messages::{RtmpMessage, UserControlEventType};
+use crate::sessions::{DataMessage, DataMessageType, StreamId, StreamMetadata};
 use crate::time::RtmpTimestamp;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::mem;
-use std::time::SystemTime;
+use std::time::Instant;
 
 type ClientResult = Result<Vec<ClientSessionResult>, ClientSessionError>;
 
@@ -51,7 +51,8 @@ type ClientResult = Result<Vec<ClientSessionResult>, ClientSessionError>;
 /// Any violation of these points have a high probability of causing RTMP chunk parsing errors
 /// by either the `ClientSession` or the peer.
 pub struct ClientSession {
-    start_time: SystemTime,
+    failed: bool,
+    start_time: Instant,
     serializer: ChunkSerializer,
     deserializer: ChunkDeserializer,
     config: ClientSessionConfig,
@@ -73,10 +74,61 @@ pub struct ClientSession {
 }
 
 impl ClientSession {
+    /// Whether an input error has permanently terminated this session.
+    pub fn is_failed(&self) -> bool {
+        self.failed
+    }
+
+    fn ensure_active(&self) -> Result<(), ClientSessionError> {
+        if self.failed {
+            Err(ClientSessionError::SessionFailed)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Process bytes in transport order.
+    ///
+    /// Any error is terminal: close the transport and discard this session. Outputs
+    /// accumulated during the failing call are discarded; no further operation may
+    /// generate bytes. Successful calls return outputs in their required wire order.
+    /// Caller errors from other methods (for example an invalid request ID) are not
+    /// input failures and do not set this terminal state.
+    pub fn handle_input(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Vec<ClientSessionResult>, ClientSessionError> {
+        self.ensure_active()?;
+        let result = self.handle_input_inner(bytes);
+        if result.is_err() {
+            self.failed = true;
+            self.current_state = ClientState::Failed;
+        }
+        result
+    }
+
+    fn handle_data_message(
+        &self,
+        stream_id: u32,
+        message: DataMessage,
+    ) -> Vec<ClientSessionResult> {
+        if self.active_stream_id != Some(stream_id) {
+            return Vec::new();
+        }
+        let event = if let Ok(Some(properties)) = message.metadata() {
+            let mut metadata = StreamMetadata::new();
+            metadata.apply_metadata_values(properties);
+            ClientSessionEvent::StreamMetadataReceived { metadata, message }
+        } else {
+            ClientSessionEvent::StreamDataReceived { message }
+        };
+        vec![ClientSessionResult::RaisedEvent(event)]
+    }
+
     /// Creates a new client session with the specified configuration
     ///
-    /// As part of the initial creation it automatically creates initial outbound RTMP messages,
-    /// such as setting the outbound chunk size
+    /// The initial output list is empty. Connection negotiation produces the
+    /// required flow-control messages after the server accepts the connection.
     pub fn new(
         config: ClientSessionConfig,
     ) -> Result<(ClientSession, Vec<ClientSessionResult>), ClientSessionError> {
@@ -89,7 +141,8 @@ impl ClientSession {
             .into());
         }
         let session = ClientSession {
-            start_time: SystemTime::now(),
+            failed: false,
+            start_time: Instant::now(),
             serializer: ChunkSerializer::new(),
             deserializer: ChunkDeserializer::with_config(config.chunk_deserializer),
             next_transaction_id: 1,
@@ -111,6 +164,16 @@ impl ClientSession {
         Ok((session, results))
     }
 
+    /// Current state, including pending requests and terminal input failure.
+    pub fn state(&self) -> &ClientState {
+        &self.current_state
+    }
+
+    /// Active stream, once createStream has succeeded.
+    pub fn active_stream_id(&self) -> Option<StreamId> {
+        self.active_stream_id.map(StreamId::new)
+    }
+
     /// The AMF encoding the server confirmed in its `connect` response,
     /// clamped to what this crate supports.
     ///
@@ -123,7 +186,7 @@ impl ClientSession {
 
     /// Takes in any number of bytes from the peer and processes them.  Any resulting responses or
     /// events are returned.
-    pub fn handle_input(&mut self, bytes: &[u8]) -> ClientResult {
+    fn handle_input_inner(&mut self, bytes: &[u8]) -> ClientResult {
         let mut results = Vec::new();
         self.bytes_received += bytes.len() as u64;
 
@@ -154,6 +217,16 @@ impl ClientSession {
             match self.deserializer.get_next_message(bytes_to_process)? {
                 None => break, // no more messages
                 Some(payload) => {
+                    if let Some(wire_type) = DataMessageType::from_type_id(payload.type_id) {
+                        if wire_type == DataMessageType::Amf3 {
+                            self.peer_uses_amf3_framing = true;
+                        }
+                        let message = DataMessage::new(wire_type, payload.timestamp, payload.data);
+                        results
+                            .extend(self.handle_data_message(payload.message_stream_id, message));
+                        bytes_to_process = &[];
+                        continue;
+                    }
                     let message = payload.to_rtmp_message()?;
                     let mut message_results = match message {
                         RtmpMessage::Abort { stream_id } => {
@@ -170,17 +243,11 @@ impl ClientSession {
                             command_object,
                             additional_arguments,
                         } => self.handle_amf0_command(
+                            payload.message_stream_id,
                             command_name,
                             transaction_id,
                             command_object,
                             additional_arguments,
-                        )?,
-
-                        RtmpMessage::Amf0Data { values } => self.handle_amf0_data(
-                            values,
-                            payload.message_stream_id,
-                            payload.timestamp,
-                            payload.data.clone(),
                         )?,
 
                         RtmpMessage::Amf3Command {
@@ -196,20 +263,11 @@ impl ClientSession {
                             // implementation.
                             self.peer_uses_amf3_framing = true;
                             self.handle_amf0_command(
+                                payload.message_stream_id,
                                 command_name,
                                 transaction_id,
                                 command_object.to_amf0(),
                                 additional_arguments.iter().map(|v| v.to_amf0()).collect(),
-                            )?
-                        }
-
-                        RtmpMessage::Amf3Data { values, format: _ } => {
-                            self.peer_uses_amf3_framing = true;
-                            self.handle_amf0_data(
-                                values.iter().map(|v| v.to_amf0()).collect(),
-                                payload.message_stream_id,
-                                payload.timestamp,
-                                payload.data.clone(),
                             )?
                         }
 
@@ -266,6 +324,7 @@ impl ClientSession {
         &mut self,
         app_name: String,
     ) -> Result<ClientSessionResult, ClientSessionError> {
+        self.ensure_active()?;
         // Delegate to the extensible variant so upstream behaviour is
         // preserved exactly while proxies can add their own connect properties.
         self.request_connection_with_properties(app_name, Amf0Object::new())
@@ -288,6 +347,7 @@ impl ClientSession {
         app_name: String,
         extra_properties: Amf0Object,
     ) -> Result<ClientSessionResult, ClientSessionError> {
+        self.ensure_active()?;
         match self.current_state {
             ClientState::Disconnected => (),
             _ => {
@@ -299,8 +359,6 @@ impl ClientSession {
         let transaction = OutstandingTransaction::ConnectionRequested {
             app_name: app_name.clone(),
         };
-        self.outstanding_transactions
-            .insert(transaction_id, transaction);
 
         // Seed with the caller's properties, then let the session's
         // own values overwrite them.
@@ -333,6 +391,10 @@ impl ClientSession {
         let payload = message.into_message_payload(self.get_epoch(), 0)?;
         let packet = self.serializer.serialize(&payload, false, false)?;
 
+        self.outstanding_transactions
+            .insert(transaction_id, transaction);
+        self.current_state = ClientState::ConnectionRequested;
+
         Ok(ClientSessionResult::OutboundResponse(packet))
     }
 
@@ -343,6 +405,7 @@ impl ClientSession {
         &mut self,
         stream_key: String,
     ) -> Result<ClientSessionResult, ClientSessionError> {
+        self.ensure_active()?;
         match self.current_state {
             ClientState::Connected => (),
             _ => {
@@ -357,9 +420,6 @@ impl ClientSession {
             purpose: TransactionPurpose::PlayRequest { stream_key },
         };
 
-        self.outstanding_transactions
-            .insert(transaction_id, transaction);
-
         let message = RtmpMessage::Amf0Command {
             command_name: "createStream".to_string(),
             transaction_id: transaction_id as f64,
@@ -369,6 +429,10 @@ impl ClientSession {
 
         let payload = message.into_message_payload(self.get_epoch(), 0)?;
         let packet = self.serializer.serialize(&payload, false, false)?;
+
+        self.outstanding_transactions
+            .insert(transaction_id, transaction);
+        self.current_state = ClientState::CreatingPlayStream;
 
         Ok(ClientSessionResult::OutboundResponse(packet))
     }
@@ -380,6 +444,7 @@ impl ClientSession {
         stream_key: String,
         publish_type: PublishRequestType,
     ) -> Result<ClientSessionResult, ClientSessionError> {
+        self.ensure_active()?;
         match self.current_state {
             ClientState::Connected => (),
             _ => {
@@ -397,9 +462,6 @@ impl ClientSession {
             },
         };
 
-        self.outstanding_transactions
-            .insert(transaction_id, transaction);
-
         let message = RtmpMessage::Amf0Command {
             command_name: "createStream".to_string(),
             transaction_id: transaction_id as f64,
@@ -410,12 +472,21 @@ impl ClientSession {
         let payload = message.into_message_payload(self.get_epoch(), 0)?;
         let packet = self.serializer.serialize(&payload, false, false)?;
 
+        self.outstanding_transactions
+            .insert(transaction_id, transaction);
+        self.current_state = ClientState::CreatingPublishStream;
+
         Ok(ClientSessionResult::OutboundResponse(packet))
     }
 
     /// If currently playing on a stream key, this is used to tell the server we no longer want to
     /// play video from the stream.
     pub fn stop_playback(&mut self) -> ClientResult {
+        self.ensure_active()?;
+        if self.current_state == ClientState::CreatingPlayStream {
+            self.current_state = ClientState::CancellingPlay;
+            return Ok(Vec::new());
+        }
         // Validate we are in a state to do this
         match self.current_state {
             ClientState::Playing { .. } => (),
@@ -444,6 +515,11 @@ impl ClientSession {
     /// If currently publishing on a stream key, this is used to tell the server we no longer want
     /// to publish to that stream.
     pub fn stop_publishing(&mut self) -> ClientResult {
+        self.ensure_active()?;
+        if self.current_state == ClientState::CreatingPublishStream {
+            self.current_state = ClientState::CancellingPublish;
+            return Ok(Vec::new());
+        }
         // Validate we are in a state to do this
         match self.current_state {
             ClientState::Publishing { .. } => (),
@@ -471,6 +547,7 @@ impl ClientSession {
 
     /// Sends a ping request to the server.  An event will be raised when we get a response back
     pub fn send_ping_request(&mut self) -> Result<(Packet, RtmpTimestamp), ClientSessionError> {
+        self.ensure_active()?;
         let current_epoch = self.get_epoch();
         let message = RtmpMessage::UserControl {
             event_type: UserControlEventType::PingRequest,
@@ -490,6 +567,7 @@ impl ClientSession {
         &mut self,
         metadata: &StreamMetadata,
     ) -> Result<ClientSessionResult, ClientSessionError> {
+        self.ensure_active()?;
         match self.current_state {
             ClientState::Publishing => (),
             _ => {
@@ -565,102 +643,23 @@ impl ClientSession {
         Ok(ClientSessionResult::OutboundResponse(packet))
     }
 
-    /// Publishes `onMetaData` from raw AMF0 properties, exactly as received.
-    ///
-    /// Added for proxy use. `publish_metadata` rebuilds the
-    /// object from the typed `StreamMetadata`, which silently drops every key
-    /// this crate does not model - including Enhanced RTMP and vendor hints. A
-    /// proxy must relay metadata unchanged, so this variant passes the
-    /// publisher's original properties straight through.
-    pub fn publish_raw_metadata(
+    /// Publish encoded script data, preserving its wire type, timestamp, and bytes.
+    pub fn publish_data(
         &mut self,
-        properties: Vec<(String, Amf0Value)>,
+        message: DataMessage,
     ) -> Result<ClientSessionResult, ClientSessionError> {
-        match self.current_state {
-            ClientState::Publishing => (),
-            _ => {
-                return Err(ClientSessionError::SessionInInvalidState {
-                    current_state: self.current_state.clone(),
-                });
-            }
+        self.ensure_active()?;
+        if self.current_state != ClientState::Publishing {
+            return Err(ClientSessionError::SessionInInvalidState {
+                current_state: self.current_state.clone(),
+            });
         }
-
-        let active_stream_id = match self.active_stream_id {
-            Some(x) => x,
-            None => {
-                return Err(ClientSessionError::NoKnownActiveStreamIdWhenRequired);
-            }
-        };
-
-        let properties: Amf0Object = properties.into_iter().collect();
-        let message = RtmpMessage::Amf0Data {
-            values: vec![
-                Amf0Value::Utf8String("@setDataFrame".to_string()),
-                Amf0Value::Utf8String("onMetaData".to_string()),
-                Amf0Value::Object(properties),
-            ],
-        };
-
-        let payload = message.into_message_payload(self.get_epoch(), active_stream_id)?;
-        let packet = self.serializer.serialize(&payload, false, false)?;
-
-        Ok(ClientSessionResult::OutboundResponse(packet))
-    }
-
-    /// Publish an already encoded AMF data body without decode/re-encode loss.
-    pub fn publish_raw_data_payload(
-        &mut self,
-        data: Bytes,
-        timestamp: RtmpTimestamp,
-    ) -> Result<ClientSessionResult, ClientSessionError> {
-        match self.current_state {
-            ClientState::Publishing => (),
-            _ => {
-                return Err(ClientSessionError::SessionInInvalidState {
-                    current_state: self.current_state.clone(),
-                });
-            }
-        }
-        let active_stream_id = self
+        let stream_id = self
             .active_stream_id
             .ok_or(ClientSessionError::NoKnownActiveStreamIdWhenRequired)?;
-        let payload = MessagePayload {
-            timestamp,
-            type_id: 18,
-            message_stream_id: active_stream_id,
-            data,
-        };
-        let packet = self.serializer.serialize(&payload, false, false)?;
-        Ok(ClientSessionResult::OutboundResponse(packet))
-    }
-
-    /// Publish an already encoded AMF3 data body (type 15) without loss.
-    ///
-    /// Mirrors `publish_raw_data_payload` (type 18/AMF0) for AMF3 script
-    /// data relayed verbatim from a type-15 publisher payload.
-    pub fn publish_raw_amf3_data_payload(
-        &mut self,
-        data: Bytes,
-        timestamp: RtmpTimestamp,
-    ) -> Result<ClientSessionResult, ClientSessionError> {
-        match self.current_state {
-            ClientState::Publishing => (),
-            _ => {
-                return Err(ClientSessionError::SessionInInvalidState {
-                    current_state: self.current_state.clone(),
-                });
-            }
-        }
-        let active_stream_id = self
-            .active_stream_id
-            .ok_or(ClientSessionError::NoKnownActiveStreamIdWhenRequired)?;
-        let payload = MessagePayload {
-            timestamp,
-            type_id: 15,
-            message_stream_id: active_stream_id,
-            data,
-        };
-        let packet = self.serializer.serialize(&payload, false, false)?;
+        let packet =
+            self.serializer
+                .serialize(&message.to_message_payload(stream_id), false, false)?;
         Ok(ClientSessionResult::OutboundResponse(packet))
     }
 
@@ -671,6 +670,7 @@ impl ClientSession {
         timestamp: RtmpTimestamp,
         can_be_dropped: bool,
     ) -> Result<ClientSessionResult, ClientSessionError> {
+        self.ensure_active()?;
         match self.current_state {
             ClientState::Publishing => (),
             _ => {
@@ -700,6 +700,7 @@ impl ClientSession {
         timestamp: RtmpTimestamp,
         can_be_dropped: bool,
     ) -> Result<ClientSessionResult, ClientSessionError> {
+        self.ensure_active()?;
         match self.current_state {
             ClientState::Publishing => (),
             _ => {
@@ -780,52 +781,9 @@ impl ClientSession {
         Ok(vec![ClientSessionResult::RaisedEvent(event)])
     }
 
-    fn handle_amf0_data(
-        &mut self,
-        mut data: Vec<Amf0Value>,
-        stream_id: u32,
-        timestamp: RtmpTimestamp,
-        raw_payload: Bytes,
-    ) -> ClientResult {
-        if data.len() == 0 {
-            // No data so just do nothing
-            return Ok(Vec::new());
-        }
-
-        // Validate we are active on the stream this message came from
-        match self.active_stream_id {
-            None => return Ok(Vec::new()), // not active on any stream
-            Some(active_stream_id) if active_stream_id != stream_id => return Ok(Vec::new()), // not active on this stream
-            Some(_) => (),
-        }
-
-        let first_element = data.remove(0);
-        match first_element {
-            Amf0Value::Utf8String(ref value) if value == "onMetaData" => {
-                self.handle_amf0_data_on_meta_data(data, timestamp, raw_payload)
-            }
-
-            // Encoders wrap `onMetaData` in `@setDataFrame`; unwrap it the
-            // same way the server leg does so playback observes metadata
-            // regardless of which framing the publisher used.
-            Amf0Value::Utf8String(ref value) if value == "@setDataFrame" => {
-                if data.len() < 2 {
-                    return Ok(Vec::new());
-                }
-                match &data[0] {
-                    Amf0Value::Utf8String(name) if name == "onMetaData" => (),
-                    _ => return Ok(Vec::new()),
-                }
-                data.remove(0);
-                self.handle_amf0_data_on_meta_data(data, timestamp, raw_payload)
-            }
-
-            _ => Ok(Vec::new()),
-        }
-    }
-
     fn handle_amf0_command(
         &mut self,
+        stream_id: u32,
         name: String,
         transaction_id: f64,
         command_object: Amf0Value,
@@ -842,10 +800,11 @@ impl ClientSession {
                 command_object,
                 additional_args,
             ),
-            "onStatus" => self.handle_on_status_command(additional_args),
+            "onStatus" => self.handle_on_status_command(stream_id, additional_args),
 
             _ => {
                 let event = ClientSessionEvent::UnhandleableAmf0Command {
+                    stream_id: StreamId::new(stream_id),
                     command_name: name,
                     additional_values: additional_args,
                     command_object,
@@ -861,7 +820,7 @@ impl ClientSession {
         &mut self,
         transaction_id: f64,
         command_object: Amf0Value,
-        mut additional_args: Vec<Amf0Value>,
+        additional_args: Vec<Amf0Value>,
     ) -> ClientResult {
         let outstanding_transaction = match self
             .outstanding_transactions
@@ -879,32 +838,40 @@ impl ClientSession {
             }
         };
 
-        match outstanding_transaction {
-            OutstandingTransaction::ConnectionRequested { app_name: _ } => {
-                let description = if additional_args.len() > 0 {
-                    if let Amf0Value::Object(mut properties) = additional_args.remove(0) {
-                        if let Some(Amf0Value::Utf8String(value)) =
-                            properties.shift_remove("description")
-                        {
-                            value
-                        } else {
-                            "".to_string()
-                        }
-                    } else {
-                        "".to_string()
+        let properties = additional_args
+            .into_iter()
+            .next()
+            .and_then(|v| v.get_object_properties())
+            .unwrap_or_default();
+        let status = CommandStatus::new(self.active_stream_id.map(StreamId::new), properties);
+        let event = match outstanding_transaction {
+            OutstandingTransaction::ConnectionRequested { .. } => {
+                self.current_state = ClientState::Disconnected;
+                ClientSessionEvent::ConnectionRequestRejected {
+                    description: status.description().unwrap_or("").to_string(),
+                    status,
+                }
+            }
+            OutstandingTransaction::CreateStream { purpose } => {
+                let cancelled = matches!(
+                    self.current_state,
+                    ClientState::CancellingPlay | ClientState::CancellingPublish
+                );
+                self.current_state = ClientState::Connected;
+                if cancelled {
+                    return Ok(Vec::new());
+                }
+                match purpose {
+                    TransactionPurpose::PlayRequest { .. } => {
+                        ClientSessionEvent::PlaybackRequestRejected { status }
                     }
-                } else {
-                    "".to_string()
-                };
-
-                let event = ClientSessionEvent::ConnectionRequestRejected { description };
-                Ok(vec![ClientSessionResult::RaisedEvent(event)])
+                    TransactionPurpose::PublishRequest { .. } => {
+                        ClientSessionEvent::PublishRequestRejected { status }
+                    }
+                }
             }
-
-            OutstandingTransaction::CreateStream { purpose: _ } => {
-                return Err(ClientSessionError::CreateStreamFailed);
-            }
-        }
+        };
+        Ok(vec![ClientSessionResult::RaisedEvent(event)])
     }
 
     fn handle_amf0_command_success_result(
@@ -987,12 +954,34 @@ impl ClientSession {
                 }
 
                 let stream_id = match additional_args[0] {
-                    Amf0Value::Number(number) => number as u32,
+                    Amf0Value::Number(number)
+                        if number.is_finite()
+                            && number.fract() == 0.0
+                            && number >= 1.0
+                            && number <= u32::MAX as f64 =>
+                    {
+                        number as u32
+                    }
                     _ => {
                         return Err(ClientSessionError::CreateStreamResponseHadNoStreamNumber);
                     }
                 };
 
+                if matches!(
+                    self.current_state,
+                    ClientState::CancellingPlay | ClientState::CancellingPublish
+                ) {
+                    let message = RtmpMessage::Amf0Command {
+                        command_name: "deleteStream".into(),
+                        transaction_id: 0.0,
+                        command_object: Amf0Value::Null,
+                        additional_arguments: vec![Amf0Value::Number(stream_id as f64)],
+                    };
+                    let payload = message.into_message_payload(self.get_epoch(), 0)?;
+                    let packet = self.serializer.serialize(&payload, false, false)?;
+                    self.current_state = ClientState::Connected;
+                    return Ok(vec![ClientSessionResult::OutboundResponse(packet)]);
+                }
                 self.active_stream_id = Some(stream_id);
 
                 match purpose {
@@ -1068,40 +1057,98 @@ impl ClientSession {
         }
     }
 
-    fn handle_on_status_command(&mut self, mut arguments: Vec<Amf0Value>) -> ClientResult {
-        if arguments.len() < 1 {
-            return Err(ClientSessionError::InvalidOnStatusArguments);
+    fn handle_on_status_command(
+        &mut self,
+        stream_id: u32,
+        arguments: Vec<Amf0Value>,
+    ) -> ClientResult {
+        let properties = arguments
+            .into_iter()
+            .next()
+            .and_then(|v| v.get_object_properties())
+            .ok_or(ClientSessionError::InvalidOnStatusArguments)?;
+        let status = CommandStatus::new(Some(StreamId::new(stream_id)), properties);
+        let code = status
+            .code()
+            .ok_or(ClientSessionError::InvalidOnStatusArguments)?;
+        // Late statuses from deleted streams remain observable but cannot restart them.
+        if self.active_stream_id != Some(stream_id) {
+            return Ok(vec![ClientSessionResult::RaisedEvent(
+                ClientSessionEvent::StatusReceived { status },
+            )]);
         }
-
-        let mut properties = match arguments.remove(0) {
-            Amf0Value::Object(properties) => properties,
+        let event = match code {
+            "NetStream.Play.Start" if self.current_state == ClientState::PlayRequested => {
+                return self.handle_play_start(status);
+            }
+            "NetStream.Publish.Start" if self.current_state == ClientState::PublishRequested => {
+                return self.handle_publish_start(status);
+            }
+            "NetStream.Play.StreamNotFound"
+            | "NetStream.Play.Failed"
+            | "NetStream.Play.FileStructureInvalid"
+            | "NetStream.Play.NoSupportedTrackFound"
+                if self.current_state == ClientState::PlayRequested =>
+            {
+                ClientSessionEvent::PlaybackRequestRejected { status }
+            }
+            "NetStream.Publish.BadName"
+            | "NetStream.Publish.Denied"
+            | "NetStream.Publish.Failed"
+                if self.current_state == ClientState::PublishRequested =>
+            {
+                ClientSessionEvent::PublishRequestRejected { status }
+            }
+            "NetStream.Play.Complete" | "NetStream.Play.Stop"
+                if matches!(
+                    self.current_state,
+                    ClientState::Playing | ClientState::PlayRequested
+                ) =>
+            {
+                ClientSessionEvent::PlaybackFinished { status }
+            }
+            "NetStream.Unpublish.Success" | "NetStream.Publish.Stop"
+                if matches!(
+                    self.current_state,
+                    ClientState::Publishing | ClientState::PublishRequested
+                ) =>
+            {
+                ClientSessionEvent::PublishingFinished { status }
+            }
+            _ if status.text("level") == Some("error")
+                && self.current_state == ClientState::PlayRequested =>
+            {
+                ClientSessionEvent::PlaybackRequestRejected { status }
+            }
+            _ if status.text("level") == Some("error")
+                && self.current_state == ClientState::PublishRequested =>
+            {
+                ClientSessionEvent::PublishRequestRejected { status }
+            }
             _ => {
-                return Err(ClientSessionError::InvalidOnStatusArguments);
+                return Ok(vec![ClientSessionResult::RaisedEvent(
+                    ClientSessionEvent::StatusReceived { status },
+                )]);
             }
         };
-
-        let code = match properties.shift_remove("code") {
-            Some(Amf0Value::Utf8String(code)) => code,
-
-            _ => {
-                return Err(ClientSessionError::InvalidOnStatusArguments);
-            }
+        // Release the server-side stream before another request can allocate a new one.
+        let delete = RtmpMessage::Amf0Command {
+            command_name: "deleteStream".into(),
+            transaction_id: 0.0,
+            command_object: Amf0Value::Null,
+            additional_arguments: vec![Amf0Value::Number(stream_id as f64)],
         };
-
-        match code.as_ref() {
-            "NetStream.Play.Start" => self.handle_play_start(),
-            "NetStream.Publish.Start" => self.handle_publish_start(),
-
-            x => {
-                let event = ClientSessionEvent::UnhandleableOnStatusCode {
-                    code: x.to_string(),
-                };
-                Ok(vec![ClientSessionResult::RaisedEvent(event)])
-            }
-        }
+        let payload = delete.into_message_payload(self.get_epoch(), 0)?;
+        let packet = self.serializer.serialize(&payload, false, false)?;
+        self.current_state = ClientState::Connected;
+        self.active_stream_id = None;
+        Ok(vec![
+            ClientSessionResult::OutboundResponse(packet),
+            ClientSessionResult::RaisedEvent(event),
+        ])
     }
 
-    fn handle_play_start(&mut self) -> ClientResult {
+    fn handle_play_start(&mut self, status: CommandStatus) -> ClientResult {
         match self.current_state {
             ClientState::PlayRequested => (),
             _ => {
@@ -1113,11 +1160,11 @@ impl ClientSession {
 
         self.current_state = ClientState::Playing;
 
-        let event = ClientSessionEvent::PlaybackRequestAccepted;
+        let event = ClientSessionEvent::PlaybackRequestAccepted { status };
         Ok(vec![ClientSessionResult::RaisedEvent(event)])
     }
 
-    fn handle_publish_start(&mut self) -> ClientResult {
+    fn handle_publish_start(&mut self, status: CommandStatus) -> ClientResult {
         match self.current_state {
             ClientState::PublishRequested => (),
             _ => {
@@ -1128,34 +1175,7 @@ impl ClientSession {
         };
 
         self.current_state = ClientState::Publishing;
-        let event = ClientSessionEvent::PublishRequestAccepted;
-        Ok(vec![ClientSessionResult::RaisedEvent(event)])
-    }
-
-    fn handle_amf0_data_on_meta_data(
-        &mut self,
-        mut data: Vec<Amf0Value>,
-        timestamp: RtmpTimestamp,
-        raw_payload: Bytes,
-    ) -> ClientResult {
-        if data.len() < 1 {
-            // No data so ignore it
-            return Ok(Vec::new());
-        }
-
-        let properties = match data.remove(0) {
-            Amf0Value::Object(properties) => properties,
-            _ => return Ok(Vec::new()), // malformed so ignore it
-        };
-
-        let mut metadata = StreamMetadata::new();
-        metadata.apply_metadata_values(properties);
-
-        let event = ClientSessionEvent::StreamMetadataReceived {
-            metadata,
-            raw_payload,
-            timestamp,
-        };
+        let event = ClientSessionEvent::PublishRequestAccepted { status };
         Ok(vec![ClientSessionResult::RaisedEvent(event)])
     }
 
@@ -1218,18 +1238,7 @@ impl ClientSession {
     }
 
     fn get_epoch(&self) -> RtmpTimestamp {
-        match self.start_time.elapsed() {
-            Ok(duration) => {
-                let milliseconds =
-                    (duration.as_secs() * 1000) + (duration.subsec_nanos() as u64 / 1_000_000);
-
-                // Casting to u32 should auto-wrap the value as expected.  If not a stream will probably
-                // break after 49 days but testing shows it should wrap
-                RtmpTimestamp::new(milliseconds as u32)
-            }
-
-            Err(_) => RtmpTimestamp::new(0), // Time went backwards, so just consider time as at epoch
-        }
+        RtmpTimestamp::new(self.start_time.elapsed().as_millis() as u32)
     }
 
     fn get_next_transaction_id(&mut self) -> u32 {

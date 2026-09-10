@@ -479,12 +479,18 @@ fn can_receive_and_raise_event_for_metadata_from_obs() {
 
     match events.remove(0) {
         ServerSessionEvent::StreamMetadataChanged {
+            message,
             app_name,
             stream_key,
             metadata,
-            raw_metadata,
             ..
         } => {
+            let raw_metadata = message
+                .metadata()
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>();
             assert_eq!(
                 app_name.as_ref(),
                 TEST_APP_NAME,
@@ -589,6 +595,7 @@ fn can_receive_audio_data_on_published_stream() {
             stream_key,
             data,
             timestamp,
+            ..
         } => {
             assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
             assert_eq!(
@@ -640,6 +647,7 @@ fn can_receive_video_data_on_published_stream() {
             stream_key,
             data,
             timestamp,
+            ..
         } => {
             assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
             assert_eq!(
@@ -693,6 +701,7 @@ fn publish_finished_event_raised_when_delete_stream_invoked_on_publishing_stream
         ServerSessionEvent::PublishStreamFinished {
             app_name,
             stream_key,
+            ..
         } => {
             assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
             assert_eq!(
@@ -742,7 +751,7 @@ fn gstreamer_string_delete_stream_id_finishes_publishing() {
 
     assert!(matches!(
         events.as_slice(),
-        [ServerSessionEvent::PublishStreamFinished { app_name, stream_key }]
+        [ServerSessionEvent::PublishStreamFinished { app_name, stream_key, .. }]
             if app_name.as_ref() == TEST_APP_NAME && stream_key.as_ref() == TEST_STREAM_KEY
     ));
 }
@@ -785,6 +794,7 @@ fn publish_finished_event_raised_when_close_stream_invoked_on_publishing_stream(
         ServerSessionEvent::PublishStreamFinished {
             app_name,
             stream_key,
+            ..
         } => {
             assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
             assert_eq!(
@@ -895,6 +905,7 @@ fn can_accept_play_command_with_no_optional_parameters_to_requested_stream_key()
             reset,
             request_id,
             stream_id: sid,
+            ..
         } => {
             assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
             assert_eq!(
@@ -909,7 +920,7 @@ fn can_accept_play_command_with_no_optional_parameters_to_requested_stream_key()
             );
             assert_eq!(duration, None, "Unexpected duration");
             assert_eq!(reset, false, "Unexpected reset value");
-            assert_eq!(sid, stream_id, "Unexpected stream id");
+            assert_eq!(sid.get(), stream_id, "Unexpected stream id");
             request_id
         }
 
@@ -1041,6 +1052,7 @@ fn can_accept_play_command_with_all_optional_parameters_to_requested_stream_key(
             reset,
             request_id,
             stream_id: sid,
+            ..
         } => {
             assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
             assert_eq!(
@@ -1055,7 +1067,7 @@ fn can_accept_play_command_with_all_optional_parameters_to_requested_stream_key(
             );
             assert_eq!(duration, Some(25), "Unexpected duration");
             assert_eq!(reset, true, "Unexpected reset value");
-            assert_eq!(sid, stream_id, "Unexpected stream id");
+            assert_eq!(sid.get(), stream_id, "Unexpected stream id");
             request_id
         }
 
@@ -1105,6 +1117,7 @@ fn play_finished_event_when_close_stream_invoked() {
         ServerSessionEvent::PlayStreamFinished {
             app_name,
             stream_key,
+            ..
         } => {
             assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
             assert_eq!(
@@ -1160,6 +1173,7 @@ fn play_finished_event_when_delete_stream_invoked_on_playing_stream() {
         ServerSessionEvent::PlayStreamFinished {
             app_name,
             stream_key,
+            ..
         } => {
             assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
             assert_eq!(
@@ -1208,7 +1222,9 @@ fn can_send_metadata_to_playing_stream() {
         video_width: Some(109),
     };
 
-    let packet = session.send_metadata(stream_id, &metadata).unwrap();
+    let packet = session
+        .send_metadata(crate::sessions::StreamId::new(stream_id), &metadata)
+        .unwrap();
     let payload = deserializer
         .get_next_message(&packet.bytes[..])
         .unwrap()
@@ -1317,7 +1333,12 @@ fn can_send_video_data_to_playing_stream() {
     let original_data = Bytes::from(vec![1_u8, 2_u8, 3_u8]);
     let timestamp = RtmpTimestamp::new(500);
     let packet = session
-        .send_video_data(stream_id, original_data.clone(), timestamp.clone(), false)
+        .send_video_data(
+            crate::sessions::StreamId::new(stream_id),
+            original_data.clone(),
+            timestamp.clone(),
+            false,
+        )
         .unwrap();
     let payload = deserializer
         .get_next_message(&packet.bytes[..])
@@ -1363,7 +1384,12 @@ fn can_send_audio_data_to_playing_stream() {
     let original_data = Bytes::from(vec![1_u8, 2_u8, 3_u8]);
     let timestamp = RtmpTimestamp::new(500);
     let packet = session
-        .send_audio_data(stream_id, original_data.clone(), timestamp.clone(), false)
+        .send_audio_data(
+            crate::sessions::StreamId::new(stream_id),
+            original_data.clone(),
+            timestamp.clone(),
+            false,
+        )
         .unwrap();
     let payload = deserializer
         .get_next_message(&packet.bytes[..])
@@ -1465,7 +1491,7 @@ fn event_raised_when_ping_response_received() {
 
     assert_eq!(events.len(), 1, "One event expected");
     match events.remove(0) {
-        ServerSessionEvent::PingResponseReceived { timestamp } => {
+        ServerSessionEvent::PingResponseReceived { timestamp, .. } => {
             assert_eq!(
                 timestamp,
                 RtmpTimestamp::new(5230),
@@ -1534,7 +1560,9 @@ fn can_finish_playing_stream() {
         &mut deserializer,
     );
 
-    let packet = session.finish_playing(stream_id).unwrap();
+    let packet = session
+        .finish_playing(crate::sessions::StreamId::new(stream_id))
+        .unwrap();
     let payload = deserializer
         .get_next_message(&packet.bytes[..])
         .unwrap()
@@ -1703,7 +1731,7 @@ fn event_raised_when_client_sends_an_acknowledgement() {
 
     assert_eq!(events.len(), 1, "Unexpected number of events");
     match events.remove(0) {
-        ServerSessionEvent::AcknowledgementReceived { bytes_received } => {
+        ServerSessionEvent::AcknowledgementReceived { bytes_received, .. } => {
             assert_eq!(
                 bytes_received, 1234,
                 "Incorrect number of bytes received in event"
@@ -2015,6 +2043,7 @@ fn start_playing(
             reset: _,
             request_id,
             stream_id: _,
+            ..
         } => request_id,
 
         x => panic!("Expected play event but instead received: {:?}", x),
@@ -2068,5 +2097,74 @@ fn verify_is_onstatus(subject: &RtmpMessage, expected_status: &str, expected_cod
         }
 
         x => panic!("Expected Amf0Command command, instead received: {:?}", x),
+    }
+}
+
+#[test]
+fn same_key_streams_keep_distinct_identity_for_data_media_and_finish() {
+    let (mut session, initial) = ServerSession::new(get_basic_config()).unwrap();
+    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ChunkDeserializer::new();
+    consume_results(&mut deserializer, initial);
+    perform_connection(
+        TEST_APP_NAME,
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    let first = create_active_stream(&mut session, &mut serializer, &mut deserializer);
+    let second = create_active_stream(&mut session, &mut serializer, &mut deserializer);
+    for id in [first, second] {
+        start_publishing(
+            TEST_STREAM_KEY,
+            id,
+            &mut session,
+            &mut serializer,
+            &mut deserializer,
+        );
+    }
+    assert_ne!(first, second);
+    for id in [second, first] {
+        let messages = vec![
+            RtmpMessage::AudioData {
+                data: Bytes::from_static(b"audio"),
+            },
+            RtmpMessage::VideoData {
+                data: Bytes::from_static(b"video"),
+            },
+            RtmpMessage::Amf0Data {
+                values: vec![
+                    Amf0Value::Utf8String("onMetaData".into()),
+                    Amf0Value::Object(Amf0Object::new()),
+                ],
+            },
+            RtmpMessage::Amf0Data {
+                values: vec![Amf0Value::Utf8String("onCaption".into())],
+            },
+            RtmpMessage::Amf0Command {
+                command_name: "deleteStream".into(),
+                transaction_id: 0.0,
+                command_object: Amf0Value::Null,
+                additional_arguments: vec![Amf0Value::Number(id as f64)],
+            },
+        ];
+        for message in messages {
+            let payload = message
+                .into_message_payload(RtmpTimestamp::new(100), id)
+                .unwrap();
+            let packet = serializer.serialize(&payload, false, false).unwrap();
+            let results = session.handle_input(&packet.bytes).unwrap();
+            let (_, events) = split_results(&mut deserializer, results);
+            assert_eq!(events.len(), 1);
+            let event_id = match &events[0] {
+                ServerSessionEvent::AudioDataReceived { stream_id, .. }
+                | ServerSessionEvent::VideoDataReceived { stream_id, .. }
+                | ServerSessionEvent::StreamMetadataChanged { stream_id, .. }
+                | ServerSessionEvent::StreamDataReceived { stream_id, .. }
+                | ServerSessionEvent::PublishStreamFinished { stream_id, .. } => *stream_id,
+                e => panic!("unexpected event: {e:?}"),
+            };
+            assert_eq!(event_id.get(), id);
+        }
     }
 }

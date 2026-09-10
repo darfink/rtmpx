@@ -5,6 +5,7 @@ use thiserror::Error;
 /// An enumeration defining all the possible errors that could occur while deserializing
 /// RTMP chunks.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ChunkDeserializationError {
     /// The RTMP chunk format requires that RTMP chunks that are not type 0 utilize information
     /// from the previously received chunk on that same chunk stream id.  This error occurs when a
@@ -12,6 +13,7 @@ pub enum ChunkDeserializationError {
     #[error(
         "Received chunk with non-zero chunk type on csid {csid} prior to receiving a type 0 chunk"
     )]
+    #[non_exhaustive]
     NoPreviousChunkOnStream { csid: u32 },
 
     /// The max chunk size does not allow chunk sizes more than 2,147,483,647 (since it's encoded in only
@@ -20,10 +22,12 @@ pub enum ChunkDeserializationError {
     #[error(
         "Requested an invalid max chunk size of {chunk_size}.  The largest chunk size possible is 2147483647"
     )]
+    #[non_exhaustive]
     InvalidMaxChunkSize { chunk_size: usize },
 
     /// The configured policy limit for an inbound RTMP resource was exceeded.
     #[error("Inbound RTMP {resource} limit exceeded: attempted {attempted}, maximum {maximum}")]
+    #[non_exhaustive]
     ResourceLimitExceeded {
         resource: &'static str,
         attempted: usize,
@@ -44,6 +48,7 @@ pub enum ChunkDeserializationError {
     #[error(
         "Chunk stream {csid} declared message length {message_length} but {buffered} bytes are already buffered"
     )]
+    #[non_exhaustive]
     MessageLengthSmallerThanBufferedPayload {
         csid: u32,
         message_length: usize,

@@ -166,6 +166,7 @@ pub struct VideoFourCc(pub [u8; 4]);
 
 /// Owned typed audio interpretation of one RTMP audio message body.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ParsedAudio {
     pub header: AudioTagHeader,
     pub body: AudioTagBody,
@@ -173,6 +174,7 @@ pub struct ParsedAudio {
 
 /// Owned typed video interpretation of one RTMP video message body.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ParsedVideo {
     pub header: VideoTagHeader,
     pub body: VideoTagBody,
@@ -180,6 +182,7 @@ pub struct ParsedVideo {
 
 /// Legacy or Enhanced audio tag header.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum AudioTagHeader {
     Legacy(LegacyAudioHeader),
     Enhanced(EnhancedAudioHeader),
@@ -187,6 +190,7 @@ pub enum AudioTagHeader {
 
 /// Legacy FLV audio tag header nibbles (E.4.2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LegacyAudioHeader {
     pub sound_format: u8,
     pub sound_rate: u8,
@@ -196,6 +200,7 @@ pub struct LegacyAudioHeader {
 
 /// Enhanced audio tag header with a resolved packet type.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct EnhancedAudioHeader {
     /// Packet type after ModEx chaining (and the multitrack byte, if any).
     pub packet_type: u8,
@@ -206,6 +211,7 @@ pub struct EnhancedAudioHeader {
 
 /// Multitrack mode selected by an Enhanced audio tag header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AudioHeaderContent {
     NoMultitrack(AudioFourCc),
     OneTrack(AudioFourCc),
@@ -219,6 +225,7 @@ pub enum AudioHeaderContent {
 
 /// Legacy or Enhanced audio tag body.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum AudioTagBody {
     Legacy(LegacyAudioBody),
     Enhanced(EnhancedAudioBody),
@@ -226,6 +233,7 @@ pub enum AudioTagBody {
 
 /// Legacy FLV audio tag body.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum LegacyAudioBody {
     AacSequenceHeader(Bytes),
     AacRaw(Bytes),
@@ -235,6 +243,7 @@ pub enum LegacyAudioBody {
 
 /// Enhanced audio tag body: one packet or one per track.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum EnhancedAudioBody {
     NoMultitrack {
         four_cc: AudioFourCc,
@@ -245,6 +254,7 @@ pub enum EnhancedAudioBody {
 
 /// One track of a multitrack Enhanced audio tag.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct AudioTrack {
     pub four_cc: AudioFourCc,
     pub track_id: u8,
@@ -253,6 +263,7 @@ pub struct AudioTrack {
 
 /// Enhanced audio packet. Sequence-start bytes are raw slices of the input.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum AudioPacket {
     SequenceStart(Bytes),
     CodedFrames(Bytes),
@@ -263,6 +274,7 @@ pub enum AudioPacket {
 
 /// Video tag header: frame type plus legacy or Enhanced data.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct VideoTagHeader {
     pub frame_type: u8,
     pub data: VideoTagHeaderData,
@@ -270,6 +282,7 @@ pub struct VideoTagHeader {
 
 /// Legacy or Enhanced video tag header data.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum VideoTagHeaderData {
     Legacy(LegacyVideoHeader),
     Enhanced(EnhancedVideoHeader),
@@ -277,6 +290,7 @@ pub enum VideoTagHeaderData {
 
 /// Legacy FLV video tag header (E.4.3.1).
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum LegacyVideoHeader {
     VideoCommand(u8),
     AvcPacket(LegacyAvcPacket),
@@ -285,6 +299,7 @@ pub enum LegacyVideoHeader {
 
 /// Legacy AVC packet header. The NALU offset is sign-extended at parse time.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum LegacyAvcPacket {
     SequenceHeader,
     Nalu {
@@ -299,6 +314,7 @@ pub enum LegacyAvcPacket {
 
 /// Enhanced video tag header with a resolved packet type.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct EnhancedVideoHeader {
     /// Packet type after ModEx chaining (and the multitrack byte, if any).
     pub packet_type: u8,
@@ -309,6 +325,7 @@ pub struct EnhancedVideoHeader {
 
 /// Multitrack mode (or command) selected by an Enhanced video tag header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VideoHeaderContent {
     VideoCommand(u8),
     NoMultitrack(VideoFourCc),
@@ -323,6 +340,7 @@ pub enum VideoHeaderContent {
 
 /// Legacy or Enhanced video tag body.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum VideoTagBody {
     Legacy(LegacyVideoBody),
     Enhanced(EnhancedVideoBody),
@@ -330,6 +348,7 @@ pub enum VideoTagBody {
 
 /// Legacy FLV video tag body.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum LegacyVideoBody {
     Command,
     AvcSequenceHeader(Bytes),
@@ -338,6 +357,7 @@ pub enum LegacyVideoBody {
 
 /// Enhanced video tag body: one packet, one per track, or a header command.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum EnhancedVideoBody {
     Command,
     NoMultitrack {
@@ -349,6 +369,7 @@ pub enum EnhancedVideoBody {
 
 /// One track of a multitrack Enhanced video tag.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct VideoTrack {
     pub four_cc: VideoFourCc,
     pub track_id: u8,
@@ -358,6 +379,7 @@ pub struct VideoTrack {
 /// Enhanced video packet. Payloads are raw slices of the input; sequence-start
 /// records are validated structurally but never re-serialized.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum VideoPacket {
     SequenceStart(Bytes),
     Mpeg2TsSequenceStart(Bytes),

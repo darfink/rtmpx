@@ -119,3 +119,11 @@ pub fn read_i32_be<R: Read>(reader: &mut R) -> io::Result<i32> {
 pub fn check_collection_len(len: usize) -> bool {
     len <= MAX_COLLECTION_LEN
 }
+
+impl<R: AmfRead> AmfRead for std::io::BufReader<R> {
+    fn remaining_hint(&self) -> Option<usize> {
+        self.get_ref()
+            .remaining_hint()?
+            .checked_add(self.buffer().len())
+    }
+}

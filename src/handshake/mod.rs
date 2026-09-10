@@ -46,6 +46,7 @@ const GENUINE_FP_CONST: &'static str = "Genuine Adobe Flash Player 001";
 
 /// Contains the result after processing bytes for the handshaking process
 #[derive(PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum HandshakeProcessResult {
     /// The handshake process is still on-going
     InProgress {
@@ -68,6 +69,7 @@ pub enum HandshakeProcessResult {
 /// This only matters due to the FP9 handshaking process, where the client and server use different
 /// calculations for packet generation.
 #[derive(Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PeerType {
     /// Handshake being represented as a server
     Server,

@@ -6,6 +6,7 @@ use thiserror::Error;
 /// Data pertaining to errors that occurred during the handshaking process.
 /// Enumeration that represents the various errors that can occur during the handshaking process
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum HandshakeError {
     /// The RTMP specification requires the first byte in the handshake process to start with a
     /// 3, so this error is encountered if any other value is in the first byte.

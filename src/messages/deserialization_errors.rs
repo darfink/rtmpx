@@ -9,6 +9,7 @@ use crate::amf3::Amf3DeserializationError as Amf3Error;
 /// Enumeration that represents the various errors that may occur while trying to
 /// deserialize a RTMP message
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MessageDeserializationError {
     /// The bytes or amf0 values contained in the message were not what were expected, and thus
     /// the message could not be parsed.

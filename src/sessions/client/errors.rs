@@ -7,7 +7,11 @@ use thiserror::Error;
 /// Error state when a client session encounters an error
 /// Represents the type of error that occurred
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ClientSessionError {
+    /// An earlier input error terminated this session. Close its transport.
+    #[error("session terminated after an input error")]
+    SessionFailed,
     /// Encountered when an error occurs while deserializing the incoming byte data
     #[error("An error occurred deserializing incoming data: {0}")]
     ChunkDeserializationError(#[from] ChunkDeserializationError),
@@ -39,6 +43,7 @@ pub enum ClientSessionError {
     #[error(
         "The request could not be performed while the session is in the {current_state:?} state"
     )]
+    #[non_exhaustive]
     SessionInInvalidState { current_state: ClientState },
 
     /// Encountered when attempting to send a message that requires having an active stream

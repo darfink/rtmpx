@@ -113,6 +113,7 @@ async fn write_server_results(
                 }
             },
             ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            _ => panic!("unexpected future protocol variant"),
         }
     }
     stream
@@ -164,6 +165,7 @@ async fn server_handshake(stream: &mut TcpStream, read_buf: &mut [u8]) -> Result
                 }
                 return Ok(remaining_bytes);
             }
+            _ => panic!("unexpected future protocol variant"),
         }
     }
 }

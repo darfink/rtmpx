@@ -39,6 +39,7 @@ fn empty_input_returns_promptly_without_blocking() {
         HandshakeProcessResult::Completed { .. } => {
             panic!("handshake cannot complete with no input")
         }
+        _ => panic!("unexpected future protocol variant"),
     }
     assert!(
         elapsed < Duration::from_secs(1),

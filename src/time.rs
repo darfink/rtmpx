@@ -1,5 +1,5 @@
-//! RTMP timestamps are 32 byte unsigned integers representing the number of milliseconds from
-//! and unknown epoch.
+//! RTMP timestamps are 32-bit unsigned integers representing the number of milliseconds from
+//! an unknown epoch.
 //!
 //! Since it's meant to support streams that can go on forever, timestamps have to work with
 //! time values that overflow and underflow a 32 bit integer but still be able to do comparisons.
@@ -21,7 +21,7 @@
 //! let time3 = RtmpTimestamp::new(30);
 //! let mut time4 = RtmpTimestamp::new(10);
 //!
-//! assert!(time1 < time2);
+//! assert!(time1.serial_cmp(time2) == Some(std::cmp::Ordering::Less));
 //! assert_eq!(time3, time1 + time2);
 //! assert_eq!(time2, time1 + 10);
 //!
@@ -38,19 +38,19 @@
 //! let time2 = RtmpTimestamp::new(4000000000);
 //! let time3 = RtmpTimestamp::new(3000000000);
 //!
-//! assert!(time1 > time2);
-//! assert!(time3 < time2);
+//! assert!(time1.serial_cmp(time2) == Some(std::cmp::Ordering::Greater));
+//! assert!(time3.serial_cmp(time2) == Some(std::cmp::Ordering::Less));
 //! ```
 //!
-//! For ease of use, a `RtmpTimestamp` can be directly compared to u32s:
+//! Construct timestamps from raw values before serial comparison. Equality also accepts `u32`:
 //!
 //! ```
 //! use rtmpx::time::RtmpTimestamp;
 //!
 //! let time = RtmpTimestamp::new(50);
 //!
-//! assert!(time < 60);
-//! assert!(time > 20);
+//! assert!(time.serial_cmp(RtmpTimestamp::new(60)) == Some(std::cmp::Ordering::Less));
+//! assert!(time.serial_cmp(RtmpTimestamp::new(20)) == Some(std::cmp::Ordering::Greater));
 //! assert!(time == 50);
 //! ```
 
@@ -58,7 +58,20 @@ use std::cmp::{Ordering, max, min};
 use std::num::Wrapping;
 use std::ops::{Add, Sub};
 
-/// The representation of a RTMP timestamp
+/// A wrapping RTMP timestamp. It has no global chronological ordering.
+///
+/// Use [`Self::serial_cmp`] for nearby timestamps or unwrap the clock before sorting.
+///
+/// ```compile_fail
+/// use rtmpx::time::RtmpTimestamp;
+/// let mut times = [RtmpTimestamp::new(0), RtmpTimestamp::new(1)];
+/// times.sort(); // A circular clock does not implement Ord.
+/// ```
+///
+/// ```compile_fail
+/// use rtmpx::time::RtmpTimestamp;
+/// let _ = RtmpTimestamp::new(0) < RtmpTimestamp::new(1);
+/// ```
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
 pub struct RtmpTimestamp {
     /// The time (as milliseconds from an unknown epoch) being represented by the timestamp
@@ -71,6 +84,24 @@ impl RtmpTimestamp {
         RtmpTimestamp {
             value: initial_value,
         }
+    }
+
+    /// Compare nearby timestamps on the wrapping RTMP clock.
+    ///
+    /// Only meaningful when the actual separation is less than 2^31 milliseconds.
+    /// Exactly half a cycle is ambiguous and returns `None`. This circular relation
+    /// is not transitive across arbitrary timestamps; do not use it for sorting.
+    pub fn serial_cmp(self, other: Self) -> Option<Ordering> {
+        if self.value.wrapping_sub(other.value) == 1 << 31 {
+            None
+        } else {
+            Some(compare(&self.value, &other.value))
+        }
+    }
+
+    /// Elapsed milliseconds modulo 2^32. The caller determines the clock epoch.
+    pub fn wrapping_elapsed_since(self, earlier: Self) -> u32 {
+        self.value.wrapping_sub(earlier.value)
     }
 
     /// Sets the timestamp to a new time value
@@ -125,18 +156,6 @@ impl Sub<u32> for RtmpTimestamp {
     }
 }
 
-impl Ord for RtmpTimestamp {
-    fn cmp(&self, other: &Self) -> Ordering {
-        compare(&self.value, &other.value)
-    }
-}
-
-impl PartialOrd for RtmpTimestamp {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(compare(&self.value, &other.value))
-    }
-}
-
 impl PartialEq<u32> for RtmpTimestamp {
     fn eq(&self, other: &u32) -> bool {
         self.value == *other
@@ -146,18 +165,6 @@ impl PartialEq<u32> for RtmpTimestamp {
 impl PartialEq<RtmpTimestamp> for u32 {
     fn eq(&self, other: &RtmpTimestamp) -> bool {
         self == &other.value
-    }
-}
-
-impl PartialOrd<u32> for RtmpTimestamp {
-    fn partial_cmp(&self, other: &u32) -> Option<Ordering> {
-        Some(compare(&self.value, other))
-    }
-}
-
-impl PartialOrd<RtmpTimestamp> for u32 {
-    fn partial_cmp(&self, other: &RtmpTimestamp) -> Option<Ordering> {
-        Some(compare(&self, &other.value))
     }
 }
 
@@ -258,8 +265,14 @@ mod tests {
         let time1 = RtmpTimestamp::new(50);
         let time2 = RtmpTimestamp::new(60);
 
-        assert!(time1 < time2, "time1 was not less than time2");
-        assert!(time2 > time1, "time2 was not greater than time2");
+        assert!(
+            time1.serial_cmp(time2) == Some(std::cmp::Ordering::Less),
+            "time1 was not less than time2"
+        );
+        assert!(
+            time2.serial_cmp(time1) == Some(std::cmp::Ordering::Greater),
+            "time2 was not greater than time2"
+        );
         assert_eq!(
             time1,
             RtmpTimestamp::new(50),
@@ -274,11 +287,11 @@ mod tests {
         let time3 = RtmpTimestamp::new(3000000000);
 
         assert!(
-            time1 > time2,
+            time1.serial_cmp(time2) == Some(std::cmp::Ordering::Greater),
             "10000 was not marked as greater than 4000000000"
         );
         assert!(
-            time3 < time2,
+            time3.serial_cmp(time2) == Some(std::cmp::Ordering::Less),
             "4000000000 was not marked greater than 3000000000"
         );
     }
@@ -287,8 +300,14 @@ mod tests {
     fn can_compare_timestamps_with_u32() {
         let time1 = RtmpTimestamp::new(50);
 
-        assert!(time1 < 60, "time1 was not less than 60");
-        assert!(time1 > 20, "time1 was not greater than 20");
+        assert!(
+            time1.serial_cmp(RtmpTimestamp::new(60)) == Some(std::cmp::Ordering::Less),
+            "time1 was not less than 60"
+        );
+        assert!(
+            time1.serial_cmp(RtmpTimestamp::new(20)) == Some(std::cmp::Ordering::Greater),
+            "time1 was not greater than 20"
+        );
         assert_eq!(time1, 50, "time1 was not equal to 50");
     }
 

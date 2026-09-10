@@ -15,6 +15,7 @@ const MAX_INITIAL_TIMESTAMP: u32 = 16777215;
 ///
 /// Defaults mirror the defensive limits used by Scuffle's public listener.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ChunkDeserializerConfig {
     pub maximum_chunk_size: usize,
     pub maximum_message_size: usize,
@@ -1282,5 +1283,33 @@ mod tests {
         }
 
         cursor.into_inner()
+    }
+}
+
+impl ChunkDeserializerConfig {
+    /// Set `maximum_chunk_size`.
+    pub fn with_maximum_chunk_size(mut self, value: usize) -> Self {
+        self.maximum_chunk_size = value;
+        self
+    }
+    /// Set `maximum_message_size`.
+    pub fn with_maximum_message_size(mut self, value: usize) -> Self {
+        self.maximum_message_size = value;
+        self
+    }
+    /// Set `maximum_tracked_chunk_streams`.
+    pub fn with_maximum_tracked_chunk_streams(mut self, value: usize) -> Self {
+        self.maximum_tracked_chunk_streams = value;
+        self
+    }
+    /// Set `maximum_partial_messages`.
+    pub fn with_maximum_partial_messages(mut self, value: usize) -> Self {
+        self.maximum_partial_messages = value;
+        self
+    }
+    /// Set `maximum_buffered_bytes`.
+    pub fn with_maximum_buffered_bytes(mut self, value: usize) -> Self {
+        self.maximum_buffered_bytes = value;
+        self
     }
 }

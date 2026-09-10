@@ -3,6 +3,7 @@ use crate::chunk_io::ChunkDeserializerConfig;
 
 /// The configuration options that govern how a RTMP server session should operate
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ServerSessionConfig {
     pub fms_version: String,
     pub chunk_size: u32,
@@ -42,5 +43,43 @@ impl ServerSessionConfig {
 impl Default for ServerSessionConfig {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ServerSessionConfig {
+    /// Set `fms_version`.
+    pub fn with_fms_version(mut self, value: String) -> Self {
+        self.fms_version = value;
+        self
+    }
+    /// Set `chunk_size`.
+    pub fn with_chunk_size(mut self, value: u32) -> Self {
+        self.chunk_size = value;
+        self
+    }
+    /// Set `peer_bandwidth`.
+    pub fn with_peer_bandwidth(mut self, value: u32) -> Self {
+        self.peer_bandwidth = value;
+        self
+    }
+    /// Set `window_ack_size`.
+    pub fn with_window_ack_size(mut self, value: u32) -> Self {
+        self.window_ack_size = value;
+        self
+    }
+    /// Set `send_on_bw_done_message_on_start`.
+    pub fn with_send_on_bw_done_message_on_start(mut self, value: bool) -> Self {
+        self.send_on_bw_done_message_on_start = value;
+        self
+    }
+    /// Set `max_object_encoding`.
+    pub fn with_max_object_encoding(mut self, value: AmfEncoding) -> Self {
+        self.max_object_encoding = value;
+        self
+    }
+    /// Set `chunk_deserializer`.
+    pub fn with_chunk_deserializer(mut self, value: ChunkDeserializerConfig) -> Self {
+        self.chunk_deserializer = value;
+        self
     }
 }

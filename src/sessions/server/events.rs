@@ -1,12 +1,14 @@
 use super::PublishMode;
 use crate::amf0::Amf0Value;
 use crate::sessions::StreamMetadata;
+use crate::sessions::{DataMessage, RequestId, StreamId};
 use crate::time::RtmpTimestamp;
 use bytes::Bytes;
 use std::sync::Arc;
 
 /// Represents where RTMP playback should start from
 #[derive(PartialEq, Debug, Clone)]
+#[non_exhaustive]
 pub enum PlayStartValue {
     /// If a live stream exists for the specified stream keyplay it, if not
     /// play the recorded stream with a matching name
@@ -21,13 +23,16 @@ pub enum PlayStartValue {
 
 /// An event that a server session can raise
 #[derive(Debug, PartialEq, Clone)]
+#[non_exhaustive]
 pub enum ServerSessionEvent {
     /// The client is changing the maximum size of the RTMP chunks they will be sending
+    #[non_exhaustive]
     ClientChunkSizeChanged { new_chunk_size: u32 },
 
     /// The client is requesting a connection on the specified RTMP application name
+    #[non_exhaustive]
     ConnectionRequested {
-        request_id: u32,
+        request_id: RequestId,
         app_name: Arc<str>,
         /// The remaining `connect` command object properties.
         ///
@@ -40,63 +45,58 @@ pub enum ServerSessionEvent {
     },
 
     /// The client is requesting a stream key be released for use.
+    #[non_exhaustive]
     ReleaseStreamRequested {
-        request_id: u32,
+        request_id: RequestId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
     },
 
     /// The client is requesting the ability to publish on the specified stream key,
+    #[non_exhaustive]
     PublishStreamRequested {
-        request_id: u32,
+        request_id: RequestId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
         mode: PublishMode,
-        stream_id: u32,
+        stream_id: StreamId,
     },
 
     /// The client is finished publishing on the specified stream key
+    #[non_exhaustive]
     PublishStreamFinished {
+        stream_id: StreamId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
     },
 
     /// The client is changing metadata properties of the stream being published
+    #[non_exhaustive]
     StreamMetadataChanged {
+        stream_id: StreamId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
         metadata: StreamMetadata,
-        /// The unparsed `onMetaData` AMF0 properties as the publisher
-        /// sent them.
-        ///
-        /// `metadata` above keeps only the fields this crate knows about, which
-        /// silently drops everything else - including the Enhanced RTMP codec
-        /// hints modern encoders emit. A proxy must relay metadata verbatim, so
-        /// the original values are carried alongside the parsed view.
-        raw_metadata: Vec<(String, crate::amf0::Amf0Value)>,
-        /// Original encoded AMF payload, authoritative for lossless relaying.
-        raw_payload: Bytes,
-        /// True when raw_payload is AMF3 (type 15); false for AMF0 (type 18).
-        is_amf3: bool,
-        timestamp: RtmpTimestamp,
+        message: DataMessage,
     },
 
-    /// A non-metadata AMF0 script-data message was received from the publisher.
+    /// Script data other than recognized metadata, including undecodable bodies.
     ///
     /// The raw encoded payload is carried so relays can preserve events such as
     /// `onCaption` without decoding and re-encoding their application-specific
     /// fields.
+    #[non_exhaustive]
     StreamDataReceived {
+        stream_id: StreamId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
-        raw_payload: Bytes,
-        /// True when raw_payload is AMF3 (type 15); false for AMF0 (type 18).
-        is_amf3: bool,
-        timestamp: RtmpTimestamp,
+        message: DataMessage,
     },
 
     /// Audio data was received from the client
+    #[non_exhaustive]
     AudioDataReceived {
+        stream_id: StreamId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
         data: Bytes,
@@ -104,7 +104,9 @@ pub enum ServerSessionEvent {
     },
 
     /// Video data received from the client
+    #[non_exhaustive]
     VideoDataReceived {
+        stream_id: StreamId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
         data: Bytes,
@@ -112,7 +114,9 @@ pub enum ServerSessionEvent {
     },
 
     /// The client sent an Amf0 command that was not able to be handled
+    #[non_exhaustive]
     UnhandleableAmf0Command {
+        stream_id: StreamId,
         command_name: String,
         transaction_id: f64,
         command_object: Amf0Value,
@@ -120,25 +124,30 @@ pub enum ServerSessionEvent {
     },
 
     /// The client is requesting playback of the specified stream
+    #[non_exhaustive]
     PlayStreamRequested {
-        request_id: u32,
+        request_id: RequestId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
         start_at: PlayStartValue,
         duration: Option<u32>,
         reset: bool,
-        stream_id: u32,
+        stream_id: StreamId,
     },
 
     /// The client is finished with playback of the specified stream
+    #[non_exhaustive]
     PlayStreamFinished {
+        stream_id: StreamId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
     },
 
     /// The client has sent an acknowledgement that they have received the specified number of bytes
+    #[non_exhaustive]
     AcknowledgementReceived { bytes_received: u32 },
 
     /// The client has responded to a ping request
+    #[non_exhaustive]
     PingResponseReceived { timestamp: RtmpTimestamp },
 }

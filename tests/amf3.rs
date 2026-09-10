@@ -620,6 +620,7 @@ fn send_to_server(
             }
             ServerSessionResult::RaisedEvent(event) => events.push(event),
             ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            _ => panic!("unexpected future protocol variant"),
         }
     }
     (responses, events, raw)
@@ -800,12 +801,15 @@ fn amf3_end_to_end_publish_flow_preserves_bytes() {
     );
     assert_eq!(events.len(), 1);
     match &events[0] {
-        ServerSessionEvent::StreamMetadataChanged {
-            is_amf3,
-            raw_payload,
-            raw_metadata,
-            ..
-        } => {
+        ServerSessionEvent::StreamMetadataChanged { message, .. } => {
+            let raw_metadata = message
+                .metadata()
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let raw_payload = message.payload().clone();
+            let is_amf3 = message.wire_type() == rtmpx::sessions::DataMessageType::Amf3;
             assert!(is_amf3);
             assert_eq!(raw_payload, &raw, "relay keeps the original bytes");
             assert!(raw_metadata.iter().any(|(k, _)| k == "width"));
@@ -830,11 +834,9 @@ fn amf3_end_to_end_publish_flow_preserves_bytes() {
     );
     assert_eq!(events.len(), 1);
     match &events[0] {
-        ServerSessionEvent::StreamDataReceived {
-            is_amf3,
-            raw_payload,
-            ..
-        } => {
+        ServerSessionEvent::StreamDataReceived { message, .. } => {
+            let raw_payload = message.payload().clone();
+            let is_amf3 = message.wire_type() == rtmpx::sessions::DataMessageType::Amf3;
             assert!(is_amf3);
             assert_eq!(raw_payload, &raw);
         }
@@ -971,7 +973,11 @@ fn client_raw_amf3_relay_keeps_type_15_bytes() {
 
     let body = Bytes::from_static(b"\x00\x06\x05hi\x06\x00");
     let result = session
-        .publish_raw_amf3_data_payload(body.clone(), RtmpTimestamp::new(10))
+        .publish_data(rtmpx::sessions::DataMessage::new(
+            rtmpx::sessions::DataMessageType::Amf3,
+            RtmpTimestamp::new(10),
+            body.clone(),
+        ))
         .unwrap();
     let packet = match result {
         ClientSessionResult::OutboundResponse(packet) => packet,
@@ -985,7 +991,11 @@ fn client_raw_amf3_relay_keeps_type_15_bytes() {
     assert_eq!(payload.data, body);
     let body0 = Bytes::from_static(b"amf0-bytes");
     let result = session
-        .publish_raw_data_payload(body0.clone(), RtmpTimestamp::new(11))
+        .publish_data(rtmpx::sessions::DataMessage::new(
+            rtmpx::sessions::DataMessageType::Amf0,
+            RtmpTimestamp::new(11),
+            body0.clone(),
+        ))
         .unwrap();
     let packet = match result {
         ClientSessionResult::OutboundResponse(packet) => packet,

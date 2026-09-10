@@ -213,7 +213,7 @@ fn event_raised_when_connect_request_rejected() {
 
     assert_eq!(events.len(), 1, "Expected one event returned");
     match events.remove(0) {
-        ClientSessionEvent::ConnectionRequestRejected { description } => {
+        ClientSessionEvent::ConnectionRequestRejected { description, .. } => {
             assert!(description.len() > 0, "Expected a non-empty description");
         }
 
@@ -419,7 +419,7 @@ fn successful_play_request_workflow() {
 
     assert_eq!(events.len(), 1, "Expected one event returned");
     match events.remove(0) {
-        ClientSessionEvent::PlaybackRequestAccepted => (),
+        ClientSessionEvent::PlaybackRequestAccepted { .. } => (),
         x => panic!(
             "Expected playback accepted event, instead received: {:?}",
             x
@@ -616,7 +616,9 @@ fn active_play_session_raises_events_when_video_data_received() {
 
     assert_eq!(events.len(), 1, "Unexpected number of events received");
     match events.remove(0) {
-        ClientSessionEvent::VideoDataReceived { data, timestamp } => {
+        ClientSessionEvent::VideoDataReceived {
+            data, timestamp, ..
+        } => {
             assert_eq!(timestamp, RtmpTimestamp::new(1234), "Unexpected timestamp");
             assert_eq!(&data[..], &video_data[..], "Unexpected video data");
         }
@@ -658,7 +660,9 @@ fn active_play_session_raises_events_when_audio_data_received() {
 
     assert_eq!(events.len(), 1, "Unexpected number of events received");
     match events.remove(0) {
-        ClientSessionEvent::AudioDataReceived { data, timestamp } => {
+        ClientSessionEvent::AudioDataReceived {
+            data, timestamp, ..
+        } => {
             assert_eq!(timestamp, RtmpTimestamp::new(1234), "Unexpected timestamp");
             assert_eq!(&data[..], &audio_data[..], "Unexpected audio data");
         }
@@ -808,7 +812,9 @@ fn can_receive_audio_data_prior_to_play_request_being_accepted() {
 
     assert_eq!(events.len(), 1, "Unexpected number of events received");
     match events.remove(0) {
-        ClientSessionEvent::AudioDataReceived { data, timestamp } => {
+        ClientSessionEvent::AudioDataReceived {
+            data, timestamp, ..
+        } => {
             assert_eq!(timestamp, RtmpTimestamp::new(1234), "Unexpected timestamp");
             assert_eq!(&data[..], &audio_data[..], "Unexpected audio data");
         }
@@ -958,7 +964,9 @@ fn can_receive_video_data_prior_to_play_request_being_accepted() {
 
     assert_eq!(events.len(), 1, "Unexpected number of events received");
     match events.remove(0) {
-        ClientSessionEvent::VideoDataReceived { data, timestamp } => {
+        ClientSessionEvent::VideoDataReceived {
+            data, timestamp, ..
+        } => {
             assert_eq!(timestamp, RtmpTimestamp::new(1234), "Unexpected timestamp");
             assert_eq!(&data[..], &video_data[..], "Unexpected video data");
         }
@@ -1111,7 +1119,7 @@ fn event_raised_when_ping_response_received() {
 
     assert_eq!(events.len(), 1, "One event expected");
     match events.remove(0) {
-        ClientSessionEvent::PingResponseReceived { timestamp } => {
+        ClientSessionEvent::PingResponseReceived { timestamp, .. } => {
             assert_eq!(
                 timestamp,
                 RtmpTimestamp::new(5230),
@@ -1270,7 +1278,7 @@ fn event_raised_when_server_sends_an_acknowledgement() {
 
     assert_eq!(events.len(), 1, "Unexpected number of events");
     match events.remove(0) {
-        ClientSessionEvent::AcknowledgementReceived { bytes_received } => {
+        ClientSessionEvent::AcknowledgementReceived { bytes_received, .. } => {
             assert_eq!(
                 bytes_received, 1234,
                 "Incorrect number of bytes received in event"
@@ -1382,7 +1390,7 @@ fn successful_publish_request_workflow() {
 
     assert_eq!(events.len(), 1, "Unexpected number of events");
     match events.remove(0) {
-        ClientSessionEvent::PublishRequestAccepted => (),
+        ClientSessionEvent::PublishRequestAccepted { .. } => (),
         x => panic!(
             "Expected publish request accepted event, instead received: {:?}",
             x
@@ -1988,7 +1996,7 @@ fn perform_successful_play_request(
 
     assert_eq!(events.len(), 1, "Expected one event returned");
     match events.remove(0) {
-        ClientSessionEvent::PlaybackRequestAccepted => (),
+        ClientSessionEvent::PlaybackRequestAccepted { .. } => (),
         x => panic!(
             "Expected playback accepted event, instead received: {:?}",
             x
@@ -2086,7 +2094,7 @@ fn perform_successful_publish_request(
 
     assert_eq!(events.len(), 1, "Unexpected number of events");
     match events.remove(0) {
-        ClientSessionEvent::PublishRequestAccepted => (),
+        ClientSessionEvent::PublishRequestAccepted { .. } => (),
         x => panic!(
             "Expected publish request accepted event, instead received: {:?}",
             x
@@ -2094,4 +2102,107 @@ fn perform_successful_publish_request(
     }
 
     created_stream_id
+}
+
+#[test]
+fn late_status_from_an_old_stream_cannot_change_the_active_operation() {
+    let (mut client, _) = ClientSession::new(ClientSessionConfig::default()).unwrap();
+    // Simulate the state after cancellation followed by a new publish operation.
+    client.current_state = super::ClientState::PublishRequested;
+    client.active_stream_id = Some(2);
+    let mut serializer = ChunkSerializer::new();
+    for (stream_id, code) in [
+        (1, "NetStream.Publish.Start"),
+        (1, "NetStream.Publish.BadName"),
+        (2, "Vendor.Unknown"),
+    ] {
+        let properties = Amf0Object::from([
+            ("code".into(), Amf0Value::Utf8String(code.into())),
+            (
+                "description".into(),
+                Amf0Value::Utf8String("retained".into()),
+            ),
+            ("vendor".into(), Amf0Value::Number(42.0)),
+        ]);
+        let message = RtmpMessage::Amf0Command {
+            command_name: "onStatus".into(),
+            transaction_id: 0.0,
+            command_object: Amf0Value::Null,
+            additional_arguments: vec![Amf0Value::Object(properties.clone())],
+        };
+        let payload = message
+            .into_message_payload(RtmpTimestamp::new(0), stream_id)
+            .unwrap();
+        let packet = serializer.serialize(&payload, false, false).unwrap();
+        let result = client.handle_input(&packet.bytes).unwrap();
+        assert!(
+            matches!(&result[0], ClientSessionResult::RaisedEvent(ClientSessionEvent::StatusReceived { status }) if status.properties() == &properties && status.stream_id().unwrap().get() == stream_id)
+        );
+        assert_eq!(client.state(), &super::ClientState::PublishRequested);
+        assert_eq!(client.active_stream_id().unwrap().get(), 2);
+    }
+}
+
+#[test]
+fn create_stream_rejection_is_recoverable_including_during_cancellation() {
+    for publishing in [false, true] {
+        for cancelled in [false, true] {
+            let (mut client, _) = ClientSession::new(ClientSessionConfig::default()).unwrap();
+            client.current_state = super::ClientState::Connected;
+            let request = if publishing {
+                client.request_publishing("demo".into(), PublishRequestType::Live)
+            } else {
+                client.request_playback("demo".into())
+            }
+            .unwrap();
+            let ClientSessionResult::OutboundResponse(packet) = request else {
+                panic!("missing createStream")
+            };
+            let mut decoder = ChunkDeserializer::new();
+            let payload = decoder.get_next_message(&packet.bytes).unwrap().unwrap();
+            let RtmpMessage::Amf0Command { transaction_id, .. } =
+                payload.to_rtmp_message().unwrap()
+            else {
+                panic!("missing command")
+            };
+            if cancelled {
+                if publishing {
+                    client.stop_publishing().unwrap();
+                } else {
+                    client.stop_playback().unwrap();
+                }
+            }
+            let properties = Amf0Object::from([
+                (
+                    "description".into(),
+                    Amf0Value::Utf8String("stream limit".into()),
+                ),
+                ("vendor".into(), Amf0Value::Number(3.0)),
+            ]);
+            let error = RtmpMessage::Amf0Command {
+                command_name: "_error".into(),
+                transaction_id,
+                command_object: Amf0Value::Null,
+                additional_arguments: vec![Amf0Value::Object(properties.clone())],
+            };
+            let payload = error
+                .into_message_payload(RtmpTimestamp::new(0), 0)
+                .unwrap();
+            let packet = ChunkSerializer::new()
+                .serialize(&payload, false, false)
+                .unwrap();
+            let results = client.handle_input(&packet.bytes).unwrap();
+            assert_eq!(client.state(), &super::ClientState::Connected);
+            assert!(!client.is_failed());
+            if cancelled {
+                assert!(results.is_empty());
+            } else {
+                assert!(matches!(&results[0], ClientSessionResult::RaisedEvent(
+                    ClientSessionEvent::PlaybackRequestRejected { status }
+                    | ClientSessionEvent::PublishRequestRejected { status }
+                ) if status.properties() == &properties));
+            }
+            assert!(client.request_playback("retry".into()).is_ok());
+        }
+    }
 }
