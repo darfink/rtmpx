@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.0.0 — unreleased
+## 3.0.0 — 2026-09-12
 
 Migrate callers before upgrading. Version 3 replaces the version 2 public API.
 

@@ -17,7 +17,7 @@ The library works with any runtime and can also run entirely in memory.
 
 Version 3 redesigns the public API around explicit payload ownership and independent stream lifecycles.
 It replaces the version 2 API without a compatibility layer.
-The version is prepared in this repository; its release tag and crates.io publication are pending.
+Use `rtmpx = "3.0"` to depend on this release from crates.io.
 See the [migration notes](CHANGELOG.md) and [API and ownership guide](docs/zero-copy.md).
 
 ## What the API provides
