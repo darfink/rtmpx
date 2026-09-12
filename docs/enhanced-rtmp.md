@@ -35,6 +35,5 @@ authoritative.
 | Typed outbound Enhanced FLV generation | No | Raw only | Deliberately deferred. Proxy forwarding uses original bytes. |
 | Playback sequence caching | No | N/A | Deliberately deferred. Applications own sequence-header caching and media replay. |
 
-Application codec admission is separate from protocol validation. Rushls can,
-for example, parse a structurally valid codec that its media policy later
-rejects.
+Application codec admission is separate from protocol validation.
+An ingest pipeline can parse a structurally valid codec that its media policy later rejects.

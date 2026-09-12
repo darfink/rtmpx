@@ -66,8 +66,8 @@ The allocation contract has explicit boundaries:
 - Cloning fragmented payloads can allocate descriptors and retain source buffers.
 - Explicit conversion to contiguous bytes copies fragmented payloads.
 
-Routmp exercises segmented forwarding from publisher to upstream.
-Rushls exercises the contiguous codec-input boundary needed by its HLS pipeline.
+A forwarding proxy can retain segmented payloads from publisher to upstream.
+An HLS ingest pipeline can coalesce payloads at its contiguous codec-input boundary.
 Elementary-unit visitors remove FLV framing without a temporary result vector.
 RTMPX does not decode codecs, package HLS, cache playback media, or implement reconnect policy.
 
@@ -160,8 +160,7 @@ Optional interoperability suites use independent implementations:
 - GStreamer: Connect properties, chunking, repeated metadata, and publication teardown.
 - OBS: Automated connect-sequence coverage and a manual live probe.
 
-The consumer migrations also exercise TCP backpressure, TLS, byte-exact forwarding, codec-sample preservation, and HLS output.
-These checks validate specific paths; they do not establish that all application workloads allocate nothing.
+These checks validate specific paths. They do not establish that all application workloads allocate nothing.
 
 ## License
 

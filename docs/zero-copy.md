@@ -247,14 +247,14 @@ The emitted wire is also decoded through a receiving session to validate the rel
 The explicit contiguous decoder needs one allocation for a 256 KiB message, with no reallocations across 16 KiB reads.
 These counts exclude transport buffer creation, connection setup, AMF commands, acknowledgements, and application metrics.
 
-## Consumer boundaries
+## Application boundaries
 
 A forwarding proxy can move each event payload through a bounded queue and into a send call.
 Borrowed validation must finish before that move. The outbound packet retains the original receive segments until writing finishes.
-Routmp uses this pattern, with transport reads and writes outside the protocol core.
+Transport reads and writes remain outside the protocol core.
 
 A codec or container pipeline can require contiguous input.
-Rushls uses `Payload::into_bytes()` at this boundary before extracting elementary units for its HLS pipeline.
+An HLS ingest pipeline can use `Payload::into_bytes()` at this boundary before extracting elementary units.
 A contiguous payload reuses its storage; a fragmented payload is copied once.
 `visit_elementary_units` avoids a temporary result vector while preserving multitrack siblings.
 This boundary is an application storage requirement, not a prerequisite for RTMP forwarding.
