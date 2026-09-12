@@ -1,3 +1,15 @@
+//! Typed validation over original legacy and Enhanced RTMP media bodies.
+//!
+//! Owned contiguous bytes and borrowed segmented views share the parser.
+//! Parsed ranges retain the source representation. Classification produces small
+//! owned facts that can outlive a borrow. Release borrowed interpretations before
+//! moving the payload into a relay queue.
+//!
+//! Strict mode rejects invalid or unsupported structures. Passthrough retains
+//! opaque bodies with a reason. Neither mode decodes codec samples.
+//! Valid single-track borrowed inspection avoids allocation; multitrack vectors
+//! and diagnostic strings can allocate.
+
 use bytes::Bytes;
 use thiserror::Error;
 

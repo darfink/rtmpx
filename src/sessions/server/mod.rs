@@ -40,9 +40,13 @@ type ServerSessionResult<D = Bytes> = ServerOutput<D>;
 /// A session that represents the server side of a single RTMP connection.
 ///
 /// The `ServerSession` parses inbound RTMP chunks into messages and runs the
-/// common server workflows for them. It answers with pre-serialized messages
-/// or with events that the parent application handles (for example, accept
-/// or reject a connection request).
+/// common server workflows for them. Each receive call returns an owned packet
+/// or event. Applications accept or reject requests, then drain queued outputs.
+/// Media sends return packets with resumable write progress.
+///
+/// Request and media events identify server-local stream handles.
+/// Independent streams share connection negotiation and flow control.
+/// Completing playback reports stream completion without closing the connection.
 ///
 /// The `ServerSession` does not move bytes itself. The application reads
 /// inbound chunk bytes and writes the returned responses.

@@ -1,23 +1,45 @@
-//! Sans-I/O RTMP protocol API with Enhanced RTMP validation.
+//! Sans-I/O RTMP and Enhanced RTMP with explicit ownership and stream lifecycles.
 //!
-//! This crate drives the RTMP state machine. Sessions take bytes in and
-//! emit bytes out; the caller moves them over TCP, a pipe, or plain memory,
-//! so the crate fits any async runtime or proxy without mandating one.
-//! The runnable client and server in `examples/` show the TCP glue. The
-//! first sample shows the protocol core with no network at all.
+//! Applications own transports, TLS, deadlines, scheduling, and backpressure.
+//! RTMPX owns protocol state and can run with any runtime or entirely in memory.
+//! Version 3 replaces the version 2 public API.
 //!
-//! Chunk framing lives in [`chunk_io`], the handshake in [`handshake`],
-//! messages in [`messages`], client and server sessions in [`sessions`],
-//! and timestamps in [`time`]. The protocol core derives from RML RTMP
-//! (MIT, KallDrexx/rust-media-libs) with hardening for proxy use:
-//! cumulative acknowledgements, resource limits, interleaved chunk streams,
-//! and verbatim metadata and connect forwarding. See `README.md`
-//! ("Changes from RML") for the full list.
+//! # Architecture
 //!
-//! Enhanced RTMP media is inspected with an in-house FLV parser through
-//! [`flv`], [`media`], [`metadata`], [`enhanced`], and [`elementary`].
-//! Original bytes stay authoritative for forwarding. An elementary-media
-//! view of the same tags serves ingest that does not wrap FLV.
+//! - [`sessions`] provides owned pull outputs and independent publishing/playback streams.
+//! - [`chunk_io`] provides streaming parsing, segmented assembly, and resumable packet encoding.
+//! - [`payload`] provides owned segments, borrowed ranges, and bounded descriptor reuse.
+//! - [`handshake`] handles the connection handshake independently of session state.
+//! - [`messages`] separates encoded message bodies from interpreted protocol messages.
+//! - [`amf`] provides tree values and graph documents for AMF0 and AMF3.
+//! - [`media`], [`flv`], [`enhanced`], and [`metadata`] inspect legacy and Enhanced RTMP.
+//! - [`elementary`] extracts contiguous codec samples and configuration without packaging a container.
+//! - [`time`] models RTMP timestamps and wrapping arithmetic.
+//!
+//! # Streams and allocation boundaries
+//!
+//! A connection can carry independent operations identified by local
+//! [`sessions::StreamHandle`] values. These differ from wire message stream IDs
+//! and chunk stream IDs. Client and server events identify the affected stream.
+//!
+//! Sessions retain owned receive-buffer slices. Media sends return [`Packet`]
+//! values with inline chunk headers and write progress. Borrowed validation
+//! can inspect segmented media without coalescing it.
+//! [`PayloadPool`] recycles descriptor storage after payload release.
+//!
+//! Warmed media paths can avoid allocations with pooled descriptors and
+//! preallocated transport storage. AMF, control messages, multitrack parsing,
+//! errors, and application transport buffers can still allocate.
+//! Explicit coalescing copies fragmented payloads at contiguous codec-input boundaries.
+//! See [`zero_copy_guide`] for measured contracts.
+//!
+//! # Provenance
+//!
+//! RTMPX derives from RML RTMP and AMF0 under the MIT license.
+//! It replaces the original ownership and session interfaces and adds streaming
+//! chunks, independent stream lifecycles, AMF3 graphs, and Enhanced media inspection.
+//! Protocol hardening includes cumulative acknowledgements, timestamp rollover,
+//! interleaved partial messages, and resource limits.
 //!
 //! # Session input and output
 //!

@@ -1,11 +1,24 @@
 /*!
-Session abstractions for RTMP clients and servers.
+Connection state and independent RTMP stream lifecycles.
 
-A session hides the RTMP message flow behind owned input and one packet or event per receive call. Each session owns its own `ChunkEncoder` and `MessageDecoder`.
-A single session represents one peer of one RTMP connection. A connection
-manager needs one distinct session instance per connection.
+Create one session per connection after its handshake.
+Each session owns a chunk encoder, a streaming message decoder, and bounded protocol state.
+Applications own socket I/O, deadlines, and backpressure.
 
-Create a session only after the handshake completes.
+Both sessions expose a `receive(&mut Bytes)` loop with one owned output per call.
+Control operations queue responses; media sends return packets directly.
+Drain queued outputs even when input is empty, and transmit packets in production order.
+
+Clients create publishing or playback operations with local [`StreamHandle`] values.
+Server request events expose server-local handles for acceptance and subsequent media operations.
+Handles identify a stream lifetime, while [`StreamId`] identifies the peer's wire message stream.
+Connection control uses [`StreamId::CONTROL`]; chunk stream IDs belong to framing.
+
+Deleting or completing one operation does not end the connection or its other streams.
+[`SessionLimits`] bounds stream and pending-request state.
+Payload descriptor pooling and decoder limits are configured separately.
+
+See [`crate::zero_copy_guide`] for receive loops, ownership rules, and lifecycle examples.
 */
 
 pub mod client;

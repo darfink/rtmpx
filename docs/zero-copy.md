@@ -169,6 +169,8 @@ Error and opaque-result strings can allocate. Elementary extraction from contigu
 Every script-data message produces `StreamDataReceived`, including metadata. There are no separate automatic metadata events.
 Call `message.metadata()` for properties, or `ValidatedMetadata::parse(message, mode)` for Enhanced RTMP metadata validation.
 Both inspect segmented storage directly. AMF values allocate, but encoded input is not coalesced.
+Use `metadata()` to distinguish metadata from other script data before calling the strict validator.
+The strict metadata validator rejects non-metadata messages.
 
 ## Recycle descriptors
 
@@ -244,6 +246,18 @@ The emitted wire is also decoded through a receiving session to validate the rel
 
 The explicit contiguous decoder needs one allocation for a 256 KiB message, with no reallocations across 16 KiB reads.
 These counts exclude transport buffer creation, connection setup, AMF commands, acknowledgements, and application metrics.
+
+## Consumer boundaries
+
+A forwarding proxy can move each event payload through a bounded queue and into a send call.
+Borrowed validation must finish before that move. The outbound packet retains the original receive segments until writing finishes.
+Routmp uses this pattern, with transport reads and writes outside the protocol core.
+
+A codec or container pipeline can require contiguous input.
+Rushls uses `Payload::into_bytes()` at this boundary before extracting elementary units for its HLS pipeline.
+A contiguous payload reuses its storage; a fragmented payload is copied once.
+`visit_elementary_units` avoids a temporary result vector while preserving multitrack siblings.
+This boundary is an application storage requirement, not a prerequisite for RTMP forwarding.
 
 ## Use AMF graphs
 

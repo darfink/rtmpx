@@ -1,15 +1,22 @@
-//! Encoding-neutral view over the two AMF value models.
+//! AMF0 and AMF3 tree values, object graphs, and encoding-neutral inspection.
 //!
-//! RTMP negotiates `objectEncoding` at `connect` time, and an
-//! `objectEncoding` 3 peer is permitted to use *either* AMF0 or AMF3 on any
-//! subsequent message. The encoding is therefore a runtime property of a
-//! connection, not something a caller can pick when constructing a session, so
-//! it is modelled as [`AmfEncoding`] rather than as a type parameter.
+//! [`amf0::Amf0Document`] and [`amf3::Amf3Document`] retain complex objects in arenas.
+//! Document-local [`ObjectId`] references preserve sharing and cycles without
+//! reference-counting ownership cycles. Serializers emit references by identity.
+//! AMF3 also maintains string and trait reference tables.
 //!
-//! Generics serve the leaf helpers. Building a status object or reading a
-//! stream key from a command argument is the same logic in both encodings.
-//! It differs only in the constructors it calls, so it is written once
-//! against [`AmfValue`].
+//! Tree decoding expands references under [`TreeLimits`]. Cycles cannot become trees.
+//! Expansion budgets bound depth, nodes, and estimated bytes.
+//! AMF strings and typed values still allocate.
+//!
+//! Value-level encoding conversions do not import graph arenas. Expand a document
+//! to a bounded tree before converting its values to another encoding.
+//! Keep encoded message bodies when forwarding requires exact wire preservation.
+//!
+//! RTMP negotiates `objectEncoding` at connect time. Message framing still selects
+//! the actual body encoding, and a peer can send both encodings on one connection.
+//! [`AmfEncoding`] models negotiation; [`AmfRead`] and [`AmfValue`] share inspection
+//! and construction logic across the two value models.
 
 mod graph;
 pub use graph::{Document, ObjectId, TreeError, TreeLimits};

@@ -239,16 +239,12 @@ impl Amf3Value {
             dynamic: Some(members),
         }
     }
-    /// Project into the AMF0 value model.
+    /// Project an AMF3 value into the AMF0 value model.
     ///
-    /// Types with a direct AMF0 counterpart convert structurally, which is what
-    /// lets one set of control-plane helpers (`connect` parsing, Enhanced RTMP
-    /// capability validation, metadata) read a payload regardless of the
-    /// encoding it arrived in. Types with no AMF0 counterpart are wrapped in
-    /// [`crate::amf0::Amf0Value::AvmPlus`] rather than degraded to `Null` or a
-    /// bare number: the value stays intact, keeps its type, and re-encodes to
-    /// AMF0 as the `avmplus` escape that a peer negotiating `objectEncoding` 3
-    /// already understands.
+    /// Direct counterparts convert structurally; other values use an AVM+ wrapper.
+    /// Conversion can change numeric and XML representations. It does not preserve
+    /// original wire bytes or import a document arena. References retain numeric
+    /// IDs only; expand a document to a bounded tree before converting its values.
     pub fn to_amf0(&self) -> crate::amf0::Amf0Value {
         use crate::amf0::Amf0Value as A;
         match self {

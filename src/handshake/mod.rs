@@ -1,26 +1,17 @@
 /*!
-This module provides functionality for handling the RTMP handshake process.  There are two types
-of handshakes that can potentially be seen.
+Incremental RTMP connection handshake, separate from session processing.
 
-The first is the original RTMP handshake that is defined in the official RTMP specification
-released by Adobe.  However, if a flash client connects using this handshake then the client
-will not play h.264 video (it is assumed this is only a restriction in flash based clients).
+[`HandshakeRole`] specifies the local endpoint. [`HandshakeProgress`] returns
+response bytes and any bytes received beyond the completed handshake.
+Pass those remaining bytes to the session before reading more transport input.
 
-Flash player 9 introduced a new handshake that utilizes SHA digests and Diffie-Hellman
-encryption key negotiation, and it is required if a connected flash player
-is going to display h.264 video.  While there is no official specifications for this format
-this module is implemented using a clean-room specification found at
-<https://www.cs.cmu.edu/~dst/Adobe/Gallery/RTMPE.txt>.
+The implementation supports the original handshake and FP9-style digest negotiation.
+It accepts and sends command byte 3; it does not implement RTMPE encryption.
+The peer's final P2 packet is not cryptographically verified.
+Handshake completion is not peer authentication.
 
-This handshake module allows for handling both the original and fp9+ handshake methods, and
-determines which method of verification to use based on the packet 1 it receives.
-This fails only against a peer that accepts exactly the original RTMP
-handshake and checks that bytes 4-7 are zero. With H.264 video everywhere,
-all current clients and servers use the fp9 method. This is not an issue
-in practice.
-
-**Note:** This code only accepts and sends command byte 3. It never encrypts.
-
+Applications write responses, enforce deadlines, and handle transport closure.
+The handshake can allocate temporary buffers; media-path allocation contracts exclude it.
 */
 
 mod errors;
@@ -90,17 +81,12 @@ enum Stage {
     Complete,
 }
 
-/// Struct that handles the handshaking process.
+/// Incremental handshake state for one RTMP endpoint.
 ///
-/// The current code does not validate the peer's p2 packet. The HMAC check
-/// is complex, and although it passed against OBS, FFmpeg, MPlayer, and
-/// Evostream, Flash clients failed it for unknown reasons.
-///
-/// Because the only fp9 handshake description is third-party, the HMAC check
-/// is removed. The handshake counts as successful once the peer sends its p2
-/// packet and stays connected after receiving ours. That is enough to shake
-/// hands with Flash players, and the remaining checks still leave little
-/// room for false positives.
+/// The final peer P2 packet is accepted without cryptographic verification
+/// for interoperability. Completion reports protocol progress, not authentication.
+/// The caller handles I/O, response writes, deadlines, and transport closure.
+/// Remaining bytes in the completed result belong to subsequent RTMP messages.
 ///
 /// ## Examples
 ///

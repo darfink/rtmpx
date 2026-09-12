@@ -2,22 +2,26 @@
 
 Chunk framing for RTMP, as described in section 5.3 of the [official RTMP specification](https://www.adobe.com/content/dam/acom/en/devnet/rtmp/pdf/rtmp_specification_1.0.pdf).
 
-RTMP chunks compress their headers against previously sent and received
-chunks. Every inbound chunk must reach the deserializer in the order it
-arrived, and every outbound chunk must reach the peer in the order it was
-created. A `ChunkEncoder` or `ContiguousDecoder` cannot join mid-stream:
-it lacks the history, so it produces errors locally or on the peer.
+RTMP chunk headers depend on earlier chunks. Feed input and transmit output in wire order.
+An encoder or parser cannot join a connection without the preceding header state.
 
-Inbound chunk bytes become `RawMessage`s. A payload describes the message
-a chunk carried: timestamp, type id, message stream id, and body.
+[`ChunkParser`] consumes borrowed bytes and exposes fragments immediately.
+[`MessageDecoder`] assembles owned receive segments without copying their bodies.
+[`ContiguousDecoder`] copies borrowed input into contiguous message storage.
+Each decoder supports partial messages on separate chunk streams.
 
-Outbound payloads become `Packet`s. A packet wraps the chunk bytes plus a flag
-that tells whether the packet may be dropped. Audio and video packets can
-usually be dropped when bandwidth runs out. Any other packet must not be
-dropped: a gap causes deserialization errors on the peer.
+[`ChunkEncoder`] frames a raw message as a [`Packet`] with inline headers and payload storage.
+The packet owns write progress; [`Packet::io_slices`] exposes the remaining wire data.
+Advance it only by the byte count successfully written.
+No contiguous wire buffer is required.
 
-Inbound and outbound buffers use the [bytes crate](https://crates.io/crates/bytes),
-so copies stay minimal.
+[`DropPolicy`] explicitly controls omission. An allowed packet can be dropped only before transmission starts.
+A partially written packet must finish. Preserve order among all packets that are transmitted.
+Applications decide whether losing a media message is acceptable.
+
+Apply SetChunkSize and Abort before decoding the next message.
+Sessions perform these steps automatically.
+[`DecoderLimits`] bounds protocol storage, not application queues or entire backing allocations retained by external owners.
 
 ## Example
 

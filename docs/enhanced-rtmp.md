@@ -8,7 +8,7 @@ This matrix is pinned to VSO Enhanced RTMP document
 
 `rtmpx` uses an in-house FLV parser for typed demuxing (wire layouts ported
 by reference from `scuffle-flv` 0.2.2), then applies the v2 r2 deltas and
-validation policy in its owned API. Raw RTMP message bodies remain
+validation policy through owned or borrowed media views. Raw RTMP message bodies remain
 authoritative.
 
 | v2 r2 area | Ingest and inspection | Lossless relay | Notes |
@@ -27,13 +27,13 @@ authoritative.
 | `[audio|video]FourCcInfoMap` | Yes | Yes | Strict mode requires FourCC or wildcard keys and numeric capability masks. |
 | `capsEx` | Yes | Yes | Numeric flags are retained. Servers advertise only capabilities they implement. |
 | Server capability response | Yes | N/A | Server `_result` properties are configurable; clients receive the complete command and status property maps. |
-| Unknown connect properties | Yes | Selected | Retained for inspection. Only E-RTMP capability fields are forwarded to a new connection; `tcUrl`, `flashVer`, and other connection-local values are not replayed. |
+| Unknown connect properties | Yes | Selected | Retained for inspection. Applications select properties for a new connection. The capability helper selects E-RTMP fields. Generic connect methods accept caller-supplied properties; rebuilding connection-local fields is application policy. |
 | Unknown or malformed Enhanced packets | Policy-dependent | Yes in passthrough | Strict rejects invalid known structures and unknown enum/FourCC values. Passthrough retains them as opaque raw bytes. |
 | AMF3 script data | Typed 15/17 + opaque 16/19 | Raw relay | The first payload byte of type 15/17 is a *format selector*: `0x00` means an AMF0 body with `avmplus` (`0x11`) escapes for individual AMF3 values, `0x03` means an AMF3 body. Both decode; the selector is preserved on `RtmpMessage::Amf3Command`/`Amf3Data` as `format` so relays reproduce the framing. Values are always presented as `Amf3Value`. Shared objects 16/19 stay opaque; FLV TagType 15 remains relay-only. An undefined selector is a strict typed error. |
 | `objectEncoding` | Negotiated | N/A | The client's request is clamped to what this crate supports and the clamped value is what the `_result` advertises; undefined values fall back to 0. Responses mirror the framing of the request they answer rather than switching unilaterally. |
-| Reconnect request | Parsed capability only | N/A | Neither app issues reconnect requests; they do not advertise the reconnect capability bit. |
+| Reconnect request | Parsed capability only | N/A | RTMPX exposes capability fields; applications own reconnect policy. |
 | Typed outbound Enhanced FLV generation | No | Raw only | Deliberately deferred. Proxy forwarding uses original bytes. |
-| Playback sequence caching | No | N/A | Deliberately deferred. Existing RML play APIs remain available internally. |
+| Playback sequence caching | No | N/A | Deliberately deferred. Applications own sequence-header caching and media replay. |
 
 Application codec admission is separate from protocol validation. Rushls can,
 for example, parse a structurally valid codec that its media policy later

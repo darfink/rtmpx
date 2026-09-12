@@ -1,9 +1,14 @@
 /*!
-This module contains all the RTMP message types as well as functionality for serializing
-and deserializing these messages into payloads.
+Encoded RTMP message bodies and interpreted protocol messages.
 
-`RawMessage`s have auxiliary data about an RTMP message, such as what message stream it is
-meant for, the timestamp for the message and what type of message it is.
+[`RawMessage`] combines a body with its timestamp, message stream ID, and type ID.
+Its generic storage can retain owned segments or borrow a body for low-level encoding.
+[`RtmpMessage`] interprets protocol fields and encodes them through [`RtmpMessage::into_raw_message`].
+Chunk framing and transport write progress belong to [`crate::Packet`].
+
+Keep the original body when relaying requires exact wire preservation.
+Interpreting AMF into values and encoding it again can change its representation.
+Sessions expose encoded script data through [`crate::sessions::DataMessage`].
 */
 
 mod deserialization_errors;

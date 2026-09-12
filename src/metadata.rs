@@ -1,3 +1,10 @@
+//! Explicit metadata inspection over encoded script-data messages.
+//!
+//! Sessions emit script data uniformly. Use DataMessage::metadata to distinguish
+//! metadata from other script messages before requesting typed validation.
+//! Decoding reads across segments without coalescing input, but AMF values allocate.
+//! Original encoded bytes remain authoritative for forwarding.
+
 use crate::sessions::DataMessage;
 use std::collections::BTreeMap;
 

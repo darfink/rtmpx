@@ -1,4 +1,14 @@
-//! Owned scatter/gather payloads. Contiguous messages need no descriptor allocation.
+//! Owned segmented storage, borrowed ranges, and reusable payload descriptors.
+//!
+//! [`Payload`] retains `Bytes` segments without copying their bodies.
+//! Its first segment is inline; additional segments occupy a descriptor vector.
+//! [`PayloadPool`] recycles that vector across payload lifetimes and threads.
+//! Pool limits bound cached descriptors, not live payload bytes or application queues.
+//!
+//! [`PayloadView`] borrows ranges without copying bytes or descriptors.
+//! [`Segments`] lets packet encoding accept other stable storage types.
+//! Explicit conversion to contiguous bytes copies fragmented storage.
+//! Cloning fragmented payloads can allocate descriptors and prolong receive-buffer lifetimes.
 use bytes::Bytes;
 
 /// Stable, nonempty segments of one logical byte string.

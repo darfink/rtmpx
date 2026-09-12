@@ -736,8 +736,12 @@ fn parse_object_property<R: common::AmfRead>(
     }
 }
 impl Amf0Value {
-    /// Project into the AMF3 value model. Total and lossless: every AMF0 type
-    /// has an AMF3 counterpart, and [`Amf0Value::AvmPlus`] simply unwraps.
+    /// Project an AMF0 value into the AMF3 value model.
+    ///
+    /// This is a value conversion, not a wire-preserving or document conversion.
+    /// Date timezone offsets are not represented in AMF3. References retain their
+    /// numeric IDs without importing targets. Expand a document to a bounded tree
+    /// before converting its values. AVM+ unwraps its contained value.
     pub fn to_amf3(&self) -> crate::amf3::Amf3Value {
         use crate::amf3::Amf3Value as B;
         use crate::amf3::{MAX_AMF3_INTEGER, MIN_AMF3_INTEGER};

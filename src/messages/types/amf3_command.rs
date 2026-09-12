@@ -21,8 +21,8 @@ pub(crate) fn encode_body(
     match format {
         AmfEncoding::Amf0 => {
             payload.push(FORMAT_SELECTOR_AMF0);
-            // to_amf0 parks AMF3-only values behind the avmplus escape, so this
-            // is lossless in both directions.
+            // AMF3-only values use the AVM+ escape. This structural conversion
+            // does not promise the original AMF wire representation.
             let as_amf0: Vec<_> = values.iter().map(|v| v.to_amf0()).collect();
             crate::amf0::serialize_into(&as_amf0, &mut payload)?;
         }
