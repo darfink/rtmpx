@@ -1,8 +1,7 @@
 /*!
 Session abstractions for RTMP clients and servers.
 
-A session hides the RTMP message flow behind bytes in and bytes or events
-out. Each session owns its own `ChunkSerializer` and `ChunkDeserializer`.
+A session hides the RTMP message flow behind owned input and one packet or event per receive call. Each session owns its own `ChunkEncoder` and `MessageDecoder`.
 A single session represents one peer of one RTMP connection. A connection
 manager needs one distinct session instance per connection.
 
@@ -12,20 +11,21 @@ Create a session only after the handshake completes.
 pub mod client;
 pub mod server;
 
+pub use self::client::ClientEvent;
+pub use self::client::ClientOutput;
 pub use self::client::ClientSession;
 pub use self::client::ClientSessionConfig;
 pub use self::client::ClientSessionError;
-pub use self::client::ClientSessionEvent;
-pub use self::client::ClientSessionResult;
-pub use self::client::ClientState;
-pub use self::client::PublishRequestType;
+mod streams;
+pub use streams::{ClientStreamState, ConnectionState, ServerStreamState, StreamHandle};
 
-pub use self::server::PublishMode;
+mod publish_mode;
+pub use self::server::ServerEvent;
+pub use self::server::ServerOutput;
 pub use self::server::ServerSession;
 pub use self::server::ServerSessionConfig;
 pub use self::server::ServerSessionError;
-pub use self::server::ServerSessionEvent;
-pub use self::server::ServerSessionResult;
+pub use publish_mode::PublishMode;
 
 use crate::amf0::Amf0Object;
 
@@ -124,3 +124,6 @@ pub use data::{DataMessage, DataMessageType};
 pub use ids::{RequestId, StreamId};
 
 pub use client::CommandStatus;
+
+mod limits;
+pub use limits::{SessionLimitError, SessionLimits};

@@ -1,7 +1,7 @@
-use crate::chunk_io::{ChunkDeserializationError, ChunkSerializationError};
+use crate::chunk_io::{DecodeError, EncodeError};
 
 use crate::messages::{MessageDeserializationError, MessageSerializationError};
-use crate::sessions::ClientState;
+use crate::sessions::{ClientStreamState, ConnectionState, StreamHandle};
 use thiserror::Error;
 
 /// Error state when a client session encounters an error
@@ -9,16 +9,31 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ClientSessionError {
+    #[error(transparent)]
+    LimitExceeded(#[from] crate::sessions::SessionLimitError),
+    #[error("stream handle is deleted or belongs to another session")]
+    InvalidStreamHandle,
+    #[error("stream {stream:?} is in state {state:?}")]
+    StreamInInvalidState {
+        stream: StreamHandle,
+        state: ClientStreamState,
+    },
+    #[error("server reused an active message stream ID")]
+    DuplicateStreamId,
+
+    #[error("drain pending session outputs through receive before sending a packet")]
+    PendingOutput,
+
     /// An earlier input error terminated this session. Close its transport.
     #[error("session terminated after an input error")]
     SessionFailed,
     /// Encountered when an error occurs while deserializing the incoming byte data
     #[error("An error occurred deserializing incoming data: {0}")]
-    ChunkDeserializationError(#[from] ChunkDeserializationError),
+    DecodeError(#[from] DecodeError),
 
     /// Encountered when an error occurs while serializing outbound messages
     #[error("An error occurred serializing outbound messages: {0}")]
-    ChunkSerializationError(#[from] ChunkSerializationError),
+    EncodeError(#[from] EncodeError),
 
     /// Encountered when an error occurs while turning an RTMP message into an message payload
     #[error(
@@ -44,18 +59,7 @@ pub enum ClientSessionError {
         "The request could not be performed while the session is in the {current_state:?} state"
     )]
     #[non_exhaustive]
-    SessionInInvalidState { current_state: ClientState },
-
-    /// Encountered when attempting to send a message that requires having an active stream
-    /// opened but none is marked down.  This is almost always a bug with the `ClientSession` as
-    /// this means we are in a valid state (e.g. `Playing` or `Publishing`) yet we never recorded
-    /// what stream id we are publishing/playing on.
-    #[error("No known stream id is active to perform publish/playback actions on")]
-    NoKnownActiveStreamIdWhenRequired,
-
-    /// Encountered when the client requests a stream be created and the server rejects the command
-    #[error("An attempt to create a stream on the server failed")]
-    CreateStreamFailed,
+    SessionInInvalidState { current_state: ConnectionState },
 
     /// A response to a `createStream` request should have a numeric as the first parameter
     /// in the additional values property of the amf0 command.  This error is thrown if this is
@@ -70,51 +74,3 @@ pub enum ClientSessionError {
     #[error("The server sent an onStatus message with invalid arguments")]
     InvalidOnStatusArguments,
 }
-
-// impl fmt::Display for ClientSessionError {
-//     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-//         fmt::Display::fmt(&self.kind, f)
-//     }
-// }
-
-// impl Fail for ClientSessionError {
-//     fn cause(&self) -> Option<&dyn Fail> {
-//         self.kind.cause()
-//     }
-
-//     fn backtrace(&self) -> Option<&Backtrace> {
-//         self.kind.backtrace()
-//     }
-// }
-
-// impl From<ChunkSerializationError> for ClientSessionError {
-//     fn from(kind: ChunkSerializationError) -> Self {
-//         ClientSessionError {
-//             kind: ClientSessionErrorKind::ChunkSerializationError(kind),
-//         }
-//     }
-// }
-
-// impl From<ChunkDeserializationError> for ClientSessionError {
-//     fn from(kind: ChunkDeserializationError) -> Self {
-//         ClientSessionError {
-//             kind: ClientSessionErrorKind::ChunkDeserializationError(kind),
-//         }
-//     }
-// }
-
-// impl From<MessageSerializationError> for ClientSessionError {
-//     fn from(kind: MessageSerializationError) -> Self {
-//         ClientSessionError {
-//             kind: ClientSessionErrorKind::MessageSerializationError(kind),
-//         }
-//     }
-// }
-
-// impl From<MessageDeserializationError> for ClientSessionError {
-//     fn from(kind: MessageDeserializationError) -> Self {
-//         ClientSessionError {
-//             kind: ClientSessionErrorKind::MessageDeserializationError(kind),
-//         }
-//     }
-// }

@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use std::process::{Child, Command, Stdio};
 
-use rtmpx::amf::AmfEncoding;
-use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rtmpx::sessions::{
+use crate::api::amf::AmfEncoding;
+use crate::api::handshake::{Handshake, HandshakeProgress, HandshakeRole};
+use crate::api::sessions::{
     ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -50,13 +50,13 @@ async fn write_server_results(
 ) -> Result<()> {
     for result in results {
         match result {
-            ServerSessionResult::OutboundResponse(packet) => {
+            ServerSessionResult::Packet(packet) => {
                 stream
-                    .write_all(&packet.bytes)
+                    .write_all(&packet.to_vec())
                     .await
                     .map_err(|e| format!("write to ffmpeg failed: {e}"))?;
             }
-            ServerSessionResult::RaisedEvent(event) => match event {
+            ServerSessionResult::Event(event) => match event {
                 ServerSessionEvent::ConnectionRequested {
                     request_id,
                     app_name,
@@ -79,7 +79,7 @@ async fn write_server_results(
                         .map_err(|e| format!("accepting ffmpeg publish failed: {e:?}"))?;
                     Box::pin(write_server_results(stream, follow, session, collected)).await?;
                 }
-                ServerSessionEvent::StreamMetadataChanged { .. } => {
+                ServerSessionEvent::StreamDataReceived { .. } => {
                     collected.metadata_events += 1;
                 }
                 ServerSessionEvent::AudioDataReceived { data, .. } => {
@@ -95,7 +95,7 @@ async fn write_server_results(
                     eprintln!("ffmpeg harness: ignoring ffmpeg event: {other:?}");
                 }
             },
-            ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            ServerSessionResult::UnhandledMessage(_) => {}
             #[allow(unreachable_patterns)]
             _ => panic!("unexpected future protocol variant"),
         }
@@ -108,7 +108,7 @@ async fn write_server_results(
 }
 
 async fn server_handshake(stream: &mut TcpStream, read_buf: &mut [u8]) -> Result<Vec<u8>> {
-    let mut handshake = Handshake::new(PeerType::Server);
+    let mut handshake = Handshake::new(HandshakeRole::Server);
     loop {
         let n = stream
             .read(read_buf)
@@ -121,7 +121,7 @@ async fn server_handshake(stream: &mut TcpStream, read_buf: &mut [u8]) -> Result
             .process_bytes(&read_buf[..n])
             .map_err(|e| format!("server handshake failed: {e:?}"))?
         {
-            HandshakeProcessResult::InProgress { response_bytes } => {
+            HandshakeProgress::InProgress { response_bytes } => {
                 if !response_bytes.is_empty() {
                     stream
                         .write_all(&response_bytes)
@@ -133,7 +133,7 @@ async fn server_handshake(stream: &mut TcpStream, read_buf: &mut [u8]) -> Result
                         .map_err(|e| format!("server handshake flush failed: {e}"))?;
                 }
             }
-            HandshakeProcessResult::Completed {
+            HandshakeProgress::Completed {
                 response_bytes,
                 remaining_bytes,
             } => {
@@ -541,13 +541,13 @@ pub fn extract_flv_media(path: &std::path::Path) -> Result<(Vec<bytes::Bytes>, V
 #[allow(clippy::too_many_arguments)]
 pub async fn relay_our_publish_to_ffmpeg(
     stream_key: &str,
-    metadata: rtmpx::sessions::StreamMetadata,
+    metadata: crate::api::sessions::StreamMetadata,
     video: Vec<bytes::Bytes>,
     audio: Vec<bytes::Bytes>,
     wall_clock: Duration,
 ) -> Result<PlayedFile> {
     use super::common::driver::{Endpoint, Peer};
-    use rtmpx::time::RtmpTimestamp;
+    use crate::api::time::RtmpTimestamp;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -573,8 +573,12 @@ pub async fn relay_our_publish_to_ffmpeg(
             op_timeout: Duration::from_secs(15),
             unreachable_hint: None,
         };
-        let (mut peer, _, _) =
-            Peer::connect(&endpoint, AmfEncoding::Amf0, rtmpx::amf0::Amf0Object::new()).await?;
+        let (mut peer, _, _) = Peer::connect(
+            &endpoint,
+            AmfEncoding::Amf0,
+            crate::api::amf0::Amf0Object::new(),
+        )
+        .await?;
         peer.publish(&pub_key).await?;
         peer.send_metadata(&pub_meta).await?;
         for (i, v) in pub_video.iter().enumerate() {
@@ -698,7 +702,7 @@ pub async fn relay_our_publish_to_ffmpeg(
         let (mut session, initial) = ServerSession::new(ServerSessionConfig::new())
             .map_err(|e| format!("server init failed: {e:?}"))?;
         debug_assert!(initial.is_empty());
-        let mut play_stream_id: Option<rtmpx::sessions::StreamId> = None;
+        let mut play_stream_id: Option<crate::api::sessions::StreamId> = None;
         let mut sent = false;
         // Handle the player's connect + play, then push the ingested media.
         let mut pending: Vec<u8> = carry;
@@ -714,21 +718,21 @@ pub async fn relay_our_publish_to_ffmpeg(
                 pending.clear();
                 for result in results {
                     match result {
-                        ServerSessionResult::OutboundResponse(packet) => {
+                        ServerSessionResult::Packet(packet) => {
                             stream
-                                .write_all(&packet.bytes)
+                                .write_all(&packet.to_vec())
                                 .await
                                 .map_err(|e| format!("write player failed: {e}"))?;
                         }
-                        ServerSessionResult::RaisedEvent(event) => match event {
+                        ServerSessionResult::Event(event) => match event {
                             ServerSessionEvent::ConnectionRequested { request_id, .. } => {
                                 let follow = session
                                     .accept_request(request_id)
                                     .map_err(|e| format!("accept player connect failed: {e:?}"))?;
                                 for r in follow {
-                                    if let ServerSessionResult::OutboundResponse(packet) = r {
+                                    if let ServerSessionResult::Packet(packet) = r {
                                         stream
-                                            .write_all(&packet.bytes)
+                                            .write_all(&packet.to_vec())
                                             .await
                                             .map_err(|e| format!("write player failed: {e}"))?;
                                     }
@@ -743,9 +747,9 @@ pub async fn relay_our_publish_to_ffmpeg(
                                     .accept_request(request_id)
                                     .map_err(|e| format!("accept play failed: {e:?}"))?;
                                 for r in follow {
-                                    if let ServerSessionResult::OutboundResponse(packet) = r {
+                                    if let ServerSessionResult::Packet(packet) = r {
                                         stream
-                                            .write_all(&packet.bytes)
+                                            .write_all(&packet.to_vec())
                                             .await
                                             .map_err(|e| format!("write player failed: {e}"))?;
                                     }
@@ -754,7 +758,7 @@ pub async fn relay_our_publish_to_ffmpeg(
                             }
                             _ => {}
                         },
-                        ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                        ServerSessionResult::UnhandledMessage(_) => {}
                         #[allow(unreachable_patterns)]
                         _ => panic!("unexpected future protocol variant"),
                     }
@@ -771,7 +775,7 @@ pub async fn relay_our_publish_to_ffmpeg(
                     .send_metadata(sid, &metadata)
                     .map_err(|e| format!("send_metadata failed: {e:?}"))?;
                 stream
-                    .write_all(&meta_packet.bytes)
+                    .write_all(&meta_packet.to_vec())
                     .await
                     .map_err(|e| format!("write meta failed: {e}"))?;
                 for (i, v) in ingested_video.iter().enumerate() {
@@ -784,7 +788,7 @@ pub async fn relay_our_publish_to_ffmpeg(
                         )
                         .map_err(|e| format!("send_video failed: {e:?}"))?;
                     stream
-                        .write_all(&p.bytes)
+                        .write_all(&p.to_vec())
                         .await
                         .map_err(|e| format!("write video failed: {e}"))?;
                 }
@@ -798,7 +802,7 @@ pub async fn relay_our_publish_to_ffmpeg(
                         )
                         .map_err(|e| format!("send_audio failed: {e:?}"))?;
                     stream
-                        .write_all(&p.bytes)
+                        .write_all(&p.to_vec())
                         .await
                         .map_err(|e| format!("write audio failed: {e}"))?;
                 }

@@ -19,13 +19,14 @@ use thiserror::Error;
 pub type Amf0Object = indexmap::IndexMap<String, Amf0Value>;
 /// An AMF0 value.
 ///
-/// Like [`crate::amf3::Amf3Value`] this is a tree. The AMF0 `reference` marker
-/// (`0x07`) is consequently not supported and decodes as
-/// [`Amf0DeserializationError::UnknownMarker`]; no RTMP encoder in practice
-/// emits it, and a typed error is preferable to inventing sharing.
+/// Inline values form a tree. `Reference` values belong to an [`Amf0Document`],
+/// which owns complex objects once and supports cycles. The convenience decoder
+/// expands acyclic graphs under a budget. Use [`deserialize_document`] to preserve identity.
 #[derive(PartialEq, Debug, Clone)]
 #[non_exhaustive]
 pub enum Amf0Value {
+    /// A document-local complex-object identity.
+    Reference(crate::amf::ObjectId),
     Number(f64),
     Boolean(bool),
     Utf8String(String),
@@ -57,6 +58,15 @@ pub enum Amf0Value {
     AvmPlus(Box<crate::amf3::Amf3Value>),
 }
 impl Amf0Value {
+    /// Borrow string storage without allocating.
+    pub fn as_str(&self) -> Option<&str> {
+        if let Self::Utf8String(value) = self {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
     pub fn get_number(&self) -> Option<f64> {
         match self {
             Amf0Value::Number(value) => Some(*value),
@@ -72,6 +82,13 @@ impl Amf0Value {
     pub fn get_string(&self) -> Option<String> {
         match self {
             Amf0Value::Utf8String(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+    /// Borrow anonymous or typed object properties without cloning them.
+    pub fn as_object(&self) -> Option<&Amf0Object> {
+        match self {
+            Self::Object(properties) | Self::TypedObject { properties, .. } => Some(properties),
             _ => None,
         }
     }
@@ -125,6 +142,12 @@ pub(crate) mod markers {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Amf0DeserializationError {
+    #[error("AMF0 graph expansion exceeds the tree budget; use deserialize_document")]
+    ExpansionLimit,
+    #[error("AMF0 invalid reference {0}")]
+    BadReference(u16),
+    #[error("AMF0 cyclic reference {0}; use deserialize_document")]
+    CyclicReference(u16),
     #[error("AMF0 unknown marker: {marker}")]
     UnknownMarker { marker: u8 },
     #[error("AMF0 unexpected empty object property name")]
@@ -145,6 +168,8 @@ pub enum Amf0DeserializationError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Amf0SerializationError {
+    #[error("AMF0 invalid or unbound reference {0:?}")]
+    InvalidReference(crate::amf::ObjectId),
     #[error("AMF0 string length greater than 65535")]
     NormalStringTooLong,
     #[error("AMF0 nesting too deep")]
@@ -157,11 +182,136 @@ pub enum Amf0SerializationError {
     BufferWriteError(#[from] io::Error),
 }
 pub fn serialize(values: &[Amf0Value]) -> Result<Vec<u8>, Amf0SerializationError> {
-    let mut bytes = Vec::new();
-    for value in values {
-        serialize_value(value, &mut bytes, 0)?;
+    let mut output = Vec::new();
+    serialize_into(values, &mut output)?;
+    Ok(output)
+}
+/// Append one encoding context. On error the caller's output is unchanged.
+pub fn serialize_into(
+    values: &[Amf0Value],
+    output: &mut Vec<u8>,
+) -> Result<(), Amf0SerializationError> {
+    encode_document(values, &[], &[], output)
+}
+fn encode_document(
+    roots: &[Amf0Value],
+    objects: &[Amf0Value],
+    embedded: &[crate::amf3::Amf3Value],
+    output: &mut Vec<u8>,
+) -> Result<(), Amf0SerializationError> {
+    let mut ctx = EncodeContext {
+        objects,
+        embedded,
+        refs: Default::default(),
+        next: 0,
+    };
+    let start = output.len();
+    for value in roots {
+        if let Err(error) = serialize_value(value, output, 0, &mut ctx) {
+            output.truncate(start);
+            return Err(error);
+        }
     }
-    Ok(bytes)
+    Ok(())
+}
+struct EncodeContext<'a> {
+    objects: &'a [Amf0Value],
+    embedded: &'a [crate::amf3::Amf3Value],
+    refs: std::collections::HashMap<crate::amf::ObjectId, u16>,
+    next: usize,
+}
+#[derive(Default)]
+struct DecodeContext {
+    objects: Vec<Amf0Value>,
+    embedded: Vec<crate::amf3::Amf3Value>,
+}
+fn is_complex(value: &Amf0Value) -> bool {
+    matches!(
+        value,
+        Amf0Value::Object(_) | Amf0Value::StrictArray(_) | Amf0Value::TypedObject { .. }
+    )
+}
+/// AMF0 arena, with a separate AMF3 arena for embedded AVM+ values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Amf0Document {
+    values: crate::amf::Document<Amf0Value>,
+    embedded: Vec<crate::amf3::Amf3Value>,
+}
+impl Default for Amf0Document {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl std::ops::Deref for Amf0Document {
+    type Target = crate::amf::Document<Amf0Value>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+impl std::ops::DerefMut for Amf0Document {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
+}
+impl Amf0Document {
+    /// Resolve a reference, or borrow an inline value unchanged.
+    pub fn resolve<'a>(&'a self, value: &'a Amf0Value) -> Option<&'a Amf0Value> {
+        match value {
+            Amf0Value::Reference(id) => self.get(*id),
+            inline => Some(inline),
+        }
+    }
+
+    pub fn new() -> Self {
+        Self {
+            values: crate::amf::Document::new(),
+            embedded: Vec::new(),
+        }
+    }
+    pub fn get_amf3(&self, id: crate::amf::ObjectId) -> Option<&crate::amf3::Amf3Value> {
+        self.embedded.get(id.0)
+    }
+    /// Import an AMF3 document with exactly one root. IDs are relocated to this arena.
+    pub fn embed_amf3(
+        &mut self,
+        document: crate::amf3::Amf3Document,
+    ) -> Result<Amf0Value, crate::amf3::Amf3Document> {
+        if document.roots().len() != 1 {
+            return Err(document);
+        }
+        let (mut roots, mut objects) = document.into_parts();
+        let base = self.embedded.len();
+        for value in roots.iter_mut().chain(objects.iter_mut()) {
+            crate::amf3::relocate(value, base);
+        }
+        self.embedded.extend(objects);
+        Ok(Amf0Value::AvmPlus(Box::new(roots.pop().unwrap())))
+    }
+    pub fn serialize_into(&self, output: &mut Vec<u8>) -> Result<(), Amf0SerializationError> {
+        encode_document(self.roots(), self.objects(), &self.embedded, output)
+    }
+    pub fn serialize(&self) -> Result<Vec<u8>, Amf0SerializationError> {
+        let mut out = Vec::new();
+        self.serialize_into(&mut out)?;
+        Ok(out)
+    }
+}
+/// Decode references as IDs rather than duplicating their target objects.
+pub fn deserialize_document<R: crate::amf::AmfRead>(
+    input: &mut R,
+) -> Result<Amf0Document, Amf0DeserializationError> {
+    let mut ctx = DecodeContext {
+        ..Default::default()
+    };
+    let mut roots = Vec::new();
+    while let Some(value) = read_next_value(input, 0, &mut ctx)? {
+        ensure_de_collection(roots.len() + 1)?;
+        roots.push(value);
+    }
+    Ok(Amf0Document {
+        values: crate::amf::Document::from_parts(roots, ctx.objects),
+        embedded: ctx.embedded,
+    })
 }
 fn ensure_ser_depth(depth: usize) -> Result<(), Amf0SerializationError> {
     if common::check_depth(depth) {
@@ -181,9 +331,33 @@ fn serialize_value(
     value: &Amf0Value,
     bytes: &mut Vec<u8>,
     depth: usize,
+    ctx: &mut EncodeContext<'_>,
 ) -> Result<(), Amf0SerializationError> {
     ensure_ser_depth(depth)?;
+    if let Amf0Value::Reference(id) = value {
+        let value = ctx
+            .objects
+            .get(id.0)
+            .ok_or(Amf0SerializationError::InvalidReference(*id))?;
+        if !is_complex(value) {
+            return Err(Amf0SerializationError::InvalidReference(*id));
+        }
+        if let Some(index) = ctx.refs.get(id) {
+            bytes.push(7);
+            common::write_u16_be(bytes, *index);
+            return Ok(());
+        }
+        if ctx.next > u16::MAX as usize {
+            return Err(Amf0SerializationError::CollectionTooLarge(ctx.next));
+        }
+        ctx.refs.insert(*id, ctx.next as u16);
+        return serialize_value(value, bytes, depth, ctx);
+    }
+    if is_complex(value) {
+        ctx.next += 1;
+    }
     match value {
+        Amf0Value::Reference(_) => unreachable!(),
         Amf0Value::Boolean(val) => {
             bytes.push(markers::BOOLEAN_MARKER);
             bytes.push(u8::from(*val));
@@ -203,8 +377,8 @@ fn serialize_value(
             Ok(())
         }
         Amf0Value::Utf8String(val) => serialize_string(val, bytes),
-        Amf0Value::Object(val) => serialize_object(val, bytes, depth),
-        Amf0Value::StrictArray(val) => serialize_strict_array(val, bytes, depth),
+        Amf0Value::Object(val) => serialize_object(val, bytes, depth, ctx),
+        Amf0Value::StrictArray(val) => serialize_strict_array(val, bytes, depth, ctx),
         Amf0Value::Date { millis, timezone } => {
             bytes.push(markers::DATE_MARKER);
             common::write_f64_be(bytes, *millis);
@@ -227,13 +401,12 @@ fn serialize_value(
             bytes.push(markers::TYPED_OBJECT_MARKER);
             common::write_u16_be(bytes, class_name.len() as u16);
             bytes.extend_from_slice(class_name.as_bytes());
-            serialize_object_body(properties, bytes, depth)
+            serialize_object_body(properties, bytes, depth, ctx)
         }
         Amf0Value::AvmPlus(inner) => {
             bytes.push(markers::AVMPLUS_OBJECT_MARKER);
-            let encoded = crate::amf3::serialize(std::slice::from_ref(inner.as_ref()))
+            crate::amf3::encode_document(std::slice::from_ref(inner.as_ref()), ctx.embedded, bytes)
                 .map_err(|e| Amf0SerializationError::EmbeddedAmf3(e.to_string()))?;
-            bytes.extend_from_slice(&encoded);
             Ok(())
         }
     }
@@ -256,11 +429,12 @@ fn serialize_object(
     properties: &Amf0Object,
     bytes: &mut Vec<u8>,
     depth: usize,
+    ctx: &mut EncodeContext<'_>,
 ) -> Result<(), Amf0SerializationError> {
     ensure_ser_depth(depth)?;
     ensure_ser_collection(properties.len())?;
     bytes.push(markers::OBJECT_MARKER);
-    serialize_object_body(properties, bytes, depth)
+    serialize_object_body(properties, bytes, depth, ctx)
 }
 /// Property list plus terminator, shared by `object-marker` and
 /// `typed-object-marker`. Property names ride on a bare `u16` in both cases,
@@ -269,6 +443,7 @@ fn serialize_object_body(
     properties: &Amf0Object,
     bytes: &mut Vec<u8>,
     depth: usize,
+    ctx: &mut EncodeContext<'_>,
 ) -> Result<(), Amf0SerializationError> {
     ensure_ser_depth(depth)?;
     ensure_ser_collection(properties.len())?;
@@ -278,7 +453,7 @@ fn serialize_object_body(
         }
         common::write_u16_be(bytes, name.len() as u16);
         bytes.extend_from_slice(name.as_bytes());
-        serialize_value(value, bytes, depth + 1)?;
+        serialize_value(value, bytes, depth + 1, ctx)?;
     }
     common::write_u16_be(bytes, markers::UTF_8_EMPTY_MARKER);
     bytes.push(markers::OBJECT_END_MARKER);
@@ -288,13 +463,14 @@ fn serialize_strict_array(
     array: &Vec<Amf0Value>,
     bytes: &mut Vec<u8>,
     depth: usize,
+    ctx: &mut EncodeContext<'_>,
 ) -> Result<(), Amf0SerializationError> {
     ensure_ser_depth(depth)?;
     ensure_ser_collection(array.len())?;
     bytes.push(markers::STRICT_ARRAY_MARKER);
     common::write_u32_be(bytes, array.len() as u32);
     for value in array {
-        serialize_value(value, bytes, depth + 1)?;
+        serialize_value(value, bytes, depth + 1, ctx)?;
     }
     Ok(())
 }
@@ -305,18 +481,35 @@ struct ObjectProperty {
 pub fn deserialize<R: crate::amf::AmfRead>(
     bytes: &mut R,
 ) -> Result<Vec<Amf0Value>, Amf0DeserializationError> {
-    let mut results = Vec::new();
-    while let Some(value) = read_next_value(bytes, 0)? {
-        results.push(value);
-    }
-    Ok(results)
+    deserialize_document(bytes)?
+        .to_tree(crate::amf::TreeLimits::default())
+        .map_err(tree_error)
 }
 pub fn deserialize_single<R: crate::amf::AmfRead>(
     bytes: &mut R,
 ) -> Result<Amf0Value, Amf0DeserializationError> {
-    match read_next_value(bytes, 0)? {
-        Some(value) => Ok(value),
-        None => Err(Amf0DeserializationError::UnexpectedEof),
+    let mut ctx = DecodeContext {
+        ..Default::default()
+    };
+    let value =
+        read_next_value(bytes, 0, &mut ctx)?.ok_or(Amf0DeserializationError::UnexpectedEof)?;
+    let doc = Amf0Document {
+        values: crate::amf::Document::from_parts(vec![value], ctx.objects),
+        embedded: ctx.embedded,
+    };
+    Ok(doc
+        .to_tree(crate::amf::TreeLimits::default())
+        .map_err(tree_error)?
+        .pop()
+        .unwrap())
+}
+fn tree_error(error: crate::amf::TreeError) -> Amf0DeserializationError {
+    match error {
+        crate::amf::TreeError::Cycle(id) => Amf0DeserializationError::CyclicReference(id.0 as u16),
+        crate::amf::TreeError::InvalidReference(id) => {
+            Amf0DeserializationError::BadReference(id.0 as u16)
+        }
+        crate::amf::TreeError::Limit => Amf0DeserializationError::ExpansionLimit,
     }
 }
 fn ensure_de_depth(depth: usize) -> Result<(), Amf0DeserializationError> {
@@ -336,6 +529,7 @@ fn ensure_de_collection(len: usize) -> Result<(), Amf0DeserializationError> {
 fn read_next_value<R: common::AmfRead>(
     bytes: &mut R,
     depth: usize,
+    ctx: &mut DecodeContext,
 ) -> Result<Option<Amf0Value>, Amf0DeserializationError> {
     ensure_de_depth(depth)?;
     let mut buffer = [0u8; 1];
@@ -348,22 +542,42 @@ fn read_next_value<R: common::AmfRead>(
     if buffer[0] == markers::OBJECT_END_MARKER {
         return Ok(None);
     }
-    match buffer[0] {
+    if buffer[0] == 7 {
+        let index = common::read_u16_be(bytes)?;
+        if index as usize >= ctx.objects.len() {
+            return Err(Amf0DeserializationError::BadReference(index));
+        }
+        return Ok(Some(Amf0Value::Reference(crate::amf::ObjectId(
+            index as usize,
+        ))));
+    }
+    let referenceable = matches!(buffer[0], 3 | 8 | 10 | 16);
+    let index = ctx.objects.len();
+    if referenceable {
+        ensure_de_collection(index + 1)?;
+        ctx.objects.push(Amf0Value::Null);
+    }
+    let result = match buffer[0] {
         markers::BOOLEAN_MARKER => parse_bool(bytes).map(Some),
         markers::NULL_MARKER => Ok(Some(Amf0Value::Null)),
         markers::UNDEFINED_MARKER => Ok(Some(Amf0Value::Undefined)),
         markers::NUMBER_MARKER => parse_number(bytes).map(Some),
-        markers::OBJECT_MARKER => parse_object(bytes, depth).map(Some),
-        markers::ECMA_ARRAY_MARKER => parse_ecma_array(bytes, depth).map(Some),
+        markers::OBJECT_MARKER => parse_object(bytes, depth, ctx).map(Some),
+        markers::ECMA_ARRAY_MARKER => parse_ecma_array(bytes, depth, ctx).map(Some),
         markers::STRING_MARKER => parse_string(bytes).map(Some),
-        markers::STRICT_ARRAY_MARKER => parse_strict_array(bytes, depth).map(Some),
+        markers::STRICT_ARRAY_MARKER => parse_strict_array(bytes, depth, ctx).map(Some),
         markers::LONG_STRING_MARKER => parse_long_string(bytes).map(Some),
         markers::DATE_MARKER => parse_date(bytes).map(Some),
         markers::XML_DOCUMENT_MARKER => parse_xml_document(bytes).map(Some),
-        markers::TYPED_OBJECT_MARKER => parse_typed_object(bytes, depth).map(Some),
-        markers::AVMPLUS_OBJECT_MARKER => parse_avmplus(bytes, depth).map(Some),
+        markers::TYPED_OBJECT_MARKER => parse_typed_object(bytes, depth, ctx).map(Some),
+        markers::AVMPLUS_OBJECT_MARKER => parse_avmplus(bytes, depth, ctx).map(Some),
         other => Err(Amf0DeserializationError::UnknownMarker { marker: other }),
+    }?;
+    if referenceable && let Some(value) = result {
+        ctx.objects[index] = value;
+        return Ok(Some(Amf0Value::Reference(crate::amf::ObjectId(index))));
     }
+    Ok(result)
 }
 /// `long-string-marker`: same payload as a string but with a `u32` length.
 fn parse_long_string<R: common::AmfRead>(
@@ -391,12 +605,13 @@ fn parse_xml_document<R: common::AmfRead>(
 fn parse_typed_object<R: common::AmfRead>(
     bytes: &mut R,
     depth: usize,
+    ctx: &mut DecodeContext,
 ) -> Result<Amf0Value, Amf0DeserializationError> {
     ensure_de_depth(depth)?;
     let name_length = common::read_u16_be(bytes)? as usize;
     let name_buffer = read_checked(bytes, name_length)?;
     let class_name = String::from_utf8(name_buffer)?;
-    match parse_object(bytes, depth)? {
+    match parse_object(bytes, depth, ctx)? {
         Amf0Value::Object(properties) => Ok(Amf0Value::TypedObject {
             class_name,
             properties,
@@ -410,11 +625,19 @@ fn parse_typed_object<R: common::AmfRead>(
 fn parse_avmplus<R: common::AmfRead>(
     bytes: &mut R,
     depth: usize,
+    ctx: &mut DecodeContext,
 ) -> Result<Amf0Value, Amf0DeserializationError> {
     ensure_de_depth(depth)?;
-    let value = crate::amf3::deserialize_single(bytes)
+    let document = crate::amf3::deserialize_document_single(bytes)
         .map_err(|e| Amf0DeserializationError::EmbeddedAmf3(e.to_string()))?;
-    Ok(Amf0Value::AvmPlus(Box::new(value)))
+    let (mut roots, mut objects) = document.into_parts();
+    let base = ctx.embedded.len();
+    ensure_de_collection(base + objects.len())?;
+    for value in roots.iter_mut().chain(objects.iter_mut()) {
+        crate::amf3::relocate(value, base);
+    }
+    ctx.embedded.extend(objects);
+    Ok(Amf0Value::AvmPlus(Box::new(roots.pop().unwrap())))
 }
 /// Read `len` bytes, rejecting a length the input cannot satisfy before
 /// allocating for it.
@@ -454,10 +677,11 @@ fn parse_string<R: common::AmfRead>(bytes: &mut R) -> Result<Amf0Value, Amf0Dese
 fn parse_object<R: common::AmfRead>(
     bytes: &mut R,
     depth: usize,
+    ctx: &mut DecodeContext,
 ) -> Result<Amf0Value, Amf0DeserializationError> {
     ensure_de_depth(depth)?;
     let mut properties = Amf0Object::new();
-    while let Some(property) = parse_object_property(bytes, depth)? {
+    while let Some(property) = parse_object_property(bytes, depth, ctx)? {
         ensure_de_collection(properties.len() + 1)?;
         properties.insert(property.label, property.value);
     }
@@ -466,20 +690,22 @@ fn parse_object<R: common::AmfRead>(
 fn parse_ecma_array<R: common::AmfRead>(
     bytes: &mut R,
     depth: usize,
+    ctx: &mut DecodeContext,
 ) -> Result<Amf0Value, Amf0DeserializationError> {
     let count = common::read_u32_be(bytes)? as usize;
     ensure_de_collection(count)?;
-    parse_object(bytes, depth)
+    parse_object(bytes, depth, ctx)
 }
 fn parse_strict_array<R: common::AmfRead>(
     bytes: &mut R,
     depth: usize,
+    ctx: &mut DecodeContext,
 ) -> Result<Amf0Value, Amf0DeserializationError> {
     let count = common::read_u32_be(bytes)? as usize;
     ensure_de_collection(count)?;
     let mut values = Vec::new();
     for _ in 0..count {
-        match read_next_value(bytes, depth + 1)? {
+        match read_next_value(bytes, depth + 1, ctx)? {
             Some(value) => values.push(value),
             None => return Err(Amf0DeserializationError::UnexpectedEof),
         }
@@ -489,6 +715,7 @@ fn parse_strict_array<R: common::AmfRead>(
 fn parse_object_property<R: common::AmfRead>(
     bytes: &mut R,
     depth: usize,
+    ctx: &mut DecodeContext,
 ) -> Result<Option<ObjectProperty>, Amf0DeserializationError> {
     let label_length = common::read_u16_be(bytes)?;
     if label_length == 0 {
@@ -500,7 +727,7 @@ fn parse_object_property<R: common::AmfRead>(
     }
     let label_buffer = read_checked(bytes, label_length as usize)?;
     let label = String::from_utf8(label_buffer)?;
-    match read_next_value(bytes, depth + 1)? {
+    match read_next_value(bytes, depth + 1, ctx)? {
         None => Err(Amf0DeserializationError::UnexpectedEof),
         Some(property_value) => Ok(Some(ObjectProperty {
             label,
@@ -518,6 +745,7 @@ impl Amf0Value {
             Amf0Value::Undefined => B::Undefined,
             Amf0Value::Null => B::Null,
             Amf0Value::Boolean(b) => B::Boolean(*b),
+            Amf0Value::Reference(id) => B::Reference(*id),
             Amf0Value::Number(n) => {
                 if n.fract() == 0.0
                     && n.is_finite()
@@ -562,5 +790,106 @@ impl Amf0Value {
 impl From<crate::amf3::Amf3Value> for Amf0Value {
     fn from(value: crate::amf3::Amf3Value) -> Self {
         value.to_amf0()
+    }
+}
+
+impl crate::amf::graph::GraphValue for Amf0Value {
+    fn check_embedded(
+        &self,
+        objects: &[crate::amf3::Amf3Value],
+        limits: &mut crate::amf::TreeLimits,
+        depth: usize,
+    ) -> Result<(), crate::amf::TreeError> {
+        if let Self::AvmPlus(value) = self {
+            crate::amf::graph::validate(
+                value.as_ref(),
+                objects,
+                &[],
+                &mut Vec::new(),
+                limits,
+                depth + 1,
+            )?;
+        }
+        Ok(())
+    }
+    fn install_embedded(&mut self, objects: &[crate::amf3::Amf3Value]) {
+        if let Self::AvmPlus(value) = self {
+            crate::amf::graph::install(value.as_mut(), objects, &[]);
+        }
+    }
+
+    fn reference(&self) -> Option<crate::amf::ObjectId> {
+        if let Self::Reference(id) = self {
+            Some(*id)
+        } else {
+            None
+        }
+    }
+    fn heap_bytes(&self) -> usize {
+        let map = |p: &Amf0Object| {
+            p.len()
+                .saturating_mul(std::mem::size_of::<(String, Self)>())
+                .saturating_add(p.keys().map(|k| k.len()).sum::<usize>())
+        };
+        match self {
+            Self::Utf8String(s) | Self::XmlDocument(s) => s.len(),
+            Self::Object(p) => map(p),
+            Self::TypedObject {
+                class_name,
+                properties,
+            } => class_name.len().saturating_add(map(properties)),
+            Self::StrictArray(v) => v.len() * std::mem::size_of::<Self>(),
+            Self::AvmPlus(_) => std::mem::size_of::<crate::amf3::Amf3Value>(),
+            _ => 0,
+        }
+    }
+    fn children(
+        &self,
+        visit: &mut dyn FnMut(&Self) -> Result<(), crate::amf::TreeError>,
+    ) -> Result<(), crate::amf::TreeError> {
+        match self {
+            Self::Object(p) | Self::TypedObject { properties: p, .. } => {
+                for v in p.values() {
+                    visit(v)?;
+                }
+            }
+            Self::StrictArray(v) => {
+                for v in v {
+                    visit(v)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn children_mut(&mut self, visit: &mut dyn FnMut(&mut Self)) {
+        match self {
+            Self::Object(p) | Self::TypedObject { properties: p, .. } => {
+                for v in p.values_mut() {
+                    visit(v);
+                }
+            }
+            Self::StrictArray(v) => {
+                for v in v {
+                    visit(v);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Amf0Document {
+    /// Expand sharing, including embedded AMF3, under one total budget. Reject cycles.
+    pub fn to_tree(
+        &self,
+        limits: crate::amf::TreeLimits,
+    ) -> Result<Vec<Amf0Value>, crate::amf::TreeError> {
+        crate::amf::graph::expand_with_embedded(
+            self.roots(),
+            self.objects(),
+            &self.embedded,
+            limits,
+        )
     }
 }

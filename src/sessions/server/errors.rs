@@ -1,4 +1,4 @@
-use crate::chunk_io::{ChunkDeserializationError, ChunkSerializationError};
+use crate::chunk_io::{DecodeError, EncodeError};
 
 use crate::messages::{MessageDeserializationError, MessageSerializationError};
 use thiserror::Error;
@@ -8,16 +8,34 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ServerSessionError {
+    #[error(transparent)]
+    LimitExceeded(#[from] crate::sessions::SessionLimitError),
+    #[error("stream {stream:?} is in state {state:?}")]
+    StreamInInvalidState {
+        stream: crate::sessions::StreamHandle,
+        state: crate::sessions::ServerStreamState,
+    },
+    #[error("message stream identifiers exhausted")]
+    StreamIdsExhausted,
+    #[error("stream handle is deleted or belongs to another session")]
+    InvalidStreamHandle,
+    /// Accept and drain a connection request before sending packets.
+    #[error("accept a connection request before sending a packet")]
+    NotConnected,
+
+    #[error("drain pending session outputs through receive before sending a packet")]
+    PendingOutput,
+
     /// An earlier input error terminated this session. Close its transport.
     #[error("session terminated after an input error")]
     SessionFailed,
     /// Encountered when an error occurs while deserializing the incoming byte data
     #[error("An error occurred deserializing incoming data: {0}")]
-    ChunkDeserializationError(#[from] ChunkDeserializationError),
+    DecodeError(#[from] DecodeError),
 
     /// Encountered when an error occurs while serializing outbound messages
     #[error("An error occurred serializing outbound messages: {0}")]
-    ChunkSerializationError(#[from] ChunkSerializationError),
+    EncodeError(#[from] EncodeError),
 
     /// Encountered when an error occurs while turning an RTMP message into an message payload
     #[error(

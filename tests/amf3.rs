@@ -4,18 +4,20 @@
 //! value vecs, `RtmpMessage::Amf3Command` (type 17) / `RtmpMessage::Amf3Data`
 //! (type 15), and strict typed errors instead of AMF0 fallback.
 
-use bytes::Bytes;
-use rtmpx::amf::AmfEncoding;
-use rtmpx::amf0::Amf0Object;
-use rtmpx::amf0::Amf0Value;
-use rtmpx::amf3::{self, Amf3Value};
-use rtmpx::chunk_io::{ChunkDeserializer, ChunkSerializer};
-use rtmpx::messages::{MessagePayload, RtmpMessage};
-use rtmpx::sessions::{
-    ClientSession, ClientSessionConfig, ClientSessionResult, PublishRequestType, ServerSession,
+#[path = "support/api.rs"]
+mod api;
+use crate::api::amf::AmfEncoding;
+use crate::api::amf0::Amf0Object;
+use crate::api::amf0::Amf0Value;
+use crate::api::amf3::{self, Amf3Value};
+use crate::api::chunk_io::{ChunkEncoder, ContiguousDecoder};
+use crate::api::messages::{RawMessage, RtmpMessage};
+use crate::api::sessions::{
+    ClientSession, ClientSessionConfig, ClientSessionResult, PublishMode, ServerSession,
     ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
 };
-use rtmpx::time::RtmpTimestamp;
+use crate::api::time::RtmpTimestamp;
+use bytes::Bytes;
 use std::io::Cursor;
 
 fn round_trip(value: &Amf3Value) -> Amf3Value {
@@ -179,7 +181,10 @@ fn avmplus_references_are_not_sticky() {
     let mut cursor = Cursor::new(second.as_slice());
     let err = amf3::decode_avmplus_wrapped(&mut cursor).unwrap_err();
     assert!(
-        matches!(err, rtmpx::Amf3DeserializationError::BadStringReference(0)),
+        matches!(
+            err,
+            crate::api::Amf3DeserializationError::BadStringReference(0)
+        ),
         "{err:?}"
     );
 }
@@ -189,33 +194,33 @@ fn malformed_inputs_are_typed_errors() {
     let mut cursor = Cursor::new([0x04].as_slice());
     assert!(matches!(
         amf3::deserialize_single(&mut cursor).unwrap_err(),
-        rtmpx::Amf3DeserializationError::UnexpectedEof
+        crate::api::Amf3DeserializationError::UnexpectedEof
     ));
     let mut cursor = Cursor::new([0x12].as_slice());
     assert!(matches!(
         amf3::deserialize_single(&mut cursor).unwrap_err(),
-        rtmpx::Amf3DeserializationError::UnknownMarker(0x12)
+        crate::api::Amf3DeserializationError::UnknownMarker(0x12)
     ));
     let mut cursor = Cursor::new([0x06, 0x00].as_slice());
     assert!(matches!(
         amf3::deserialize_single(&mut cursor).unwrap_err(),
-        rtmpx::Amf3DeserializationError::BadStringReference(_)
+        crate::api::Amf3DeserializationError::BadStringReference(_)
     ));
     let mut cursor = Cursor::new([0x09, 0x00].as_slice());
     assert!(matches!(
         amf3::deserialize_single(&mut cursor).unwrap_err(),
-        rtmpx::Amf3DeserializationError::BadObjectReference(_)
+        crate::api::Amf3DeserializationError::BadObjectReference(_)
     ));
     let mut cursor = Cursor::new([0x0A, 0x05].as_slice());
     assert!(matches!(
         amf3::deserialize_single(&mut cursor).unwrap_err(),
-        rtmpx::Amf3DeserializationError::BadTraitReference(_)
+        crate::api::Amf3DeserializationError::BadTraitReference(_)
     ));
     // An externalizable class this codec has no reader for stops with the class
     // name attached so the caller can fall back to opaque relay.
     let mut cursor = Cursor::new([0x0A, 0x07, 0x03, b'X'].as_slice());
     match amf3::deserialize_single(&mut cursor).unwrap_err() {
-        rtmpx::Amf3DeserializationError::ExternalizableUnsupported(name) => {
+        crate::api::Amf3DeserializationError::ExternalizableUnsupported(name) => {
             assert_eq!(name, "X");
         }
         other => panic!("expected ExternalizableUnsupported, got {other:?}"),
@@ -233,7 +238,7 @@ fn depth_and_size_limits_hold() {
     }
     assert!(matches!(
         amf3::serialize(std::slice::from_ref(&deep)).unwrap_err(),
-        rtmpx::Amf3SerializationError::DepthLimit
+        crate::api::Amf3SerializationError::DepthLimit
     ));
     let mut bytes = Vec::new();
     for _ in 0..70 {
@@ -243,12 +248,12 @@ fn depth_and_size_limits_hold() {
     let mut cursor = Cursor::new(bytes.as_slice());
     assert!(matches!(
         amf3::deserialize_single(&mut cursor).unwrap_err(),
-        rtmpx::Amf3DeserializationError::DepthLimit
+        crate::api::Amf3DeserializationError::DepthLimit
     ));
     let big = Amf3Value::String("x".repeat(5 * 1024 * 1024));
     assert!(matches!(
         amf3::serialize(std::slice::from_ref(&big)).unwrap_err(),
-        rtmpx::Amf3SerializationError::StringTooLong(_)
+        crate::api::Amf3SerializationError::StringTooLong(_)
     ));
 }
 
@@ -303,7 +308,7 @@ fn amf3_command_round_trips_over_type_17() {
         };
         let payload = msg
             .clone()
-            .into_message_payload(RtmpTimestamp::new(0), 0)
+            .into_raw_message(RtmpTimestamp::new(0), 0)
             .unwrap();
         assert_eq!(payload.type_id, 17);
         assert_eq!(payload.data[0], selector);
@@ -317,7 +322,7 @@ fn amf3_command_round_trips_over_type_17() {
         };
         let payload = create
             .clone()
-            .into_message_payload(RtmpTimestamp::new(0), 0)
+            .into_raw_message(RtmpTimestamp::new(0), 0)
             .unwrap();
         assert_eq!(payload.to_rtmp_message().unwrap(), create);
     }
@@ -336,7 +341,7 @@ fn amf0_framing_normalises_numbers_and_drops_order() {
         ])],
         format: AmfEncoding::Amf0,
     };
-    let payload = msg.into_message_payload(RtmpTimestamp::new(0), 0).unwrap();
+    let payload = msg.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
     match payload.to_rtmp_message().unwrap() {
         RtmpMessage::Amf3Data { values, .. } => {
             let props = values[0].get_object_properties().unwrap();
@@ -361,7 +366,7 @@ fn amf0_framing_normalises_numbers_and_drops_order() {
     };
     let payload = exact
         .clone()
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .unwrap();
     assert_eq!(payload.to_rtmp_message().unwrap(), exact);
 }
@@ -379,7 +384,7 @@ fn amf3_data_round_trips_over_type_15() {
         };
         let payload = msg
             .clone()
-            .into_message_payload(RtmpTimestamp::new(0), 1)
+            .into_raw_message(RtmpTimestamp::new(0), 1)
             .unwrap();
         assert_eq!(payload.type_id, 15);
         assert_eq!(payload.data[0], selector);
@@ -398,10 +403,10 @@ fn undefined_format_selectors_are_strict_errors() {
             additional_arguments: Vec::new(),
             format: AmfEncoding::Amf0,
         };
-        let payload = msg.into_message_payload(RtmpTimestamp::new(0), 0).unwrap();
+        let payload = msg.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
         let mut raw = payload.data.to_vec();
         raw[0] = bad;
-        let payload = MessagePayload {
+        let payload = RawMessage {
             data: Bytes::from(raw),
             ..payload
         };
@@ -428,12 +433,10 @@ fn amf0_bodies_behind_a_zero_selector_decode_on_types_15_and_17() {
         ),
         additional_arguments: Vec::new(),
     };
-    let payload = legacy
-        .into_message_payload(RtmpTimestamp::new(0), 0)
-        .unwrap();
+    let payload = legacy.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
     let mut raw = vec![0x00u8];
     raw.extend_from_slice(&payload.data);
-    let payload = MessagePayload {
+    let payload = RawMessage {
         data: Bytes::from(raw),
         type_id: 17,
         ..payload
@@ -464,11 +467,11 @@ fn amf0_bodies_behind_a_zero_selector_decode_on_types_15_and_17() {
         values: vec![Amf0Value::Boolean(true)],
     };
     let payload = legacy_data
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .unwrap();
     let mut raw = vec![0x00u8];
     raw.extend_from_slice(&payload.data);
-    let payload = MessagePayload {
+    let payload = RawMessage {
         data: Bytes::from(raw),
         type_id: 15,
         ..payload
@@ -503,7 +506,7 @@ fn shared_objects_stay_opaque() {
     ] {
         let payload = make
             .clone()
-            .into_message_payload(RtmpTimestamp::new(0), 0)
+            .into_raw_message(RtmpTimestamp::new(0), 0)
             .unwrap();
         assert_eq!(payload.type_id, type_id);
         assert_eq!(payload.to_rtmp_message().unwrap(), make);
@@ -572,18 +575,18 @@ fn fuzz_round_trip_equivalence() {
     }
 }
 
-fn drain_server_outbound(deserializer: &mut ChunkDeserializer, results: Vec<ServerSessionResult>) {
+fn drain_server_outbound(deserializer: &mut ContiguousDecoder, results: Vec<ServerSessionResult>) {
     for result in results {
-        if let ServerSessionResult::OutboundResponse(packet) = result {
+        if let ServerSessionResult::Packet(packet) = result {
             let payload = deserializer
-                .get_next_message(&packet.bytes)
+                .get_next_message(&packet.to_vec())
                 .expect("response must decode")
                 .expect("response must be complete");
             if let RtmpMessage::SetChunkSize { size } =
                 payload.to_rtmp_message().expect("response must parse")
             {
                 deserializer
-                    .set_max_chunk_size(size as usize)
+                    .set_chunk_size(size as usize)
                     .expect("chunk size applies");
             }
         }
@@ -592,34 +595,34 @@ fn drain_server_outbound(deserializer: &mut ChunkDeserializer, results: Vec<Serv
 
 fn send_to_server(
     session: &mut ServerSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
     message: RtmpMessage,
     stream_id: u32,
     _first_on_stream: bool,
 ) -> (Vec<RtmpMessage>, Vec<ServerSessionEvent>, Bytes) {
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     let raw = payload.data.clone();
     let packet = serializer.serialize(&payload, true, false).unwrap();
     let mut responses = Vec::new();
     let mut events = Vec::new();
-    for result in session.handle_input(&packet.bytes).unwrap() {
+    for result in session.handle_input(&packet.to_vec()).unwrap() {
         match result {
-            ServerSessionResult::OutboundResponse(packet) => {
+            ServerSessionResult::Packet(packet) => {
                 let payload = deserializer
-                    .get_next_message(&packet.bytes)
+                    .get_next_message(&packet.to_vec())
                     .unwrap()
                     .unwrap();
                 let message = payload.to_rtmp_message().unwrap();
                 if let RtmpMessage::SetChunkSize { size } = &message {
-                    deserializer.set_max_chunk_size(*size as usize).unwrap();
+                    deserializer.set_chunk_size(*size as usize).unwrap();
                 }
                 responses.push(message);
             }
-            ServerSessionResult::RaisedEvent(event) => events.push(event),
-            ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            ServerSessionResult::Event(event) => events.push(event),
+            ServerSessionResult::UnhandledMessage(_) => {}
             #[allow(unreachable_patterns)]
             _ => panic!("unexpected future protocol variant"),
         }
@@ -647,8 +650,8 @@ fn amf3_connect(app: &str) -> RtmpMessage {
 #[test]
 fn amf3_end_to_end_publish_flow_preserves_bytes() {
     let (mut session, initial) = ServerSession::new(ServerSessionConfig::new()).unwrap();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     drain_server_outbound(&mut deserializer, initial);
 
     let (_, events, _) = send_to_server(
@@ -694,14 +697,14 @@ fn amf3_end_to_end_publish_flow_preserves_bytes() {
         .expect("accept must work");
     let mut saw_result = false;
     for result in results {
-        if let ServerSessionResult::OutboundResponse(packet) = result {
+        if let ServerSessionResult::Packet(packet) = result {
             let payload = deserializer
-                .get_next_message(&packet.bytes)
+                .get_next_message(&packet.to_vec())
                 .unwrap_or_else(|e| panic!("chunk parse failed: {e:?}"))
                 .expect("accept response must be complete");
             let message = payload.to_rtmp_message().unwrap();
             if let RtmpMessage::SetChunkSize { size } = &message {
-                deserializer.set_max_chunk_size(*size as usize).unwrap();
+                deserializer.set_chunk_size(*size as usize).unwrap();
                 continue;
             }
             if let RtmpMessage::Amf3Command {
@@ -802,7 +805,7 @@ fn amf3_end_to_end_publish_flow_preserves_bytes() {
     );
     assert_eq!(events.len(), 1);
     match &events[0] {
-        ServerSessionEvent::StreamMetadataChanged { message, .. } => {
+        ServerSessionEvent::StreamDataReceived { message, .. } => {
             let raw_metadata = message
                 .metadata()
                 .unwrap()
@@ -810,7 +813,7 @@ fn amf3_end_to_end_publish_flow_preserves_bytes() {
                 .into_iter()
                 .collect::<Vec<_>>();
             let raw_payload = message.payload().clone();
-            let is_amf3 = message.wire_type() == rtmpx::sessions::DataMessageType::Amf3;
+            let is_amf3 = message.wire_type() == crate::api::sessions::DataMessageType::Amf3;
             assert!(is_amf3);
             assert_eq!(raw_payload, &raw, "relay keeps the original bytes");
             assert!(raw_metadata.iter().any(|(k, _)| k == "width"));
@@ -837,7 +840,7 @@ fn amf3_end_to_end_publish_flow_preserves_bytes() {
     match &events[0] {
         ServerSessionEvent::StreamDataReceived { message, .. } => {
             let raw_payload = message.payload().clone();
-            let is_amf3 = message.wire_type() == rtmpx::sessions::DataMessageType::Amf3;
+            let is_amf3 = message.wire_type() == crate::api::sessions::DataMessageType::Amf3;
             assert!(is_amf3);
             assert_eq!(raw_payload, &raw);
         }
@@ -846,14 +849,14 @@ fn amf3_end_to_end_publish_flow_preserves_bytes() {
 }
 
 fn client_outbound_messages(
-    deserializer: &mut ChunkDeserializer,
+    deserializer: &mut ContiguousDecoder,
     results: Vec<ClientSessionResult>,
-) -> Vec<(MessagePayload, RtmpMessage)> {
+) -> Vec<(RawMessage, RtmpMessage)> {
     let mut out = Vec::new();
     for result in results {
-        if let ClientSessionResult::OutboundResponse(packet) = result {
+        if let ClientSessionResult::Packet(packet) = result {
             let payload = deserializer
-                .get_next_message(&packet.bytes)
+                .get_next_message(&packet.to_vec())
                 .unwrap()
                 .unwrap();
             let message = payload.to_rtmp_message().unwrap_or_else(|e| {
@@ -864,7 +867,7 @@ fn client_outbound_messages(
                 )
             });
             if let RtmpMessage::SetChunkSize { size } = &message {
-                deserializer.set_max_chunk_size(*size as usize).unwrap();
+                deserializer.set_chunk_size(*size as usize).unwrap();
             }
             out.push((payload, message));
         }
@@ -872,18 +875,14 @@ fn client_outbound_messages(
     out
 }
 
-fn server_packet(
-    serializer: &mut ChunkSerializer,
-    message: RtmpMessage,
-    stream_id: u32,
-) -> Vec<u8> {
+fn server_packet(serializer: &mut ChunkEncoder, message: RtmpMessage, stream_id: u32) -> Vec<u8> {
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     serializer
         .serialize(&payload, true, false)
         .unwrap()
-        .bytes
+        .to_vec()
         .to_vec()
 }
 
@@ -915,8 +914,8 @@ fn amf0_connect_success() -> RtmpMessage {
 #[test]
 fn client_raw_amf3_relay_keeps_type_15_bytes() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial) = ClientSession::new(config).unwrap();
     client_outbound_messages(&mut deserializer, initial);
     let connect = session.request_connection("live".to_string()).unwrap();
@@ -932,7 +931,7 @@ fn client_raw_amf3_relay_keeps_type_15_bytes() {
     let bytes = server_packet(&mut serializer, amf0_connect_success(), 0);
     client_outbound_messages(&mut deserializer, session.handle_input(&bytes).unwrap());
     let publish_req = session
-        .request_publishing("key".to_string(), PublishRequestType::Live)
+        .request_publishing("key".to_string(), PublishMode::Live)
         .unwrap();
     let outbound = client_outbound_messages(&mut deserializer, vec![publish_req]);
     let create_txn = outbound
@@ -974,36 +973,36 @@ fn client_raw_amf3_relay_keeps_type_15_bytes() {
 
     let body = Bytes::from_static(b"\x00\x06\x05hi\x06\x00");
     let result = session
-        .publish_data(rtmpx::sessions::DataMessage::new(
-            rtmpx::sessions::DataMessageType::Amf3,
+        .publish_data(crate::api::sessions::DataMessage::new(
+            crate::api::sessions::DataMessageType::Amf3,
             RtmpTimestamp::new(10),
             body.clone(),
         ))
         .unwrap();
     let packet = match result {
-        ClientSessionResult::OutboundResponse(packet) => packet,
+        ClientSessionResult::Packet(packet) => packet,
         other => panic!("expected outbound packet, got {other:?}"),
     };
     let payload = deserializer
-        .get_next_message(&packet.bytes)
+        .get_next_message(&packet.to_vec())
         .unwrap()
         .unwrap();
     assert_eq!(payload.type_id, 15, "AMF3 relay must stay type 15");
     assert_eq!(payload.data, body);
     let body0 = Bytes::from_static(b"amf0-bytes");
     let result = session
-        .publish_data(rtmpx::sessions::DataMessage::new(
-            rtmpx::sessions::DataMessageType::Amf0,
+        .publish_data(crate::api::sessions::DataMessage::new(
+            crate::api::sessions::DataMessageType::Amf0,
             RtmpTimestamp::new(11),
             body0.clone(),
         ))
         .unwrap();
     let packet = match result {
-        ClientSessionResult::OutboundResponse(packet) => packet,
+        ClientSessionResult::Packet(packet) => packet,
         other => panic!("expected outbound packet, got {other:?}"),
     };
     let payload = deserializer
-        .get_next_message(&packet.bytes)
+        .get_next_message(&packet.to_vec())
         .unwrap()
         .unwrap();
     assert_eq!(payload.type_id, 18, "AMF0 relay must stay type 18");
@@ -1064,7 +1063,7 @@ fn unknown_externalizable_reports_its_class_name() {
     bytes.extend_from_slice(b"DSA\0\0"[..5].as_ref());
     let mut cursor = Cursor::new(bytes.as_slice());
     match amf3::deserialize_single(&mut cursor).unwrap_err() {
-        rtmpx::Amf3DeserializationError::ExternalizableUnsupported(name) => {
+        crate::api::Amf3DeserializationError::ExternalizableUnsupported(name) => {
             assert_eq!(name.len(), 5);
         }
         other => panic!("expected ExternalizableUnsupported, got {other:?}"),
@@ -1106,7 +1105,7 @@ fn cyclic_reference_is_reported_as_a_cycle() {
     let bytes = [0x09, 0x03, 0x01, 0x09, 0x00];
     let mut cursor = Cursor::new(bytes.as_slice());
     match amf3::deserialize_single(&mut cursor).unwrap_err() {
-        rtmpx::Amf3DeserializationError::CyclicReference(0) => {}
+        crate::api::Amf3DeserializationError::CyclicReference(0) => {}
         other => panic!("expected CyclicReference(0), got {other:?}"),
     }
 
@@ -1115,7 +1114,7 @@ fn cyclic_reference_is_reported_as_a_cycle() {
     let mut cursor = Cursor::new(bytes.as_slice());
     assert!(matches!(
         amf3::deserialize_single(&mut cursor).unwrap_err(),
-        rtmpx::Amf3DeserializationError::BadObjectReference(_)
+        crate::api::Amf3DeserializationError::BadObjectReference(_)
     ));
 }
 
@@ -1134,7 +1133,7 @@ fn oversized_length_prefixes_do_not_allocate() {
         assert!(
             matches!(
                 amf3::deserialize_single(&mut cursor).unwrap_err(),
-                rtmpx::Amf3DeserializationError::UnexpectedEof
+                crate::api::Amf3DeserializationError::UnexpectedEof
             ),
             "marker {marker:#x} must fail before allocating"
         );
@@ -1145,7 +1144,7 @@ fn oversized_length_prefixes_do_not_allocate() {
     let mut cursor = Cursor::new(bytes.as_slice());
     assert!(matches!(
         amf3::deserialize_single(&mut cursor).unwrap_err(),
-        rtmpx::Amf3DeserializationError::ByteArrayTooLong(_)
+        crate::api::Amf3DeserializationError::ByteArrayTooLong(_)
     ));
 }
 
@@ -1187,8 +1186,8 @@ fn connect_and_accept_with(
     config: ServerSessionConfig,
 ) -> (Vec<RtmpMessage>, Vec<ServerSessionEvent>) {
     let (mut session, initial) = ServerSession::new(config).unwrap();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     drain_server_outbound(&mut deserializer, initial);
 
     let (_, events, _) = send_to_server(
@@ -1212,14 +1211,14 @@ fn connect_and_accept_with(
         .accept_request(request_id)
         .expect("accept must work")
     {
-        if let ServerSessionResult::OutboundResponse(packet) = result {
+        if let ServerSessionResult::Packet(packet) = result {
             let payload = deserializer
-                .get_next_message(&packet.bytes)
+                .get_next_message(&packet.to_vec())
                 .unwrap()
                 .unwrap();
             let message = payload.to_rtmp_message().unwrap();
             if let RtmpMessage::SetChunkSize { size } = &message {
-                deserializer.set_max_chunk_size(*size as usize).unwrap();
+                deserializer.set_chunk_size(*size as usize).unwrap();
             }
             responses.push(message);
         }
@@ -1329,13 +1328,13 @@ fn client_object_encoding_config_drives_the_connect_request() {
 
         let (mut session, _) = ClientSession::new(config).unwrap();
         let result = session.request_connection("live".to_string()).unwrap();
-        let ClientSessionResult::OutboundResponse(packet) = result else {
+        let ClientSessionResult::Packet(packet) = result else {
             panic!("expected an outbound connect");
         };
 
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         let payload = deserializer
-            .get_next_message(&packet.bytes)
+            .get_next_message(&packet.to_vec())
             .unwrap()
             .expect("connect must be complete");
         match payload.to_rtmp_message().unwrap() {
@@ -1371,8 +1370,8 @@ fn amf0_object_encoding_is_deterministic_and_order_preserving() {
     );
 
     // Insertion order is what comes back, not hash order.
-    let decoded = rtmpx::amf0::deserialize(&mut Cursor::new(
-        rtmpx::amf0::serialize(std::slice::from_ref(&object))
+    let decoded = crate::api::amf0::deserialize(&mut Cursor::new(
+        crate::api::amf0::serialize(std::slice::from_ref(&object))
             .unwrap()
             .as_slice(),
     ))
@@ -1383,10 +1382,10 @@ fn amf0_object_encoding_is_deterministic_and_order_preserving() {
     assert_eq!(properties.keys().cloned().collect::<Vec<_>>(), keys);
 
     // And the bytes are stable across repeated encodes.
-    let first = rtmpx::amf0::serialize(std::slice::from_ref(&object)).unwrap();
+    let first = crate::api::amf0::serialize(std::slice::from_ref(&object)).unwrap();
     for _ in 0..16 {
         assert_eq!(
-            rtmpx::amf0::serialize(std::slice::from_ref(&object)).unwrap(),
+            crate::api::amf0::serialize(std::slice::from_ref(&object)).unwrap(),
             first
         );
     }
@@ -1408,7 +1407,7 @@ fn property_order_survives_the_amf3_projection() {
         values: vec![ordered.clone()],
         format: AmfEncoding::Amf0,
     };
-    let payload = msg.into_message_payload(RtmpTimestamp::new(0), 0).unwrap();
+    let payload = msg.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
     match payload.to_rtmp_message().unwrap() {
         RtmpMessage::Amf3Data { values, .. } => assert_eq!(values[0], ordered),
         other => panic!("expected AMF3 data, got {other:?}"),
@@ -1436,7 +1435,7 @@ fn amf0_connect_is_answered_as_amf0_even_at_object_encoding_three() {
 /// callers one shape regardless of encoding.
 #[test]
 fn enhanced_capabilities_are_validated_on_an_amf3_connect() {
-    use rtmpx::{EnhancedCapabilities, EnhancedValidationMode};
+    use crate::api::{EnhancedCapabilities, EnhancedValidationMode};
 
     let connect_with = |caps_ex: Amf3Value| RtmpMessage::Amf3Command {
         command_name: "connect".to_string(),
@@ -1609,7 +1608,7 @@ fn unregistered_externalizable_with_bean_payload_still_errors() {
         );
         let mut cursor = Cursor::new(bytes.as_slice());
         match amf3::deserialize_single(&mut cursor).unwrap_err() {
-            rtmpx::Amf3DeserializationError::ExternalizableUnsupported(name) => {
+            crate::api::Amf3DeserializationError::ExternalizableUnsupported(name) => {
                 assert_eq!(name, class);
             }
             other => panic!("expected ExternalizableUnsupported, got {other:?}"),
@@ -1630,7 +1629,7 @@ fn truncated_status_bean_reports_unsupported() {
     let mut cursor = Cursor::new(bytes.as_slice());
     assert!(matches!(
         amf3::deserialize_single(&mut cursor).unwrap_err(),
-        rtmpx::Amf3DeserializationError::ExternalizableUnsupported(_)
+        crate::api::Amf3DeserializationError::ExternalizableUnsupported(_)
     ));
 }
 
@@ -1647,7 +1646,7 @@ fn status_bean_writer_rejects_wrong_shape() {
     };
     assert!(matches!(
         amf3::serialize(std::slice::from_ref(&odd)).unwrap_err(),
-        rtmpx::Amf3SerializationError::ExternalizableUnsupported(_)
+        crate::api::Amf3SerializationError::ExternalizableUnsupported(_)
     ));
 }
 

@@ -1,7 +1,8 @@
 use super::*;
 use crate::amf0::{Amf0Object, Amf0Value};
-use crate::chunk_io::ChunkDeserializer;
-use crate::messages::{MessagePayload, RtmpMessage, UserControlEventType};
+use crate::api::sessions::{ServerSession, ServerSessionEvent, ServerSessionResult};
+use crate::chunk_io::ContiguousDecoder;
+use crate::messages::{RawMessage, RtmpMessage, UserControlEventType};
 use bytes::BytesMut;
 
 const DEFAULT_CHUNK_SIZE: u32 = 1111;
@@ -23,7 +24,7 @@ fn on_bw_done_not_sent_when_config_disables_it() {
     let mut config = get_basic_config();
     config.send_on_bw_done_message_on_start = false;
 
-    let mut deserializer = ChunkDeserializer::new();
+    let mut deserializer = ContiguousDecoder::new();
     let (_, results) = ServerSession::new(config).unwrap();
 
     let (responses, _) = split_results(&mut deserializer, results);
@@ -44,7 +45,7 @@ fn can_accept_connection_request() {
 
     let connect_payload = create_connect_message("some_app".to_string(), 15, 0, 0.0);
     let connect_packet = serializer.serialize(&connect_payload, true, false).unwrap();
-    let connect_results = session.handle_input(&connect_packet.bytes[..]).unwrap();
+    let connect_results = session.handle_input(&connect_packet.to_vec()[..]).unwrap();
     assert_eq!(
         connect_results.len(),
         1,
@@ -137,7 +138,7 @@ fn connect_request_strips_trailing_slash() {
 
     let connect_payload = create_connect_message("some_app/".to_string(), 15, 0, 0.0);
     let connect_packet = serializer.serialize(&connect_payload, true, false).unwrap();
-    let connect_results = session.handle_input(&connect_packet.bytes[..]).unwrap();
+    let connect_results = session.handle_input(&connect_packet.to_vec()[..]).unwrap();
     assert_eq!(
         connect_results.len(),
         1,
@@ -172,7 +173,7 @@ fn connection_requested_event_carries_additional_connect_properties() {
     let connect_payload =
         create_connect_message_with_properties("some_app".to_string(), 15, 0, 0.0, extra);
     let connect_packet = serializer.serialize(&connect_payload, true, false).unwrap();
-    let connect_results = session.handle_input(&connect_packet.bytes[..]).unwrap();
+    let connect_results = session.handle_input(&connect_packet.to_vec()[..]).unwrap();
 
     let (_, events) = split_results(&mut deserializer, connect_results);
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -207,7 +208,7 @@ fn accepted_connection_responds_with_same_object_encoding_value_as_connection_re
 
     let connect_payload = create_connect_message("some_app".to_string(), 15, 0, 3.0);
     let connect_packet = serializer.serialize(&connect_payload, true, false).unwrap();
-    let connect_results = session.handle_input(&connect_packet.bytes[..]).unwrap();
+    let connect_results = session.handle_input(&connect_packet.to_vec()[..]).unwrap();
     assert_eq!(
         connect_results.len(),
         1,
@@ -306,11 +307,9 @@ fn can_create_stream_on_connected_session() {
         additional_arguments: Vec::new(),
     };
 
-    let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
-        .unwrap();
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
     let packet = serializer.serialize(&payload, true, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (responses, _) = split_results(&mut deserializer, results);
 
     assert_eq!(
@@ -361,12 +360,12 @@ fn can_accept_live_publishing_to_requested_stream_key() {
     };
 
     let publish_payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     let publish_packet = serializer
         .serialize(&publish_payload, false, false)
         .unwrap();
-    let publish_results = session.handle_input(&publish_packet.bytes[..]).unwrap();
+    let publish_results = session.handle_input(&publish_packet.to_vec()[..]).unwrap();
     let (_, events) = split_results(&mut deserializer, publish_results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -467,24 +466,24 @@ fn can_receive_and_raise_event_for_metadata_from_obs() {
     };
 
     let metadata_payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     let metadata_packet = serializer
         .serialize(&metadata_payload, false, false)
         .unwrap();
-    let metadata_results = session.handle_input(&metadata_packet.bytes[..]).unwrap();
+    let metadata_results = session.handle_input(&metadata_packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, metadata_results);
 
     assert_eq!(events.len(), 1, "Unexpected number of metadata events");
 
     match events.remove(0) {
-        ServerSessionEvent::StreamMetadataChanged {
+        ServerSessionEvent::StreamDataReceived {
             message,
             app_name,
             stream_key,
-            metadata,
             ..
         } => {
+            let metadata = crate::api::sessions::metadata(&message);
             let raw_metadata = message
                 .metadata()
                 .unwrap()
@@ -581,10 +580,10 @@ fn can_receive_audio_data_on_published_stream() {
         data: Bytes::from(vec![1_u8, 2_u8, 3_u8]),
     };
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(1234), stream_id)
+        .into_raw_message(RtmpTimestamp::new(1234), stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -633,10 +632,10 @@ fn can_receive_video_data_on_published_stream() {
         data: Bytes::from(vec![1_u8, 2_u8, 3_u8]),
     };
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(1234), stream_id)
+        .into_raw_message(RtmpTimestamp::new(1234), stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -689,10 +688,10 @@ fn publish_finished_event_raised_when_delete_stream_invoked_on_publishing_stream
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(1234), stream_id)
+        .into_raw_message(RtmpTimestamp::new(1234), stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -743,10 +742,10 @@ fn gstreamer_string_delete_stream_id_finishes_publishing() {
         additional_arguments: vec![Amf0Value::Utf8String(stream_id.to_string())],
     };
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(1234), stream_id)
+        .into_raw_message(RtmpTimestamp::new(1234), stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, events) = split_results(&mut deserializer, results);
 
     assert!(matches!(
@@ -782,10 +781,10 @@ fn publish_finished_event_raised_when_close_stream_invoked_on_publishing_stream(
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(1234), stream_id)
+        .into_raw_message(RtmpTimestamp::new(1234), stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -841,12 +840,12 @@ fn can_request_publishing_on_closed_stream() {
     };
 
     let publish_payload = message
-        .into_message_payload(RtmpTimestamp::new(2000), stream_id)
+        .into_raw_message(RtmpTimestamp::new(2000), stream_id)
         .unwrap();
     let publish_packet = serializer
         .serialize(&publish_payload, false, false)
         .unwrap();
-    let publish_results = session.handle_input(&publish_packet.bytes[..]).unwrap();
+    let publish_results = session.handle_input(&publish_packet.to_vec()[..]).unwrap();
     let (_, events) = split_results(&mut deserializer, publish_results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -889,10 +888,10 @@ fn can_accept_play_command_with_no_optional_parameters_to_requested_stream_key()
     };
 
     let play_payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     let play_packet = serializer.serialize(&play_payload, false, false).unwrap();
-    let play_results = session.handle_input(&play_packet.bytes[..]).unwrap();
+    let play_results = session.handle_input(&play_packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, play_results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -1036,10 +1035,10 @@ fn can_accept_play_command_with_all_optional_parameters_to_requested_stream_key(
     };
 
     let play_payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     let play_packet = serializer.serialize(&play_payload, false, false).unwrap();
-    let play_results = session.handle_input(&play_packet.bytes[..]).unwrap();
+    let play_results = session.handle_input(&play_packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, play_results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -1105,10 +1104,10 @@ fn play_finished_event_when_close_stream_invoked() {
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(1234), stream_id)
+        .into_raw_message(RtmpTimestamp::new(1234), stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -1161,10 +1160,10 @@ fn play_finished_event_when_delete_stream_invoked_on_playing_stream() {
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(1234), stream_id)
+        .into_raw_message(RtmpTimestamp::new(1234), stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -1226,7 +1225,7 @@ fn can_send_metadata_to_playing_stream() {
         .send_metadata(crate::sessions::StreamId::new(stream_id), &metadata)
         .unwrap();
     let payload = deserializer
-        .get_next_message(&packet.bytes[..])
+        .get_next_message(&packet.to_vec()[..])
         .unwrap()
         .unwrap();
     let message = payload.to_rtmp_message().unwrap();
@@ -1341,7 +1340,7 @@ fn can_send_video_data_to_playing_stream() {
         )
         .unwrap();
     let payload = deserializer
-        .get_next_message(&packet.bytes[..])
+        .get_next_message(&packet.to_vec()[..])
         .unwrap()
         .unwrap();
     let message = payload.to_rtmp_message().unwrap();
@@ -1392,7 +1391,7 @@ fn can_send_audio_data_to_playing_stream() {
         )
         .unwrap();
     let payload = deserializer
-        .get_next_message(&packet.bytes[..])
+        .get_next_message(&packet.to_vec()[..])
         .unwrap()
         .unwrap();
     let message = payload.to_rtmp_message().unwrap();
@@ -1432,10 +1431,10 @@ fn automatically_responds_to_ping_requests() {
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(6000), 0)
+        .into_raw_message(RtmpTimestamp::new(6000), 0)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (mut responses, _) = split_results(&mut deserializer, results);
 
     assert_eq!(
@@ -1483,10 +1482,10 @@ fn event_raised_when_ping_response_received() {
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(6000), 0)
+        .into_raw_message(RtmpTimestamp::new(6000), 0)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "One event expected");
@@ -1515,7 +1514,7 @@ fn can_send_ping_request() {
 
     let (packet, sent_timestamp) = session.send_ping_request().unwrap();
     let payload = deserializer
-        .get_next_message(&packet.bytes[..])
+        .get_next_message(&packet.to_vec()[..])
         .unwrap()
         .unwrap();
     let message = payload.to_rtmp_message().unwrap();
@@ -1543,7 +1542,7 @@ fn can_send_ping_request() {
 }
 
 #[test]
-fn can_finish_playing_stream() {
+fn can_complete_playback_stream() {
     let (mut deserializer, mut serializer, mut session) = common_basic_setup();
     perform_connection(
         TEST_APP_NAME,
@@ -1561,10 +1560,10 @@ fn can_finish_playing_stream() {
     );
 
     let packet = session
-        .finish_playing(crate::sessions::StreamId::new(stream_id))
+        .complete_playback(crate::sessions::StreamId::new(stream_id))
         .unwrap();
     let payload = deserializer
-        .get_next_message(&packet.bytes[..])
+        .get_next_message(&packet.to_vec()[..])
         .unwrap()
         .unwrap();
     let message = payload.to_rtmp_message().unwrap();
@@ -1585,7 +1584,9 @@ fn acknowledges_a_peer_that_never_advertises_its_own_window() {
         window_ack_size: 200,
         send_on_bw_done_message_on_start: true,
         max_object_encoding: crate::amf::AmfEncoding::Amf3,
-        chunk_deserializer: crate::chunk_io::ChunkDeserializerConfig::default(),
+        payload_pool: None,
+        decoder_limits: crate::chunk_io::DecoderLimits::default(),
+        session_limits: crate::sessions::SessionLimits::default(),
     };
     let (mut deserializer, mut serializer, mut session) = common_setup(&config);
     perform_connection(
@@ -1602,10 +1603,10 @@ fn acknowledges_a_peer_that_never_advertises_its_own_window() {
         data: bytes.freeze(),
     };
     let video_payload = video_message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .unwrap();
     let video_packet = serializer.serialize(&video_payload, false, false).unwrap();
-    let results = session.handle_input(&video_packet.bytes[..]).unwrap();
+    let results = session.handle_input(&video_packet.to_vec()[..]).unwrap();
     let (mut responses, _) = split_results(&mut deserializer, results);
 
     assert_eq!(
@@ -1633,7 +1634,7 @@ fn sends_ack_after_receiving_window_ack_bytes() {
 
     let window_ack_message = RtmpMessage::WindowAcknowledgement { size: 100 };
     let window_ack_payload = window_ack_message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .unwrap();
     let window_ack_packet = serializer
         .serialize(&window_ack_payload, false, false)
@@ -1643,8 +1644,10 @@ fn sends_ack_after_receiving_window_ack_bytes() {
     // received on the connection, which includes the connect handshake traffic
     // and this window-ack packet, not just the video that triggered the ack.
     let mut total_input_bytes = session.bytes_received_for_test();
-    total_input_bytes += window_ack_packet.bytes.len() as u64;
-    let results = session.handle_input(&window_ack_packet.bytes[..]).unwrap();
+    total_input_bytes += window_ack_packet.to_vec().len() as u64;
+    let results = session
+        .handle_input(&window_ack_packet.to_vec()[..])
+        .unwrap();
     consume_results(&mut deserializer, results);
 
     let mut bytes = BytesMut::new();
@@ -1653,11 +1656,11 @@ fn sends_ack_after_receiving_window_ack_bytes() {
         data: bytes.freeze(),
     };
     let video_payload = video_message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .unwrap();
     let video_packet = serializer.serialize(&video_payload, false, false).unwrap();
-    total_input_bytes += video_packet.bytes.len() as u64;
-    let results = session.handle_input(&video_packet.bytes[..]).unwrap();
+    total_input_bytes += video_packet.to_vec().len() as u64;
+    let results = session.handle_input(&video_packet.to_vec()[..]).unwrap();
     let (mut responses, _) = split_results(&mut deserializer, results);
 
     assert_eq!(responses.len(), 1, "Unexpected number of responses");
@@ -1678,11 +1681,11 @@ fn sends_ack_after_receiving_window_ack_bytes() {
         data: bytes.freeze(),
     };
     let video_payload = video_message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .unwrap();
     let video_packet = serializer.serialize(&video_payload, false, false).unwrap();
-    total_input_bytes += video_packet.bytes.len() as u64;
-    let results = session.handle_input(&video_packet.bytes[..]).unwrap();
+    total_input_bytes += video_packet.to_vec().len() as u64;
+    let results = session.handle_input(&video_packet.to_vec()[..]).unwrap();
     let (responses, _) = split_results(&mut deserializer, results);
     assert_eq!(responses.len(), 0, "Expected no responses");
 
@@ -1692,11 +1695,11 @@ fn sends_ack_after_receiving_window_ack_bytes() {
         data: bytes.freeze(),
     };
     let video_payload = video_message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .unwrap();
     let video_packet = serializer.serialize(&video_payload, false, false).unwrap();
-    total_input_bytes += video_packet.bytes.len() as u64;
-    let results = session.handle_input(&video_packet.bytes[..]).unwrap();
+    total_input_bytes += video_packet.to_vec().len() as u64;
+    let results = session.handle_input(&video_packet.to_vec()[..]).unwrap();
     let (mut responses, _) = split_results(&mut deserializer, results);
     assert_eq!(responses.len(), 1, "Unexpected number of responses");
     match responses.remove(0) {
@@ -1722,11 +1725,9 @@ fn event_raised_when_client_sends_an_acknowledgement() {
     let message = RtmpMessage::Acknowledgement {
         sequence_number: 1234,
     };
-    let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
-        .unwrap();
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events");
@@ -1753,42 +1754,42 @@ fn get_basic_config() -> ServerSessionConfig {
         window_ack_size: DEFAULT_WINDOW_ACK_SIZE,
         send_on_bw_done_message_on_start: true,
         max_object_encoding: crate::amf::AmfEncoding::Amf3,
-        chunk_deserializer: crate::chunk_io::ChunkDeserializerConfig::default(),
+        payload_pool: None,
+        decoder_limits: crate::chunk_io::DecoderLimits::default(),
+        session_limits: crate::sessions::SessionLimits::default(),
     }
 }
 
-fn common_setup(
-    config: &ServerSessionConfig,
-) -> (ChunkDeserializer, ChunkSerializer, ServerSession) {
-    let mut deserializer = ChunkDeserializer::new();
-    let serializer = ChunkSerializer::new();
+fn common_setup(config: &ServerSessionConfig) -> (ContiguousDecoder, ChunkEncoder, ServerSession) {
+    let mut deserializer = ContiguousDecoder::new();
+    let serializer = ChunkEncoder::new();
     let (session, initial_results) = ServerSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
     (deserializer, serializer, session)
 }
 
-fn common_basic_setup() -> (ChunkDeserializer, ChunkSerializer, ServerSession) {
+fn common_basic_setup() -> (ContiguousDecoder, ChunkEncoder, ServerSession) {
     common_setup(&get_basic_config())
 }
 
 fn split_results(
-    deserializer: &mut ChunkDeserializer,
+    deserializer: &mut ContiguousDecoder,
     mut results: Vec<ServerSessionResult>,
-) -> (Vec<(MessagePayload, RtmpMessage)>, Vec<ServerSessionEvent>) {
+) -> (Vec<(RawMessage, RtmpMessage)>, Vec<ServerSessionEvent>) {
     let mut responses = Vec::new();
     let mut events = Vec::new();
 
     for result in results.drain(..) {
         match result {
-            ServerSessionResult::OutboundResponse(packet) => {
+            ServerSessionResult::Packet(packet) => {
                 let payload = deserializer
-                    .get_next_message(&packet.bytes[..])
+                    .get_next_message(&packet.to_vec()[..])
                     .unwrap()
                     .unwrap();
                 let message = payload.to_rtmp_message().unwrap();
                 match message {
                     RtmpMessage::SetChunkSize { size } => {
-                        deserializer.set_max_chunk_size(size as usize).unwrap()
+                        deserializer.set_chunk_size(size as usize).unwrap()
                     }
                     _ => (),
                 }
@@ -1797,7 +1798,7 @@ fn split_results(
                 responses.push((payload, message));
             }
 
-            ServerSessionResult::RaisedEvent(event) => {
+            ServerSessionResult::Event(event) => {
                 println!("event received from server: {:?}", event);
                 events.push(event);
             }
@@ -1809,7 +1810,7 @@ fn split_results(
     (responses, events)
 }
 
-fn consume_results(deserializer: &mut ChunkDeserializer, results: Vec<ServerSessionResult>) {
+fn consume_results(deserializer: &mut ContiguousDecoder, results: Vec<ServerSessionResult>) {
     // Needed to keep the deserializer up to date
     split_results(deserializer, results);
 }
@@ -1819,7 +1820,7 @@ fn create_connect_message(
     timestamp: u32,
     stream_id: u32,
     object_encoding: f64,
-) -> MessagePayload {
+) -> RawMessage {
     create_connect_message_with_properties(
         app_name,
         timestamp,
@@ -1837,7 +1838,7 @@ fn create_connect_message_with_properties(
     stream_id: u32,
     object_encoding: f64,
     extra: Amf0Object,
-) -> MessagePayload {
+) -> RawMessage {
     let mut properties = extra;
     properties.insert("app".to_string(), Amf0Value::Utf8String(app_name));
     properties.insert(
@@ -1853,19 +1854,19 @@ fn create_connect_message_with_properties(
     };
 
     let timestamp = RtmpTimestamp::new(timestamp);
-    let payload = message.into_message_payload(timestamp, stream_id).unwrap();
+    let payload = message.into_raw_message(timestamp, stream_id).unwrap();
     payload
 }
 
 fn perform_connection(
     app_name: &str,
     session: &mut ServerSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
 ) {
     let connect_payload = create_connect_message(app_name.to_string(), 15, 0, 0.0);
     let connect_packet = serializer.serialize(&connect_payload, true, false).unwrap();
-    let connect_results = session.handle_input(&connect_packet.bytes[..]).unwrap();
+    let connect_results = session.handle_input(&connect_packet.to_vec()[..]).unwrap();
     assert_eq!(
         connect_results.len(),
         1,
@@ -1891,8 +1892,8 @@ fn perform_connection(
 
 fn create_active_stream(
     session: &mut ServerSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
 ) -> u32 {
     let message = RtmpMessage::Amf0Command {
         command_name: "createStream".to_string(),
@@ -1901,11 +1902,9 @@ fn create_active_stream(
         additional_arguments: Vec::new(),
     };
 
-    let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
-        .unwrap();
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
     let packet = serializer.serialize(&payload, true, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (responses, _) = split_results(deserializer, results);
 
     assert_eq!(
@@ -1944,8 +1943,8 @@ fn create_active_stream(
 fn close_stream(
     stream_id: u32,
     session: &mut ServerSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
 ) {
     let message = RtmpMessage::Amf0Command {
         command_name: "closeStream".to_string(),
@@ -1955,10 +1954,10 @@ fn close_stream(
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     consume_results(deserializer, results);
 }
 
@@ -1966,8 +1965,8 @@ fn start_publishing(
     stream_key: &str,
     stream_id: u32,
     session: &mut ServerSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
 ) {
     let message = RtmpMessage::Amf0Command {
         command_name: "publish".to_string(),
@@ -1980,12 +1979,12 @@ fn start_publishing(
     };
 
     let publish_payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     let publish_packet = serializer
         .serialize(&publish_payload, false, false)
         .unwrap();
-    let publish_results = session.handle_input(&publish_packet.bytes[..]).unwrap();
+    let publish_results = session.handle_input(&publish_packet.to_vec()[..]).unwrap();
     let (_, events) = split_results(deserializer, publish_results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -2011,8 +2010,8 @@ fn start_playing(
     stream_key: &str,
     stream_id: u32,
     session: &mut ServerSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
 ) {
     let message = RtmpMessage::Amf0Command {
         command_name: "play".to_string(),
@@ -2027,10 +2026,10 @@ fn start_playing(
     };
 
     let play_payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     let play_packet = serializer.serialize(&play_payload, false, false).unwrap();
-    let play_results = session.handle_input(&play_packet.bytes[..]).unwrap();
+    let play_results = session.handle_input(&play_packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(deserializer, play_results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
@@ -2103,8 +2102,8 @@ fn verify_is_onstatus(subject: &RtmpMessage, expected_status: &str, expected_cod
 #[test]
 fn same_key_streams_keep_distinct_identity_for_data_media_and_finish() {
     let (mut session, initial) = ServerSession::new(get_basic_config()).unwrap();
-    let mut serializer = ChunkSerializer::new();
-    let mut deserializer = ChunkDeserializer::new();
+    let mut serializer = ChunkEncoder::new();
+    let mut deserializer = ContiguousDecoder::new();
     consume_results(&mut deserializer, initial);
     perform_connection(
         TEST_APP_NAME,
@@ -2150,16 +2149,15 @@ fn same_key_streams_keep_distinct_identity_for_data_media_and_finish() {
         ];
         for message in messages {
             let payload = message
-                .into_message_payload(RtmpTimestamp::new(100), id)
+                .into_raw_message(RtmpTimestamp::new(100), id)
                 .unwrap();
             let packet = serializer.serialize(&payload, false, false).unwrap();
-            let results = session.handle_input(&packet.bytes).unwrap();
+            let results = session.handle_input(&packet.to_vec()).unwrap();
             let (_, events) = split_results(&mut deserializer, results);
             assert_eq!(events.len(), 1);
             let event_id = match &events[0] {
                 ServerSessionEvent::AudioDataReceived { stream_id, .. }
                 | ServerSessionEvent::VideoDataReceived { stream_id, .. }
-                | ServerSessionEvent::StreamMetadataChanged { stream_id, .. }
                 | ServerSessionEvent::StreamDataReceived { stream_id, .. }
                 | ServerSessionEvent::PublishStreamFinished { stream_id, .. } => *stream_id,
                 e => panic!("unexpected event: {e:?}"),

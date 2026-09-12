@@ -1,5 +1,7 @@
-use rtmpx::{
-    chunk_io::{ChunkDeserializer, ChunkDeserializerConfig, ChunkSerializer},
+#[path = "support/api.rs"]
+mod api;
+use crate::api::{
+    chunk_io::{ChunkEncoder, ContiguousDecoder, DecoderLimits},
     sessions::{ClientSession, ClientSessionConfig, ServerSession, ServerSessionConfig},
     time::RtmpTimestamp,
 };
@@ -27,10 +29,10 @@ fn full_chunk(csid: u8, message_length: usize, payload: &[u8]) -> Vec<u8> {
 
 #[test]
 fn rejects_zero_chunk_sizes_and_acknowledgement_windows() {
-    assert!(ChunkDeserializer::new().set_max_chunk_size(0).is_err());
+    assert!(ContiguousDecoder::new().set_chunk_size(0).is_err());
     assert!(
-        ChunkSerializer::new()
-            .set_max_chunk_size(0, RtmpTimestamp::new(0))
+        ChunkEncoder::new()
+            .set_chunk_size(0, RtmpTimestamp::new(0))
             .is_err()
     );
 
@@ -44,15 +46,15 @@ fn rejects_zero_chunk_sizes_and_acknowledgement_windows() {
 
 #[test]
 fn rejects_oversized_declared_messages_before_allocating_the_payload() {
-    let limits = ChunkDeserializerConfig::default().with_maximum_message_size(32);
-    let mut parser = ChunkDeserializer::with_config(limits);
+    let limits = DecoderLimits::default().with_maximum_message_size(32);
+    let mut parser = ContiguousDecoder::with_limits(limits);
     assert!(parser.get_next_message(&full_chunk(3, 33, &[])).is_err());
 }
 
 #[test]
 fn bounds_tracked_chunk_stream_ids() {
-    let limits = ChunkDeserializerConfig::default().with_maximum_tracked_chunk_streams(1);
-    let mut parser = ChunkDeserializer::with_config(limits);
+    let limits = DecoderLimits::default().with_maximum_tracked_chunk_streams(1);
+    let mut parser = ContiguousDecoder::with_limits(limits);
     assert!(
         parser
             .get_next_message(&full_chunk(3, 1, &[1]))
@@ -64,8 +66,8 @@ fn bounds_tracked_chunk_stream_ids() {
 
 #[test]
 fn bounds_concurrent_partial_messages() {
-    let limits = ChunkDeserializerConfig::default().with_maximum_partial_messages(1);
-    let mut parser = ChunkDeserializer::with_config(limits);
+    let limits = DecoderLimits::default().with_maximum_partial_messages(1);
+    let mut parser = ContiguousDecoder::with_limits(limits);
     assert!(
         parser
             .get_next_message(&full_chunk(3, 129, &[1; 128]))
@@ -81,7 +83,7 @@ fn bounds_concurrent_partial_messages() {
 
 #[test]
 fn bounds_total_buffered_wire_and_payload_bytes() {
-    let limits = ChunkDeserializerConfig::default().with_maximum_buffered_bytes(10);
-    let mut parser = ChunkDeserializer::with_config(limits);
+    let limits = DecoderLimits::default().with_maximum_buffered_bytes(10);
+    let mut parser = ContiguousDecoder::with_limits(limits);
     assert!(parser.get_next_message(&[0; 11]).is_err());
 }

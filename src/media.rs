@@ -36,9 +36,9 @@ pub use crate::flv::{ParsedAudio, ParsedVideo};
 /// assert_eq!(media.raw(), &raw);
 /// ```
 #[derive(Clone, Debug, PartialEq)]
-pub struct ValidatedMedia<T> {
+pub struct ValidatedMedia<T, D = Bytes> {
     // Original RTMP message body. This is authoritative for republishing.
-    raw: Bytes,
+    raw: D,
     // Parsed interpretation, or an opaque reason in passthrough mode.
     interpretation: MediaInterpretation<T>,
 }
@@ -76,11 +76,8 @@ pub enum MediaValidationError {
     Malformed { kind: &'static str, reason: String },
 }
 
-impl ValidatedMedia<ParsedAudio> {
-    pub fn parse_audio(
-        raw: Bytes,
-        mode: EnhancedValidationMode,
-    ) -> Result<Self, MediaValidationError> {
+impl<P: crate::flv::MediaData> ValidatedMedia<ParsedAudio<P>, P> {
+    pub fn parse_audio(raw: P, mode: EnhancedValidationMode) -> Result<Self, MediaValidationError> {
         match ParsedAudio::demux(&raw) {
             Ok(parsed) => finish_audio(raw, parsed, mode),
             Err(error) if mode == EnhancedValidationMode::Passthrough => Ok(Self {
@@ -121,11 +118,8 @@ impl ValidatedMedia<ParsedAudio> {
     }
 }
 
-impl ValidatedMedia<ParsedVideo> {
-    pub fn parse_video(
-        raw: Bytes,
-        mode: EnhancedValidationMode,
-    ) -> Result<Self, MediaValidationError> {
+impl<P: crate::flv::MediaData> ValidatedMedia<ParsedVideo<P>, P> {
+    pub fn parse_video(raw: P, mode: EnhancedValidationMode) -> Result<Self, MediaValidationError> {
         match ParsedVideo::demux(&raw) {
             Ok(parsed) => finish_video(raw, parsed, mode),
             Err(error) if mode == EnhancedValidationMode::Passthrough => Ok(Self {
@@ -188,9 +182,9 @@ impl ValidatedMedia<ParsedVideo> {
     }
 }
 
-fn classify_enhanced_audio(body: &EnhancedAudioBody) -> MediaClassification {
+fn classify_enhanced_audio<P>(body: &EnhancedAudioBody<P>) -> MediaClassification {
     let mut classification = MediaClassification::default();
-    let mut classify = |packet: &AudioPacket| match packet {
+    let mut classify = |packet: &AudioPacket<P>| match packet {
         AudioPacket::SequenceStart(_) => classification.configuration = true,
         AudioPacket::CodedFrames(_) => classification.coded = true,
         _ => {}
@@ -206,9 +200,9 @@ fn classify_enhanced_audio(body: &EnhancedAudioBody) -> MediaClassification {
     classification
 }
 
-fn classify_enhanced_video(body: &EnhancedVideoBody, keyframe: bool) -> MediaClassification {
+fn classify_enhanced_video<P>(body: &EnhancedVideoBody<P>, keyframe: bool) -> MediaClassification {
     let mut classification = MediaClassification::default();
-    let mut classify = |packet: &VideoPacket| match packet {
+    let mut classify = |packet: &VideoPacket<P>| match packet {
         VideoPacket::SequenceStart(_) | VideoPacket::Mpeg2TsSequenceStart(_) => {
             classification.configuration = true;
         }
@@ -230,11 +224,11 @@ fn classify_enhanced_video(body: &EnhancedVideoBody, keyframe: bool) -> MediaCla
     classification
 }
 
-fn finish_audio(
-    raw: Bytes,
-    parsed: ParsedAudio,
+fn finish_audio<P>(
+    raw: P,
+    parsed: ParsedAudio<P>,
     mode: EnhancedValidationMode,
-) -> Result<ValidatedMedia<ParsedAudio>, MediaValidationError> {
+) -> Result<ValidatedMedia<ParsedAudio<P>, P>, MediaValidationError> {
     match validate_audio_unknowns(&parsed) {
         Ok(()) => Ok(ValidatedMedia {
             raw,
@@ -251,11 +245,11 @@ fn finish_audio(
     }
 }
 
-fn finish_video(
-    raw: Bytes,
-    parsed: ParsedVideo,
+fn finish_video<P>(
+    raw: P,
+    parsed: ParsedVideo<P>,
     mode: EnhancedValidationMode,
-) -> Result<ValidatedMedia<ParsedVideo>, MediaValidationError> {
+) -> Result<ValidatedMedia<ParsedVideo<P>, P>, MediaValidationError> {
     match validate_video_unknowns(&parsed) {
         Ok(()) => Ok(ValidatedMedia {
             raw,
@@ -272,7 +266,7 @@ fn finish_video(
     }
 }
 
-fn validate_audio_unknowns(parsed: &ParsedAudio) -> Result<(), String> {
+fn validate_audio_unknowns<P>(parsed: &ParsedAudio<P>) -> Result<(), String> {
     let AudioTagHeader::Enhanced(header) = &parsed.header else {
         return Ok(());
     };
@@ -295,7 +289,7 @@ fn validate_audio_unknowns(parsed: &ParsedAudio) -> Result<(), String> {
     }
 }
 
-fn validate_audio_track(four_cc: [u8; 4], packet: &AudioPacket) -> Result<(), String> {
+fn validate_audio_track<P>(four_cc: [u8; 4], packet: &AudioPacket<P>) -> Result<(), String> {
     const KNOWN: [[u8; 4]; 6] = [*b"ac-3", *b"ec-3", *b"Opus", *b".mp3", *b"fLaC", *b"mp4a"];
     if !KNOWN.contains(&four_cc) {
         return Err(format!(
@@ -309,7 +303,7 @@ fn validate_audio_track(four_cc: [u8; 4], packet: &AudioPacket) -> Result<(), St
     Ok(())
 }
 
-fn validate_video_unknowns(parsed: &ParsedVideo) -> Result<(), String> {
+fn validate_video_unknowns<P>(parsed: &ParsedVideo<P>) -> Result<(), String> {
     let VideoTagHeaderData::Enhanced(header) = &parsed.header.data else {
         return Ok(());
     };
@@ -333,7 +327,7 @@ fn validate_video_unknowns(parsed: &ParsedVideo) -> Result<(), String> {
     }
 }
 
-fn validate_video_track(four_cc: [u8; 4], packet: &VideoPacket) -> Result<(), String> {
+fn validate_video_track<P>(four_cc: [u8; 4], packet: &VideoPacket<P>) -> Result<(), String> {
     const KNOWN: [[u8; 4]; 6] = [*b"vp08", *b"vp09", *b"av01", *b"avc1", *b"hvc1", *b"vvc1"];
     if !KNOWN.contains(&four_cc) {
         return Err(format!(
@@ -347,9 +341,9 @@ fn validate_video_track(four_cc: [u8; 4], packet: &VideoPacket) -> Result<(), St
     Ok(())
 }
 
-impl<T> ValidatedMedia<T> {
+impl<T, D> ValidatedMedia<T, D> {
     /// Original message body, authoritative for forwarding.
-    pub fn raw(&self) -> &Bytes {
+    pub fn raw(&self) -> &D {
         &self.raw
     }
     /// Immutable interpretation of the original body.
@@ -357,7 +351,7 @@ impl<T> ValidatedMedia<T> {
         &self.interpretation
     }
     /// Consume this value without copying its bytes or interpretation.
-    pub fn into_parts(self) -> (Bytes, MediaInterpretation<T>) {
+    pub fn into_parts(self) -> (D, MediaInterpretation<T>) {
         (self.raw, self.interpretation)
     }
 }

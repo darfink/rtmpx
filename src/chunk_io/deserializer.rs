@@ -1,600 +1,168 @@
-use super::chunk_header::{ChunkHeader, ChunkHeaderFormat};
-use crate::chunk_io::ChunkDeserializationError;
-use crate::messages::MessagePayload;
-use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
-use bytes::{BufMut, BytesMut};
-use std::cmp::min;
+use super::{ChunkParser, DecodeError};
+use crate::messages::RawMessage;
+use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::mem;
-
-const INITIAL_MAX_CHUNK_SIZE: usize = 128;
-const MAX_INITIAL_TIMESTAMP: u32 = 16777215;
 
 /// Resource limits for one inbound RTMP chunk stream parser.
 ///
 /// Defaults mirror the defensive limits used by Scuffle's public listener.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub struct ChunkDeserializerConfig {
+pub struct DecoderLimits {
     pub maximum_chunk_size: usize,
     pub maximum_message_size: usize,
     pub maximum_tracked_chunk_streams: usize,
     pub maximum_partial_messages: usize,
     pub maximum_buffered_bytes: usize,
+    /// Maximum retained payload descriptors for one owned segmented message.
+    pub maximum_fragments_per_message: usize,
 }
 
-impl Default for ChunkDeserializerConfig {
+impl Default for DecoderLimits {
     fn default() -> Self {
-        ChunkDeserializerConfig {
+        DecoderLimits {
             maximum_chunk_size: 64 * 1024,
             maximum_message_size: 10 * 1024 * 1024,
             maximum_tracked_chunk_streams: 100,
             maximum_partial_messages: 4,
             maximum_buffered_bytes: 16 * 1024 * 1024,
+            maximum_fragments_per_message: 128 * 1024,
         }
     }
 }
 
-/// Allows deserializing bytes representing RTMP chunks into RTMP message payloads.
+/// Contiguous compatibility adapter over [`ChunkParser`].
 ///
-/// Due to the nature of the RTMP chunk protocol it is required that every byte going through the
-/// wire is sent to the same `ChunkDeserializer` instance, as future chunks can rely on previous
-/// chunks, so any chunks missing from the stream may cause deserialization errors.
-pub struct ChunkDeserializer {
-    max_chunk_size: usize,
-    current_header_format: ChunkHeaderFormat,
-    current_header: ChunkHeader,
-    current_stage: ParseStage,
-    current_payload: MessagePayload,
-    current_payload_data: BytesMut,
-    buffer: BytesMut,
-    previous_headers: HashMap<u32, ChunkHeader>,
-    // Partially received message payloads, keyed by chunk stream id.
-    //
-    // RTMP lets a peer interleave chunks from different chunk stream ids, so a
-    // large video message on one csid can be split around a control message on
-    // another. Upstream kept a single `current_payload_data` buffer shared by
-    // every csid, so an interleaved message was appended to the wrong payload.
-    // That corrupted the stream and could panic on an arithmetic underflow in
-    // `get_message_data`, which is remotely reachable on a public ingest port.
-    partial_payloads: HashMap<u32, BytesMut>,
-    // Chunk stream id currently being parsed, used to file the payload away.
-    current_csid: u32,
-    limits: ChunkDeserializerConfig,
+/// Supply input once, then call with an empty slice until `None` is returned.
+/// Apply SetChunkSize and Abort before requesting the next message. This adapter
+/// copies payload bytes into one message allocation. Use [`super::MessageDecoder`]
+/// to retain owned receive buffers without copying payloads.
+pub struct ContiguousDecoder {
+    parser: ChunkParser,
+    pending: Vec<u8>,
+    partials: HashMap<u32, BytesMut>,
+    buffered: usize,
+    reserved: usize,
+    limits: DecoderLimits,
 }
-
-enum ParsedValue<T> {
-    NotEnoughBytes,
-    Value { val: T, next_index: u32 },
-}
-
-enum ParseStage {
-    Csid,
-    InitialTimestamp,
-    MessageLength,
-    MessageTypeId,
-    MessageStreamId,
-    MessagePayload,
-    ExtendedTimestamp,
-}
-
-#[derive(Eq, PartialEq, Debug)]
-enum ParseStageResult {
-    Success,
-    NotEnoughBytes,
-}
-
-impl ChunkDeserializer {
-    /// Create a new `ChunkDeserializer` with its initial properties.
-    ///
-    /// Per the RTMP specification an initial `ChunkDeserializer` is expecting RTMP chunks with
-    /// a max size of 128 bytes.
-    pub fn new() -> ChunkDeserializer {
-        Self::with_config(ChunkDeserializerConfig::default())
-    }
-}
-
-impl Default for ChunkDeserializer {
+impl Default for ContiguousDecoder {
     fn default() -> Self {
         Self::new()
     }
 }
-
-impl ChunkDeserializer {
-    /// Create a parser with explicit resource limits.
-    pub fn with_config(limits: ChunkDeserializerConfig) -> ChunkDeserializer {
-        ChunkDeserializer {
-            max_chunk_size: INITIAL_MAX_CHUNK_SIZE,
-            current_header_format: ChunkHeaderFormat::Full,
-            current_header: ChunkHeader::new(),
-            current_stage: ParseStage::Csid,
-            buffer: BytesMut::with_capacity(4096),
-            previous_headers: HashMap::new(),
-            current_payload: MessagePayload::new(),
-            current_payload_data: BytesMut::new(),
-            partial_payloads: HashMap::new(),
-            current_csid: 0,
+impl ContiguousDecoder {
+    pub fn new() -> Self {
+        Self::with_limits(DecoderLimits::default())
+    }
+    pub fn with_limits(limits: DecoderLimits) -> Self {
+        Self {
+            parser: ChunkParser::with_limits(limits),
+            pending: Vec::new(),
+            partials: HashMap::new(),
+            buffered: 0,
+            reserved: 0,
             limits,
         }
     }
-
-    /// Attempts to read a complete RTMP message from the passed in bytes.
-    ///
-    /// It is normal that one set of bytes will not form a complete RTMP message (or even a
-    /// complete RTMP chunk).  Therefore it can be assumed that the deserializer will store all
-    /// partial message bytes passed into it and the same bytes should not be passed in repeatedly,
-    /// otherwise deserialization errors will most likely occur.
-    ///
-    /// If the bytes that were passed in did not form a complete RTMP message, then the bytes are
-    /// added to an internal buffer for storage and `Ok(None)` is returned while it waits for
-    /// the next `get_next_message()` call to complete the message.
-    ///
-    /// If the bytes that were passed in formed multiple RTMP messages than only the first message
-    /// is deserialized and any subsequent messages are not read until the next `get_next_message()`
-    /// call.
-    ///
-    /// This is important because if the peer sends a `SendChunkSize` message (meaning it will
-    /// change the maximum size of RTMP chunks it sends) you must process that message and call
-    /// the `set_max_chunk_size()` method prior to the next `get_next_message()` call.   Otherwise
-    /// if the peer sends a chunk larger than the previous max chunk size the message will not be
-    /// deserialized properly (and most likely errors will occur).
-    ///
-    /// It is expected that consumers will call `get_next_message()` in a loop until `None` is
-    /// returned.  Since it is important not to keep sending it the same bytes over and over again
-    /// an empty slice must be passed in for subsequent calls.
-    ///
-    /// ## Examples
-    ///
-    /// ```
-    /// # use bytes::Bytes;
-    /// # use rtmpx::time::RtmpTimestamp;
-    /// # use rtmpx::chunk_io::{ChunkSerializer, ChunkDeserializer};
-    /// # use rtmpx::messages::MessagePayload;
-    /// # fn main() {
-    /// let input1 = MessagePayload {
-    ///     timestamp: RtmpTimestamp::new(55),
-    ///     message_stream_id: 1,
-    ///     type_id: 15,
-    ///     data: Bytes::from(vec![1, 2, 3, 4, 5, 6]),
-    /// };
-    ///
-    /// let input2 = MessagePayload {
-    ///     timestamp: RtmpTimestamp::new(65),
-    ///     message_stream_id: 1,
-    ///     type_id: 15,
-    ///     data: Bytes::from(vec![8, 9, 10]),
-    /// };
-    ///
-    /// let input3 = MessagePayload {
-    ///     timestamp: RtmpTimestamp::new(75),
-    ///     message_stream_id: 1,
-    ///     type_id: 15,
-    ///     data: Bytes::from(vec![1, 2, 3]),
-    /// };
-    ///
-    /// let mut serializer = ChunkSerializer::new();
-    /// let mut packet1 = serializer.serialize(&input1, false, false).unwrap();
-    /// let mut packet2 = serializer.serialize(&input2, false, false).unwrap();
-    /// let mut packet3 = serializer.serialize(&input3, false, false).unwrap();
-    ///
-    /// let mut all_bytes = Vec::new();
-    /// all_bytes.append(&mut packet1.bytes);
-    /// all_bytes.append(&mut packet2.bytes);
-    /// all_bytes.append(&mut packet3.bytes);
-    ///
-    /// let mut deserializer = ChunkDeserializer::new();
-    /// let message1 = deserializer.get_next_message(&all_bytes[..]).unwrap();
-    /// let message2 = deserializer.get_next_message(&[]).unwrap();
-    /// let message3 = deserializer.get_next_message(&[]).unwrap();
-    /// let message4 = deserializer.get_next_message(&[]).unwrap();
-    ///
-    /// assert_eq!(message1, Some(input1));
-    /// assert_eq!(message2, Some(input2));
-    /// assert_eq!(message3, Some(input3));
-    /// assert_eq!(message4, None);
-    /// # }
-    /// ```
-    pub fn get_next_message(
-        &mut self,
-        bytes: &[u8],
-    ) -> Result<Option<MessagePayload>, ChunkDeserializationError> {
-        let buffered = self.buffered_bytes();
-        let attempted = buffered.saturating_add(bytes.len());
+    pub fn chunk_size(&self) -> usize {
+        self.parser.chunk_size()
+    }
+    pub fn set_chunk_size(&mut self, size: usize) -> Result<(), DecodeError> {
+        self.parser.set_chunk_size(size)
+    }
+    pub fn abort_chunk_stream(&mut self, csid: u32) {
+        self.parser.abort_chunk_stream(csid);
+        if let Some(body) = self.partials.remove(&csid) {
+            self.buffered -= body.len();
+            self.reserved -= body.capacity();
+        }
+    }
+    /// True only at a clean wire boundary with no incomplete message.
+    pub fn is_idle(&self) -> bool {
+        self.pending.is_empty() && self.parser.is_idle()
+    }
+    pub fn get_next_message(&mut self, bytes: &[u8]) -> Result<Option<RawMessage>, DecodeError> {
+        let attempted = self
+            .buffered
+            .saturating_add(self.pending.len())
+            .saturating_add(bytes.len());
         if attempted > self.limits.maximum_buffered_bytes {
-            return Err(ChunkDeserializationError::ResourceLimitExceeded {
+            return Err(DecodeError::ResourceLimitExceeded {
                 resource: "buffered bytes",
                 attempted,
                 maximum: self.limits.maximum_buffered_bytes,
             });
         }
-        self.buffer.extend_from_slice(bytes);
-
-        loop {
-            let mut complete_message = None;
-            let result = match self.current_stage {
-                ParseStage::Csid => self.form_header()?,
-                ParseStage::InitialTimestamp => self.get_initial_timestamp()?,
-                ParseStage::MessageLength => self.get_message_length()?,
-                ParseStage::MessageTypeId => self.get_message_type_id()?,
-                ParseStage::MessageStreamId => self.get_message_stream_id()?,
-                ParseStage::ExtendedTimestamp => self.get_extended_timestamp()?,
-                ParseStage::MessagePayload => self.get_message_data(&mut complete_message)?,
+        let mut pending = mem::take(&mut self.pending);
+        let from_pending = !pending.is_empty();
+        let input = if from_pending {
+            pending.extend_from_slice(bytes);
+            pending.as_slice()
+        } else {
+            bytes
+        };
+        let mut offset = 0;
+        let result = loop {
+            let step = self.parser.consume(&input[offset..])?;
+            offset += step.consumed;
+            let Some(fragment) = step.fragment else {
+                break None;
             };
-
-            if result == ParseStageResult::NotEnoughBytes || complete_message.is_some() {
-                return Ok(complete_message);
-            }
-        }
-    }
-
-    /// Tells the deserializer that the peer will start sending RTMP chunks with a different
-    /// max chunk size.
-    ///
-    /// When an RTMP message is larger than the current max chunk size the serializer
-    /// will split the message across multiple RTMP chunks, with each chunk only containing the number
-    /// of bytes that fit into the max chunk size value.  Therefore, the sender and the receiver
-    /// must be exactly in tune as to what max chunk size they are utilizing.  Any mismatch will
-    /// cause errors in the deserialization process, as it will expect split chunks where there
-    /// are noone, or encounter a split chunk where it wasn't expecting one.
-    ///
-    /// This method should almost always be called only in reaction to receiving a `SetChunkSize`
-    /// message from the other end.
-    pub fn set_max_chunk_size(&mut self, new_size: usize) -> Result<(), ChunkDeserializationError> {
-        if new_size == 0 || new_size > 2147483647 || new_size > self.limits.maximum_chunk_size {
-            return Err(ChunkDeserializationError::InvalidMaxChunkSize {
-                chunk_size: new_size,
-            });
-        }
-
-        self.max_chunk_size = new_size;
-        Ok(())
-    }
-
-    /// Returns the maximum size of any RTMP chunks that should be received
-    pub fn get_max_chunk_size(&self) -> usize {
-        self.max_chunk_size
-    }
-
-    /// Discard an incomplete message after receiving an RTMP `Abort` control
-    /// message for its chunk stream id.
-    pub fn abort_chunk_stream(&mut self, csid: u32) {
-        self.partial_payloads.remove(&csid);
-        if self.current_csid == csid {
-            self.current_payload_data.clear();
-        }
-    }
-
-    fn buffered_bytes(&self) -> usize {
-        self.buffer
-            .len()
-            .saturating_add(self.current_payload_data.len())
-            .saturating_add(
-                self.partial_payloads
-                    .values()
-                    .map(|value| value.len())
-                    .sum::<usize>(),
-            )
-    }
-
-    fn form_header(&mut self) -> Result<ParseStageResult, ChunkDeserializationError> {
-        if self.buffer.len() < 1 {
-            return Ok(ParseStageResult::NotEnoughBytes);
-        }
-
-        self.current_header_format = get_format(&self.buffer[0]);
-        let (csid, next_index) = match get_csid(&self.buffer[..]) {
-            ParsedValue::NotEnoughBytes => return Ok(ParseStageResult::NotEnoughBytes),
-            ParsedValue::Value { val, next_index } => (val, next_index),
-        };
-
-        self.current_header = match self.current_header_format {
-            ChunkHeaderFormat::Full => {
-                if !self.previous_headers.contains_key(&csid)
-                    && self.previous_headers.len() >= self.limits.maximum_tracked_chunk_streams
-                {
-                    return Err(ChunkDeserializationError::ResourceLimitExceeded {
-                        resource: "tracked chunk streams",
-                        attempted: self.previous_headers.len() + 1,
-                        maximum: self.limits.maximum_tracked_chunk_streams,
-                    });
-                }
-                let mut new_header = ChunkHeader::new();
-                new_header.chunk_stream_id = csid;
-                new_header
-            }
-
-            _ => match self.previous_headers.remove(&csid) {
-                None => return Err(ChunkDeserializationError::NoPreviousChunkOnStream { csid }),
-                Some(header) => header,
-            },
-        };
-
-        // Swap in the partial payload belonging to this chunk stream
-        // so interleaved messages do not append to each other's buffers.
-        self.current_csid = csid;
-        self.current_payload_data = self.partial_payloads.remove(&csid).unwrap_or_default();
-
-        let _ = self.buffer.split_to(next_index as usize);
-        self.current_stage = ParseStage::InitialTimestamp;
-        Ok(ParseStageResult::Success)
-    }
-
-    fn get_initial_timestamp(&mut self) -> Result<ParseStageResult, ChunkDeserializationError> {
-        if self.current_header_format == ChunkHeaderFormat::Empty {
-            // Some encoders send an empty header after a type 1 header due to a message split
-            // across multiple chunks.  We need to be careful *NOT* to apply the delta to each
-            // type 3 chunk that's trying to serve a single message, otherwise timestamps will
-            // get out of control.
-            if self.current_payload_data.len() == 0 {
-                // Since we don't have any payload data yet, that means this is the first
-                // chunk of the message.  As it's the first chunk this is the only time we should
-                // apply the previous header's delta to the timestamp
-                self.current_header.timestamp =
-                    self.current_header.timestamp + self.current_header.timestamp_field;
-            }
-
-            self.current_stage = ParseStage::MessageLength;
-            return Ok(ParseStageResult::Success);
-        }
-
-        if self.buffer.len() < 3 {
-            return Ok(ParseStageResult::NotEnoughBytes);
-        }
-
-        let timestamp;
-        {
-            let bytes = self.buffer.split_to(3);
-            let mut cursor = Cursor::new(bytes);
-            timestamp = cursor.read_u24::<BigEndian>()?;
-        }
-
-        if self.current_header_format == ChunkHeaderFormat::Full {
-            self.current_header.timestamp.set(timestamp);
-        } else {
-            // Non full headers are deltas only
-            self.current_header.timestamp = self.current_header.timestamp + timestamp;
-        }
-
-        //apply the timestamp field
-        self.current_header.timestamp_field = timestamp;
-
-        self.current_stage = ParseStage::MessageLength;
-        Ok(ParseStageResult::Success)
-    }
-
-    fn get_message_length(&mut self) -> Result<ParseStageResult, ChunkDeserializationError> {
-        if self.current_header_format == ChunkHeaderFormat::TimeDeltaOnly
-            || self.current_header_format == ChunkHeaderFormat::Empty
-        {
-            self.current_stage = ParseStage::MessageTypeId;
-            return Ok(ParseStageResult::Success);
-        }
-
-        if self.buffer.len() < 3 {
-            return Ok(ParseStageResult::NotEnoughBytes);
-        }
-
-        let length;
-        {
-            let bytes = self.buffer.split_to(3);
-            let mut cursor = Cursor::new(bytes);
-            length = cursor.read_u24::<BigEndian>()?;
-        }
-
-        self.current_header.message_length = length;
-        if length as usize > self.limits.maximum_message_size {
-            return Err(ChunkDeserializationError::ResourceLimitExceeded {
-                resource: "message payload bytes",
-                attempted: length as usize,
-                maximum: self.limits.maximum_message_size,
-            });
-        }
-        self.current_stage = ParseStage::MessageTypeId;
-        Ok(ParseStageResult::Success)
-    }
-
-    fn get_message_type_id(&mut self) -> Result<ParseStageResult, ChunkDeserializationError> {
-        if self.current_header_format == ChunkHeaderFormat::TimeDeltaOnly
-            || self.current_header_format == ChunkHeaderFormat::Empty
-        {
-            self.current_stage = ParseStage::MessageStreamId;
-            return Ok(ParseStageResult::Success);
-        }
-
-        if self.buffer.len() < 1 {
-            return Ok(ParseStageResult::NotEnoughBytes);
-        }
-
-        self.current_header.message_type_id = self.buffer[0];
-        let _ = self.buffer.split_to(1);
-        self.current_stage = ParseStage::MessageStreamId;
-        Ok(ParseStageResult::Success)
-    }
-
-    fn get_message_stream_id(&mut self) -> Result<ParseStageResult, ChunkDeserializationError> {
-        if self.current_header_format != ChunkHeaderFormat::Full {
-            self.current_stage = ParseStage::ExtendedTimestamp;
-            return Ok(ParseStageResult::Success);
-        }
-
-        if self.buffer.len() < 4 {
-            return Ok(ParseStageResult::NotEnoughBytes);
-        }
-
-        let stream_id;
-        {
-            let bytes = self.buffer.split_to(4);
-            let mut cursor = Cursor::new(bytes);
-            stream_id = cursor.read_u32::<LittleEndian>()?;
-        }
-
-        self.current_header.message_stream_id = stream_id;
-        self.current_stage = ParseStage::ExtendedTimestamp;
-        Ok(ParseStageResult::Success)
-    }
-
-    fn get_extended_timestamp(&mut self) -> Result<ParseStageResult, ChunkDeserializationError> {
-        if self.current_header.timestamp_field < MAX_INITIAL_TIMESTAMP {
-            self.current_stage = ParseStage::MessagePayload;
-            return Ok(ParseStageResult::Success);
-        }
-
-        if self.buffer.len() < 4 {
-            return Ok(ParseStageResult::NotEnoughBytes);
-        }
-
-        let timestamp;
-        {
-            let bytes = self.buffer.split_to(4);
-            let mut cursor = Cursor::new(bytes);
-            timestamp = cursor.read_u32::<BigEndian>()?;
-        }
-
-        // If the type 3 chunk is not the first chunk of a message, we just ignore it's extended timestamp because the timestamp of this message was already deserialized.
-        if self.current_header_format == ChunkHeaderFormat::Full {
-            self.current_header.timestamp.set(timestamp);
-        } else if self.current_payload_data.len() == 0 {
-            // Since we already added the MAX_INITIAL_TIMESTAMP to the timestamp, only add the delta difference
-            self.current_header.timestamp =
-                self.current_header.timestamp + timestamp.wrapping_sub(MAX_INITIAL_TIMESTAMP);
-        }
-
-        self.current_stage = ParseStage::MessagePayload;
-        Ok(ParseStageResult::Success)
-    }
-
-    fn get_message_data(
-        &mut self,
-        message_to_return: &mut Option<MessagePayload>,
-    ) -> Result<ParseStageResult, ChunkDeserializationError> {
-        let mut length = self.current_header.message_length as usize;
-        let current_payload_length = self.current_payload_data.len();
-        // A peer can declare a message length shorter than what it
-        // has already sent on this chunk stream. Upstream subtracted without
-        // checking, panicking on underflow - remotely reachable from a public
-        // ingest port. Treat it as the protocol error it is.
-        let remaining_bytes = match length.checked_sub(current_payload_length) {
-            Some(remaining) => remaining,
-            None => {
-                return Err(
-                    ChunkDeserializationError::MessageLengthSmallerThanBufferedPayload {
-                        csid: self.current_header.chunk_stream_id,
-                        message_length: length,
-                        buffered: current_payload_length,
-                    },
-                );
-            }
-        };
-        if length > self.max_chunk_size as usize {
-            length = min(remaining_bytes, self.max_chunk_size as usize);
-        }
-
-        if self.buffer.len() < length {
-            return Ok(ParseStageResult::NotEnoughBytes);
-        }
-
-        self.current_payload.timestamp = self.current_header.timestamp;
-        self.current_payload.type_id = self.current_header.message_type_id;
-        self.current_payload.message_stream_id = self.current_header.message_stream_id;
-
-        // Make sure the we have enough capacity for the whole message data.  This
-        // helps with performance when there are smaller chunk sizes.
-        if remaining_bytes > self.current_payload_data.remaining_mut() {
-            let capacity_needed = remaining_bytes - self.current_payload_data.remaining_mut();
-            self.current_payload_data.reserve(capacity_needed);
-        }
-
-        let bytes = self.buffer.split_to(length as usize);
-        self.current_payload_data.extend_from_slice(&bytes[..]);
-
-        // Check if this completes the message
-        if self.current_payload_data.len() == self.current_header.message_length as usize {
-            let data = mem::replace(&mut self.current_payload_data, BytesMut::new());
-            self.current_payload.data = data.freeze();
-
-            let payload = mem::replace(&mut self.current_payload, MessagePayload::new());
-            *message_to_return = Some(payload)
-        } else {
-            // Message is incomplete, so park its bytes against this
-            // chunk stream until its next chunk arrives.
-            let partial = mem::replace(&mut self.current_payload_data, BytesMut::new());
-            if !self.partial_payloads.contains_key(&self.current_csid)
-                && self.partial_payloads.len() >= self.limits.maximum_partial_messages
-            {
-                return Err(ChunkDeserializationError::ResourceLimitExceeded {
-                    resource: "partial messages",
-                    attempted: self.partial_payloads.len() + 1,
-                    maximum: self.limits.maximum_partial_messages,
+            let header = fragment.header;
+            let complete = fragment.is_end();
+            if fragment.is_start() && complete {
+                break Some(RawMessage {
+                    timestamp: header.timestamp,
+                    type_id: header.type_id,
+                    message_stream_id: header.message_stream_id,
+                    data: Bytes::copy_from_slice(fragment.data),
                 });
             }
-            self.partial_payloads.insert(self.current_csid, partial);
-        }
-
-        // This completes the current chunk, so cycle the header into the map and start a new one
-        let current_header = mem::replace(&mut self.current_header, ChunkHeader::new());
-        self.previous_headers
-            .insert(current_header.chunk_stream_id, current_header);
-        self.current_stage = ParseStage::Csid;
-        Ok(ParseStageResult::Success)
-    }
-}
-
-fn get_format(byte: &u8) -> ChunkHeaderFormat {
-    const TYPE_0_MASK: u8 = 0b00000000;
-    const TYPE_1_MASK: u8 = 0b01000000;
-    const TYPE_2_MASK: u8 = 0b10000000;
-    const FORMAT_MASK: u8 = 0b11000000;
-
-    let format_id = *byte & FORMAT_MASK;
-
-    match format_id {
-        TYPE_0_MASK => ChunkHeaderFormat::Full,
-        TYPE_1_MASK => ChunkHeaderFormat::TimeDeltaWithoutMessageStreamId,
-        TYPE_2_MASK => ChunkHeaderFormat::TimeDeltaOnly,
-        _ => ChunkHeaderFormat::Empty,
-    }
-}
-
-fn get_csid(buffer: &[u8]) -> ParsedValue<u32> {
-    const CSID_MASK: u8 = 0b00111111;
-
-    if buffer.len() < 1 {
-        return ParsedValue::NotEnoughBytes;
-    }
-
-    match buffer[0] & CSID_MASK {
-        0 => {
-            if buffer.len() < 2 {
-                ParsedValue::NotEnoughBytes
-            } else {
-                ParsedValue::Value {
-                    val: buffer[1] as u32 + 64,
-                    next_index: 2,
+            if !self.partials.contains_key(&header.chunk_stream_id) {
+                let attempted = self.reserved.saturating_add(header.message_length);
+                if attempted > self.limits.maximum_buffered_bytes {
+                    return Err(DecodeError::ResourceLimitExceeded {
+                        resource: "reserved payload bytes",
+                        attempted,
+                        maximum: self.limits.maximum_buffered_bytes,
+                    });
                 }
+                let body = BytesMut::with_capacity(header.message_length);
+                self.reserved += body.capacity();
+                self.partials.insert(header.chunk_stream_id, body);
             }
-        }
-
-        1 => {
-            if buffer.len() < 3 {
-                ParsedValue::NotEnoughBytes
-            } else {
-                ParsedValue::Value {
-                    val: (buffer[2] as u32 * 256) + buffer[1] as u32 + 64,
-                    next_index: 3,
-                }
+            let body = self.partials.get_mut(&header.chunk_stream_id).unwrap();
+            body.extend_from_slice(fragment.data);
+            self.buffered += fragment.data.len();
+            if complete {
+                let body = self.partials.remove(&header.chunk_stream_id).unwrap();
+                self.buffered -= body.len();
+                self.reserved -= body.capacity();
+                break Some(RawMessage {
+                    timestamp: header.timestamp,
+                    type_id: header.type_id,
+                    message_stream_id: header.message_stream_id,
+                    data: body.freeze(),
+                });
             }
+        };
+        if from_pending {
+            let remaining = input.len() - offset;
+            pending.copy_within(offset.., 0);
+            pending.truncate(remaining);
+        } else {
+            pending.extend_from_slice(&bytes[offset..]);
         }
-
-        x => ParsedValue::Value {
-            val: x as u32,
-            next_index: 1,
-        },
+        self.pending = pending;
+        Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    const INITIAL_MAX_CHUNK_SIZE: usize = 128;
+    const MAX_INITIAL_TIMESTAMP: u32 = 0xff_ffff;
     use super::*;
     use crate::time::RtmpTimestamp;
     use byteorder::{BigEndian, LittleEndian, WriteBytesExt};
@@ -616,7 +184,7 @@ mod tests {
             &payload,
             INITIAL_MAX_CHUNK_SIZE,
         );
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
@@ -644,7 +212,7 @@ mod tests {
             &payload,
             INITIAL_MAX_CHUNK_SIZE,
         );
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
@@ -672,7 +240,7 @@ mod tests {
             &payload,
             INITIAL_MAX_CHUNK_SIZE,
         );
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
@@ -700,7 +268,7 @@ mod tests {
             &payload,
             INITIAL_MAX_CHUNK_SIZE,
         );
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
@@ -728,7 +296,7 @@ mod tests {
             &payload,
             INITIAL_MAX_CHUNK_SIZE,
         );
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
@@ -756,7 +324,7 @@ mod tests {
             &payload,
             INITIAL_MAX_CHUNK_SIZE,
         );
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
@@ -787,7 +355,7 @@ mod tests {
             INITIAL_MAX_CHUNK_SIZE,
         );
         let chunk_1_bytes = form_type_1_chunk(csid, delta, type_id2, &payload);
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         let _ = deserializer
             .get_next_message(&chunk_0_bytes)
             .unwrap()
@@ -827,7 +395,7 @@ mod tests {
         );
         let chunk_1_bytes = form_type_1_chunk(csid, delta1, type_id2, &payload);
         let chunk_2_bytes = form_type_2_chunk(csid, delta2, &payload);
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         let _ = deserializer
             .get_next_message(&chunk_0_bytes)
             .unwrap()
@@ -871,7 +439,7 @@ mod tests {
         );
         let chunk_1_bytes = form_type_1_chunk(csid, delta1, type_id2, &payload);
         let chunk_2_bytes = form_type_2_chunk(csid, delta2, &payload);
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         let _ = deserializer
             .get_next_message(&chunk_0_bytes)
             .unwrap()
@@ -916,7 +484,7 @@ mod tests {
         let chunk_1_bytes = form_type_1_chunk(csid, delta1, type_id2, &payload);
         let chunk_2_bytes = form_type_2_chunk(csid, delta2, &payload);
         let chunk_3_bytes = form_type_3_chunk(csid, &payload, INITIAL_MAX_CHUNK_SIZE, None);
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         let _ = deserializer
             .get_next_message(&chunk_0_bytes)
             .unwrap()
@@ -965,7 +533,7 @@ mod tests {
         let chunk_1_bytes = form_type_1_chunk(csid, delta1, type_id2, &payload);
         let chunk_2_bytes = form_type_2_chunk(csid, delta2, &payload);
         let chunk_3_bytes = form_type_3_chunk(csid, &payload, INITIAL_MAX_CHUNK_SIZE, Some(delta2));
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         let _ = deserializer
             .get_next_message(&chunk_0_bytes)
             .unwrap()
@@ -1009,7 +577,7 @@ mod tests {
             INITIAL_MAX_CHUNK_SIZE,
         );
         let (first, second) = all_bytes.split_at(all_bytes.len() / 2);
-        let mut deserializer = ChunkDeserializer::new();
+        let mut deserializer = ContiguousDecoder::new();
         match deserializer.get_next_message(first).unwrap() {
             Some(x) => panic!("Expected None but received {:?}", x),
             None => (),
@@ -1043,8 +611,8 @@ mod tests {
             &payload,
             max_chunk_size,
         );
-        let mut deserializer = ChunkDeserializer::new();
-        deserializer.set_max_chunk_size(max_chunk_size).unwrap();
+        let mut deserializer = ContiguousDecoder::new();
+        deserializer.set_chunk_size(max_chunk_size).unwrap();
         let result = deserializer.get_next_message(&bytes).unwrap().unwrap();
 
         assert_eq!(result.type_id, 3, "Incorrect type id");
@@ -1059,9 +627,9 @@ mod tests {
     #[test]
     fn error_when_setting_chunk_size_too_large() {
         const CHUNK_SIZE_VALUE: usize = 2147483648;
-        let mut deserializer = ChunkDeserializer::new();
-        match deserializer.set_max_chunk_size(CHUNK_SIZE_VALUE) {
-            Err(ChunkDeserializationError::InvalidMaxChunkSize {
+        let mut deserializer = ContiguousDecoder::new();
+        match deserializer.set_chunk_size(CHUNK_SIZE_VALUE) {
+            Err(DecodeError::InvalidMaxChunkSize {
                 chunk_size: CHUNK_SIZE_VALUE,
             }) => {} // success
             x => panic!("Unexpected set max chunk size result of {:?}", x),
@@ -1082,8 +650,8 @@ mod tests {
             0x44, 0x00, 0x00, 0x21, 0x00, 0x00, 0x05, 0x09, 0x01, 0x02, 0x03, 0x04, 0xc4, 0x05,
         ];
 
-        let mut deserializer = ChunkDeserializer::new();
-        deserializer.set_max_chunk_size(4).unwrap();
+        let mut deserializer = ContiguousDecoder::new();
+        deserializer.set_chunk_size(4).unwrap();
 
         let payload1 = deserializer.get_next_message(&chunk1).unwrap().unwrap();
         assert_eq!(payload1.type_id, 0x09, "Incorrect payload 1 type");
@@ -1115,8 +683,8 @@ mod tests {
             0xff, 0xff, 0x01, 0x02, 0x03, 0x04,
         ];
         let chunk2 = [0xc6, 0x01, 0xff, 0xff, 0xff, 0x05, 0x06, 0x07];
-        let mut deserializer = ChunkDeserializer::new();
-        deserializer.set_max_chunk_size(4).unwrap();
+        let mut deserializer = ContiguousDecoder::new();
+        deserializer.set_chunk_size(4).unwrap();
         let _ = deserializer.get_next_message(&chunk1).unwrap();
         let payload = deserializer.get_next_message(&chunk2).unwrap().unwrap();
         assert_eq!(payload.type_id, 0x09, "Incorrect payload type");
@@ -1286,7 +854,12 @@ mod tests {
     }
 }
 
-impl ChunkDeserializerConfig {
+impl DecoderLimits {
+    /// Set the maximum number of retained payload segments per message.
+    pub fn with_maximum_fragments_per_message(mut self, value: usize) -> Self {
+        self.maximum_fragments_per_message = value;
+        self
+    }
     /// Set `maximum_chunk_size`.
     pub fn with_maximum_chunk_size(mut self, value: usize) -> Self {
         self.maximum_chunk_size = value;

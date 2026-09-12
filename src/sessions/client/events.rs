@@ -1,16 +1,13 @@
 use crate::amf0::{Amf0Object, Amf0Value};
-use crate::sessions::DataMessage;
-use crate::sessions::StreamMetadata;
+use crate::sessions::{DataMessage, StreamHandle};
 use crate::time::RtmpTimestamp;
-use bytes::Bytes;
 
 /// Events that can be raised by the client session so that custom business logic can be written
 /// to react to it
 #[derive(PartialEq, Debug)]
 #[non_exhaustive]
-pub enum ClientSessionEvent {
+pub enum ClientEvent<D = crate::Payload> {
     /// Raised when a connection request has been accepted by the server
-    #[non_exhaustive]
     ConnectionRequestAccepted {
         /// Server properties from the `_result` command object.
         command_object: Amf0Object,
@@ -19,48 +16,45 @@ pub enum ClientSessionEvent {
     },
 
     /// The server has rejected the connection request
-    #[non_exhaustive]
     ConnectionRequestRejected {
         description: String,
         status: CommandStatus,
     },
 
     /// The server has accepted our request to play video back from a stream key
-    #[non_exhaustive]
-    PlaybackRequestAccepted { status: CommandStatus },
-
-    /// The server has accepted our request to publish video
-    #[non_exhaustive]
-    PublishRequestAccepted { status: CommandStatus },
-
-    /// The server has sent over new metadata for the stream
-    #[non_exhaustive]
-    StreamMetadataReceived {
-        metadata: StreamMetadata,
-        message: DataMessage,
+    PlaybackRequestAccepted {
+        stream: StreamHandle,
+        status: CommandStatus,
     },
 
-    /// Script data other than recognized metadata, including undecodable bodies.
-    #[non_exhaustive]
-    StreamDataReceived { message: DataMessage },
+    /// The server has accepted our request to publish video
+    PublishRequestAccepted {
+        stream: StreamHandle,
+        status: CommandStatus,
+    },
+
+    /// Encoded script data, including metadata, captions, and undecodable bodies.
+    StreamDataReceived {
+        stream: StreamHandle,
+        message: DataMessage<D>,
+    },
 
     /// The server has sent over video data for the stream
-    #[non_exhaustive]
     VideoDataReceived {
+        stream: StreamHandle,
         timestamp: RtmpTimestamp,
-        data: Bytes,
+        data: D,
     },
 
     /// The server has sent over audio data for the stream
-    #[non_exhaustive]
     AudioDataReceived {
+        stream: StreamHandle,
         timestamp: RtmpTimestamp,
-        data: Bytes,
+        data: D,
     },
 
-    /// The server sent an Amf0 command that was not able to be handled
-    #[non_exhaustive]
-    UnhandleableAmf0Command {
+    /// The server sent a command that the session could not handle
+    UnhandledCommand {
         stream_id: crate::sessions::StreamId,
         command_name: String,
         transaction_id: f64,
@@ -69,7 +63,6 @@ pub enum ClientSessionEvent {
     },
 
     /// The server sent us a result to a transaction that we don't know about
-    #[non_exhaustive]
     UnknownTransactionResultReceived {
         transaction_id: f64,
         command_object: Amf0Value,
@@ -78,28 +71,36 @@ pub enum ClientSessionEvent {
 
     /// The server sent an `onStatus` message with a `code` property that we don't know
     /// how to handle.
-    #[non_exhaustive]
-    StatusReceived { status: CommandStatus },
+    StatusReceived {
+        stream: Option<StreamHandle>,
+        status: CommandStatus,
+    },
 
     /// The server rejected playback or stream creation.
-    #[non_exhaustive]
-    PlaybackRequestRejected { status: CommandStatus },
+    PlaybackRequestRejected {
+        stream: StreamHandle,
+        status: CommandStatus,
+    },
     /// The server rejected publishing or stream creation.
-    #[non_exhaustive]
-    PublishRequestRejected { status: CommandStatus },
-    /// Playback ended on the active stream.
-    #[non_exhaustive]
-    PlaybackFinished { status: CommandStatus },
-    /// Publishing ended on the active stream.
-    #[non_exhaustive]
-    PublishingFinished { status: CommandStatus },
+    PublishRequestRejected {
+        stream: StreamHandle,
+        status: CommandStatus,
+    },
+    /// Playback ended on this stream.
+    PlaybackFinished {
+        stream: StreamHandle,
+        status: CommandStatus,
+    },
+    /// Publishing ended on this stream.
+    PublishingFinished {
+        stream: StreamHandle,
+        status: CommandStatus,
+    },
 
-    /// The client has sent an acknowledgement that they have received the specified number of bytes
-    #[non_exhaustive]
+    /// The server has sent an acknowledgement that they have received the specified number of bytes
     AcknowledgementReceived { bytes_received: u32 },
 
-    /// The client has responded to a ping request
-    #[non_exhaustive]
+    /// The server has responded to a ping request
     PingResponseReceived { timestamp: RtmpTimestamp },
 }
 
@@ -135,6 +136,99 @@ impl CommandStatus {
         match self.properties.get(key) {
             Some(Amf0Value::Utf8String(s)) => Some(s),
             _ => None,
+        }
+    }
+}
+
+impl<D> ClientEvent<D> {
+    /// Transform media and script-data storage without changing event semantics.
+    pub fn map_payload<T>(self, mut map: impl FnMut(D) -> T) -> ClientEvent<T> {
+        match self {
+            Self::ConnectionRequestAccepted {
+                command_object,
+                additional_properties,
+            } => ClientEvent::ConnectionRequestAccepted {
+                command_object,
+                additional_properties,
+            },
+            Self::ConnectionRequestRejected {
+                description,
+                status,
+            } => ClientEvent::ConnectionRequestRejected {
+                description,
+                status,
+            },
+            Self::PlaybackRequestAccepted { stream, status } => {
+                ClientEvent::PlaybackRequestAccepted { stream, status }
+            }
+            Self::PublishRequestAccepted { stream, status } => {
+                ClientEvent::PublishRequestAccepted { stream, status }
+            }
+            Self::StreamDataReceived { stream, message } => ClientEvent::StreamDataReceived {
+                stream,
+                message: message.map_payload(&mut map),
+            },
+            Self::VideoDataReceived {
+                stream,
+                timestamp,
+                data,
+            } => ClientEvent::VideoDataReceived {
+                stream,
+                timestamp,
+                data: map(data),
+            },
+            Self::AudioDataReceived {
+                stream,
+                timestamp,
+                data,
+            } => ClientEvent::AudioDataReceived {
+                stream,
+                timestamp,
+                data: map(data),
+            },
+            Self::UnhandledCommand {
+                stream_id,
+                command_name,
+                transaction_id,
+                command_object,
+                additional_values,
+            } => ClientEvent::UnhandledCommand {
+                stream_id,
+                command_name,
+                transaction_id,
+                command_object,
+                additional_values,
+            },
+            Self::UnknownTransactionResultReceived {
+                transaction_id,
+                command_object,
+                additional_values,
+            } => ClientEvent::UnknownTransactionResultReceived {
+                transaction_id,
+                command_object,
+                additional_values,
+            },
+            Self::StatusReceived { stream, status } => {
+                ClientEvent::StatusReceived { stream, status }
+            }
+            Self::PlaybackRequestRejected { stream, status } => {
+                ClientEvent::PlaybackRequestRejected { stream, status }
+            }
+            Self::PublishRequestRejected { stream, status } => {
+                ClientEvent::PublishRequestRejected { stream, status }
+            }
+            Self::PlaybackFinished { stream, status } => {
+                ClientEvent::PlaybackFinished { stream, status }
+            }
+            Self::PublishingFinished { stream, status } => {
+                ClientEvent::PublishingFinished { stream, status }
+            }
+            Self::AcknowledgementReceived { bytes_received } => {
+                ClientEvent::AcknowledgementReceived { bytes_received }
+            }
+            Self::PingResponseReceived { timestamp } => {
+                ClientEvent::PingResponseReceived { timestamp }
+            }
         }
     }
 }

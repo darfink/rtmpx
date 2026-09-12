@@ -11,6 +11,8 @@
 //! It differs only in the constructors it calls, so it is written once
 //! against [`AmfValue`].
 
+mod graph;
+pub use graph::{Document, ObjectId, TreeError, TreeLimits};
 pub mod amf0;
 pub mod amf3;
 pub(crate) mod common;

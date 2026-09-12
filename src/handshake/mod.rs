@@ -45,7 +45,7 @@ const GENUINE_FP_CONST: &'static str = "Genuine Adobe Flash Player 001";
 
 /// Contains the result after processing bytes for the handshaking process
 #[derive(PartialEq, Eq, Debug)]
-pub enum HandshakeProcessResult {
+pub enum HandshakeProgress {
     /// The handshake process is still on-going
     InProgress {
         /// Any bytes that should be sent to the peer as a response
@@ -62,12 +62,12 @@ pub enum HandshakeProcessResult {
     },
 }
 
-/// The type of peer being represented by the handshake.
+/// The local role represented by the handshake.
 ///
 /// This only matters due to the FP9 handshaking process, where the client and server use different
 /// calculations for packet generation.
 #[derive(Debug, Eq, PartialEq)]
-pub enum PeerType {
+pub enum HandshakeRole {
     /// Handshake being represented as a server
     Server,
 
@@ -105,19 +105,19 @@ enum Stage {
 /// ## Examples
 ///
 /// ```
-/// use rtmpx::handshake::{Handshake, PeerType, HandshakeProcessResult};
+/// use rtmpx::handshake::{Handshake, HandshakeRole, HandshakeProgress};
 ///
-/// let mut client = Handshake::new(PeerType::Client);
-/// let mut server = Handshake::new(PeerType::Server);
+/// let mut client = Handshake::new(HandshakeRole::Client);
+/// let mut server = Handshake::new(HandshakeRole::Server);
 ///
 /// let c0_and_c1 = client.generate_outbound_p0_and_p1().unwrap();
 /// let s0_s1_and_s2 = match server.process_bytes(&c0_and_c1[..]) {
-///     Ok(HandshakeProcessResult::InProgress {response_bytes: bytes}) => bytes,
+///     Ok(HandshakeProgress::InProgress {response_bytes: bytes}) => bytes,
 ///     x => panic!("Unexpected process_bytes response: {:?}", x),
 /// };
 ///
 /// let c2 = match client.process_bytes(&s0_s1_and_s2[..]) {
-///     Ok(HandshakeProcessResult::Completed {
+///     Ok(HandshakeProgress::Completed {
 ///         response_bytes: bytes,
 ///         remaining_bytes: _
 ///     }) => bytes,
@@ -125,7 +125,7 @@ enum Stage {
 /// };
 ///
 /// match server.process_bytes(&c2[..]) {
-///     Ok(HandshakeProcessResult::Completed {
+///     Ok(HandshakeProgress::Completed {
 ///             response_bytes: _,
 ///             remaining_bytes: _
 ///         }) => {},
@@ -135,7 +135,7 @@ enum Stage {
 ///
 pub struct Handshake {
     current_stage: Stage,
-    peer_type: PeerType,
+    peer_type: HandshakeRole,
     command_byte: u8,
     input_buffer: Vec<u8>,
     sent_p1: [u8; RTMP_PACKET_SIZE],
@@ -147,7 +147,7 @@ impl Handshake {
     /// The Flash Player 9 handshake requires generating a different packet 1 depending if you
     /// are the client or the server, and thus this must be specified when creating a new
     /// `Handshake` instance.
-    pub fn new(peer_type: PeerType) -> Handshake {
+    pub fn new(peer_type: HandshakeRole) -> Handshake {
         Handshake {
             current_stage: Stage::NeedToSendP0AndP1,
             command_byte: 0_u8,
@@ -176,8 +176,8 @@ impl Handshake {
         self.sent_p1[7] = ADOBE_VERSION[3];
 
         let (digest_offset, constant_key) = match self.peer_type {
-            PeerType::Server => (get_server_digest_offset(&self.sent_p1), GENUINE_FMS_CONST),
-            PeerType::Client => (get_client_digest_offset(&self.sent_p1), GENUINE_FP_CONST),
+            HandshakeRole::Server => (get_server_digest_offset(&self.sent_p1), GENUINE_FMS_CONST),
+            HandshakeRole::Client => (get_client_digest_offset(&self.sent_p1), GENUINE_FP_CONST),
         };
 
         {
@@ -211,7 +211,7 @@ impl Handshake {
     /// If the `Handshake` has not generated the outbound packets 0 and 1 yet, then
     /// the first call to `process_bytes` will include packets 0 and 1 in the `response_bytes`
     /// field.
-    pub fn process_bytes(&mut self, data: &[u8]) -> Result<HandshakeProcessResult, HandshakeError> {
+    pub fn process_bytes(&mut self, data: &[u8]) -> Result<HandshakeProgress, HandshakeError> {
         self.input_buffer.extend_from_slice(data);
 
         let mut bytes_for_response: Vec<u8> = Vec::new();
@@ -222,7 +222,7 @@ impl Handshake {
             let result = match self.current_stage {
                 Stage::NeedToSendP0AndP1 => match self.generate_outbound_p0_and_p1() {
                     Err(x) => Err(x),
-                    Ok(bytes) => Ok(HandshakeProcessResult::InProgress {
+                    Ok(bytes) => Ok(HandshakeProgress::InProgress {
                         response_bytes: bytes,
                     }),
                 },
@@ -235,10 +235,10 @@ impl Handshake {
             match result {
                 Err(x) => return Err(x),
                 Ok(x) => match x {
-                    HandshakeProcessResult::InProgress {
+                    HandshakeProgress::InProgress {
                         response_bytes: bytes,
                     } => bytes_for_response.extend(bytes),
-                    HandshakeProcessResult::Completed {
+                    HandshakeProgress::Completed {
                         response_bytes: _,
                         remaining_bytes: bytes,
                     } => left_over_bytes.extend(bytes),
@@ -253,20 +253,20 @@ impl Handshake {
         }
 
         if self.current_stage == Stage::Complete {
-            Ok(HandshakeProcessResult::Completed {
+            Ok(HandshakeProgress::Completed {
                 response_bytes: bytes_for_response,
                 remaining_bytes: left_over_bytes,
             })
         } else {
-            Ok(HandshakeProcessResult::InProgress {
+            Ok(HandshakeProgress::InProgress {
                 response_bytes: bytes_for_response,
             })
         }
     }
 
-    fn parse_p0(&mut self) -> Result<HandshakeProcessResult, HandshakeError> {
+    fn parse_p0(&mut self) -> Result<HandshakeProgress, HandshakeError> {
         if self.input_buffer.len() == 0 {
-            return Ok(HandshakeProcessResult::InProgress {
+            return Ok(HandshakeProgress::InProgress {
                 response_bytes: Vec::new(),
             });
         }
@@ -277,14 +277,14 @@ impl Handshake {
         };
 
         self.current_stage = Stage::WaitingForPacket1;
-        Ok(HandshakeProcessResult::InProgress {
+        Ok(HandshakeProgress::InProgress {
             response_bytes: Vec::new(),
         })
     }
 
-    fn parse_p1(&mut self) -> Result<HandshakeProcessResult, HandshakeError> {
+    fn parse_p1(&mut self) -> Result<HandshakeProgress, HandshakeError> {
         if self.input_buffer.len() < RTMP_PACKET_SIZE {
-            return Ok(HandshakeProcessResult::InProgress {
+            return Ok(HandshakeProgress::InProgress {
                 response_bytes: Vec::new(),
             });
         }
@@ -304,8 +304,8 @@ impl Handshake {
 
         // Test against the expected constant string the peer sent over
         let p1_key = match self.peer_type {
-            PeerType::Server => GENUINE_FP_CONST.as_bytes().to_vec(),
-            PeerType::Client => GENUINE_FMS_CONST.as_bytes().to_vec(),
+            HandshakeRole::Server => GENUINE_FP_CONST.as_bytes().to_vec(),
+            HandshakeRole::Client => GENUINE_FMS_CONST.as_bytes().to_vec(),
         };
 
         let received_digest = match get_digest_for_received_packet(&received_packet_1, &p1_key) {
@@ -322,7 +322,7 @@ impl Handshake {
                 // destinations such as YouTube provide a non-zero version while
                 // still expecting an original handshake.
                 self.current_stage = Stage::WaitingForPacket2;
-                return Ok(HandshakeProcessResult::InProgress {
+                return Ok(HandshakeProgress::InProgress {
                     response_bytes: received_packet_1.to_vec(),
                 });
             }
@@ -334,8 +334,8 @@ impl Handshake {
         fill_with_random_data(&mut output_packet);
 
         let mut p2_key = match self.peer_type {
-            PeerType::Server => GENUINE_FMS_CONST.as_bytes().to_vec(),
-            PeerType::Client => GENUINE_FP_CONST.as_bytes().to_vec(),
+            HandshakeRole::Server => GENUINE_FMS_CONST.as_bytes().to_vec(),
+            HandshakeRole::Client => GENUINE_FP_CONST.as_bytes().to_vec(),
         };
 
         p2_key.extend_from_slice(&RANDOM_CRUD[..]);
@@ -349,14 +349,14 @@ impl Handshake {
         }
 
         self.current_stage = Stage::WaitingForPacket2;
-        Ok(HandshakeProcessResult::InProgress {
+        Ok(HandshakeProgress::InProgress {
             response_bytes: output_packet.to_vec(),
         })
     }
 
-    fn parse_p2(&mut self) -> Result<HandshakeProcessResult, HandshakeError> {
+    fn parse_p2(&mut self) -> Result<HandshakeProgress, HandshakeError> {
         if self.input_buffer.len() < RTMP_PACKET_SIZE {
-            return Ok(HandshakeProcessResult::InProgress {
+            return Ok(HandshakeProgress::InProgress {
                 response_bytes: Vec::new(),
             });
         }
@@ -375,7 +375,7 @@ impl Handshake {
         if &self.sent_p1[..] == &received_packet_2[..] {
             self.current_stage = Stage::Complete;
             let remaining_bytes = self.input_buffer.drain(..).collect();
-            return Ok(HandshakeProcessResult::Completed {
+            return Ok(HandshakeProgress::Completed {
                 response_bytes: Vec::new(),
                 remaining_bytes,
             });
@@ -391,7 +391,7 @@ impl Handshake {
 
         self.current_stage = Stage::Complete;
         let bytes_left = self.input_buffer.drain(..).collect();
-        Ok(HandshakeProcessResult::Completed {
+        Ok(HandshakeProgress::Completed {
             response_bytes: Vec::new(),
             remaining_bytes: bytes_left,
         })
@@ -663,14 +663,14 @@ mod tests {
 
     #[test]
     fn can_start_client_handshake() {
-        let handshake = Handshake::new(PeerType::Server);
+        let handshake = Handshake::new(HandshakeRole::Server);
 
         assert_eq!(handshake.current_stage, Stage::NeedToSendP0AndP1);
     }
 
     #[test]
     fn bad_version_if_first_byte_is_not_a_3() {
-        let mut handshake = Handshake::new(PeerType::Server);
+        let mut handshake = Handshake::new(HandshakeRole::Server);
         let input = [4_u8];
 
         match handshake.process_bytes(&input) {
@@ -682,7 +682,7 @@ mod tests {
 
     #[test]
     fn can_accept_jw_player_example_p0_and_p1() {
-        let mut handshake = Handshake::new(PeerType::Server);
+        let mut handshake = Handshake::new(HandshakeRole::Server);
         let s0_and_s1 = match handshake.generate_outbound_p0_and_p1() {
             Err(x) => panic!("Unexpected error: {:?}", x),
             Ok(x) => x,
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(handshake.current_stage, Stage::WaitingForPacket0);
 
         let p0_response = match handshake.process_bytes(&JWPLAYER_C0) {
-            Ok(HandshakeProcessResult::InProgress {
+            Ok(HandshakeProgress::InProgress {
                 response_bytes: data,
             }) => data,
             Ok(x) => panic!("Unexpected response of {:?}", x),
@@ -708,7 +708,7 @@ mod tests {
         assert_eq!(handshake.current_stage, Stage::WaitingForPacket1);
 
         let p1_response = match handshake.process_bytes(&JWPLAYER_C1) {
-            Ok(HandshakeProcessResult::InProgress {
+            Ok(HandshakeProgress::InProgress {
                 response_bytes: data,
             }) => data,
             Ok(x) => panic!("Unexpected response of {:?}", x),
@@ -723,7 +723,7 @@ mod tests {
         assert_eq!(handshake.current_stage, Stage::WaitingForPacket2);
 
         let remaining_bytes = match handshake.process_bytes(&s0_and_s1[1..]) {
-            Ok(HandshakeProcessResult::Completed {
+            Ok(HandshakeProgress::Completed {
                 response_bytes: _,
                 remaining_bytes: data,
             }) => data,
@@ -742,14 +742,14 @@ mod tests {
         c0_and_c1[0] = 3;
         fill_with_random_data(&mut c0_and_c1[9..RTMP_PACKET_SIZE + 1]);
 
-        let mut handshake = Handshake::new(PeerType::Server);
+        let mut handshake = Handshake::new(HandshakeRole::Server);
         let s0_and_s1 = match handshake.generate_outbound_p0_and_p1() {
             Err(x) => panic!("Unexpected error: {:?}", x),
             Ok(x) => x,
         };
 
         let s2 = match handshake.process_bytes(&c0_and_c1) {
-            Ok(HandshakeProcessResult::InProgress {
+            Ok(HandshakeProgress::InProgress {
                 response_bytes: data,
             }) => data,
             Ok(x) => panic!("Unexpected response of {:?}", x),
@@ -764,7 +764,7 @@ mod tests {
         assert_eq!(handshake.current_stage, Stage::WaitingForPacket2);
 
         let remaining_bytes = match handshake.process_bytes(&s0_and_s1[1..]) {
-            Ok(HandshakeProcessResult::Completed {
+            Ok(HandshakeProgress::Completed {
                 response_bytes: _,
                 remaining_bytes: data,
             }) => data,
@@ -781,8 +781,8 @@ mod tests {
         // This is the best way to verify we can handle the fp9 handshake method
         // without reimplementing the exact algorithims for the test.
 
-        let mut client = Handshake::new(PeerType::Client);
-        let mut server = Handshake::new(PeerType::Server);
+        let mut client = Handshake::new(HandshakeRole::Client);
+        let mut server = Handshake::new(HandshakeRole::Server);
 
         let c0_and_c1 = match client.generate_outbound_p0_and_p1() {
             Ok(bytes) => bytes,
@@ -792,7 +792,7 @@ mod tests {
         assert_eq!(client.current_stage, Stage::WaitingForPacket0);
 
         let s0_s1_and_s2 = match server.process_bytes(&c0_and_c1[..]) {
-            Ok(HandshakeProcessResult::InProgress {
+            Ok(HandshakeProgress::InProgress {
                 response_bytes: bytes,
             }) => bytes,
             x => panic!("Unexpected process_bytes response: {:?}", x),
@@ -801,7 +801,7 @@ mod tests {
         assert_eq!(server.current_stage, Stage::WaitingForPacket2);
 
         let c2 = match client.process_bytes(&s0_s1_and_s2[..]) {
-            Ok(HandshakeProcessResult::Completed {
+            Ok(HandshakeProgress::Completed {
                 response_bytes: bytes,
                 remaining_bytes: _,
             }) => bytes,
@@ -811,7 +811,7 @@ mod tests {
         assert_eq!(client.current_stage, Stage::Complete);
 
         match server.process_bytes(&c2[..]) {
-            Ok(HandshakeProcessResult::Completed {
+            Ok(HandshakeProgress::Completed {
                 response_bytes: _,
                 remaining_bytes: _,
             }) => {}
@@ -823,11 +823,11 @@ mod tests {
 
     #[test]
     fn sends_outbound_p0_p1_if_p0_received_and_outbound_p0_and_p1_not_yet_sent() {
-        let mut handshake = Handshake::new(PeerType::Server);
+        let mut handshake = Handshake::new(HandshakeRole::Server);
         let input = [3_u8];
 
         let response = match handshake.process_bytes(&input) {
-            Ok(HandshakeProcessResult::InProgress {
+            Ok(HandshakeProgress::InProgress {
                 response_bytes: bytes,
             }) => bytes,
             x => panic!("Unexpected process_bytes response: {:?}", x),

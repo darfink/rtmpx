@@ -19,18 +19,19 @@
 //    this does, including what our own client raises for each and that the
 //    framing follows the negotiated exchange (AMF0 mirror vs type 17).
 
-use bytes::Bytes;
-use rtmpx::amf::AmfEncoding;
-use rtmpx::amf0::{Amf0Object, Amf0Value};
-use rtmpx::amf3::Amf3Value;
-use rtmpx::chunk_io::{ChunkDeserializer, ChunkSerializer};
-use rtmpx::messages::RtmpMessage;
-use rtmpx::sessions::{
-    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult,
-    PublishRequestType, ServerSession, ServerSessionConfig, ServerSessionEvent,
-    ServerSessionResult,
+#[path = "support/api.rs"]
+mod api;
+use crate::api::amf::AmfEncoding;
+use crate::api::amf0::{Amf0Object, Amf0Value};
+use crate::api::amf3::Amf3Value;
+use crate::api::chunk_io::{ChunkEncoder, ContiguousDecoder};
+use crate::api::messages::RtmpMessage;
+use crate::api::sessions::{
+    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishMode,
+    ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
 };
-use rtmpx::time::RtmpTimestamp;
+use crate::api::time::RtmpTimestamp;
+use bytes::Bytes;
 
 // ---------------------------------------------------------------------------
 // Shared pump: two sessions wired back to back, byte-exact in-process.
@@ -66,11 +67,11 @@ impl Pump {
         let mut bytes = Vec::new();
         for result in results {
             match result {
-                ClientSessionResult::OutboundResponse(packet) => {
-                    bytes.extend_from_slice(&packet.bytes);
+                ClientSessionResult::Packet(packet) => {
+                    bytes.extend_from_slice(&packet.to_vec());
                 }
-                ClientSessionResult::RaisedEvent(event) => self.client_events.push(event),
-                ClientSessionResult::UnhandleableMessageReceived(_) => {}
+                ClientSessionResult::Event(event) => self.client_events.push(event),
+                ClientSessionResult::UnhandledMessage(_) => {}
                 #[allow(unreachable_patterns)]
                 _ => panic!("unexpected future protocol variant"),
             }
@@ -89,11 +90,11 @@ impl Pump {
         let mut bytes = Vec::new();
         for result in results {
             match result {
-                ServerSessionResult::OutboundResponse(packet) => {
-                    bytes.extend_from_slice(&packet.bytes);
+                ServerSessionResult::Packet(packet) => {
+                    bytes.extend_from_slice(&packet.to_vec());
                 }
-                ServerSessionResult::RaisedEvent(event) => self.server_events.push(event),
-                ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                ServerSessionResult::Event(event) => self.server_events.push(event),
+                ServerSessionResult::UnhandledMessage(_) => {}
                 #[allow(unreachable_patterns)]
                 _ => panic!("unexpected future protocol variant"),
             }
@@ -148,7 +149,7 @@ fn connect(pump: &mut Pump, app: &str) {
 fn publish(pump: &mut Pump, stream_key: &str) {
     let out = pump
         .client
-        .request_publishing(stream_key.to_string(), PublishRequestType::Live)
+        .request_publishing(stream_key.to_string(), PublishMode::Live)
         .expect("publish must build");
     pump.push_client(vec![out]);
     let request_id = pump
@@ -175,7 +176,7 @@ fn publish(pump: &mut Pump, stream_key: &str) {
 // Drive a second pump to Playing so relayed media can be pushed through
 // ServerSession::send_video_data and observed on the player. Returns the
 // server-side stream id to send on.
-fn play(pump: &mut Pump, stream_key: &str) -> rtmpx::sessions::StreamId {
+fn play(pump: &mut Pump, stream_key: &str) -> crate::api::sessions::StreamId {
     let out = pump
         .client
         .request_playback(stream_key.to_string())
@@ -212,7 +213,7 @@ fn play(pump: &mut Pump, stream_key: &str) -> rtmpx::sessions::StreamId {
 // the session's existing chunk stream, so it can only be decoded with the
 // full history, not a fresh deserializer.
 fn decode_all(raw: &[u8]) -> Vec<RtmpMessage> {
-    let mut deserializer = ChunkDeserializer::new();
+    let mut deserializer = ContiguousDecoder::new();
     let mut messages = Vec::new();
     let mut first = true;
     loop {
@@ -234,7 +235,7 @@ fn decode_all(raw: &[u8]) -> Vec<RtmpMessage> {
                     .expect("captured payload must parse");
                 if let RtmpMessage::SetChunkSize { size } = &message {
                     deserializer
-                        .set_max_chunk_size(*size as usize)
+                        .set_chunk_size(*size as usize)
                         .expect("chunk size must apply");
                 }
                 messages.push(message);
@@ -314,7 +315,7 @@ fn extended_timestamps_survive_ingest_and_relay() {
             .server
             .send_video_data(play_stream_id, data.clone(), *timestamp, false)
             .expect("relay send with extended timestamp must build");
-        playout.push_server(vec![ServerSessionResult::OutboundResponse(packet)]);
+        playout.push_server(vec![ServerSessionResult::Packet(packet)]);
     }
     let played: Vec<(Bytes, RtmpTimestamp)> = playout
         .take_client_events()
@@ -341,20 +342,20 @@ fn extended_timestamps_survive_ingest_and_relay() {
 // ---------------------------------------------------------------------------
 
 fn collect_outbound(
-    deserializer: &mut ChunkDeserializer,
+    deserializer: &mut ContiguousDecoder,
     results: Vec<ServerSessionResult>,
 ) -> Vec<RtmpMessage> {
     let mut messages = Vec::new();
     for result in results {
-        if let ServerSessionResult::OutboundResponse(packet) = result {
+        if let ServerSessionResult::Packet(packet) = result {
             let payload = deserializer
-                .get_next_message(&packet.bytes)
+                .get_next_message(&packet.to_vec())
                 .expect("server response must decode")
                 .expect("server response must be complete");
             let message = payload.to_rtmp_message().expect("response must parse");
             if let RtmpMessage::SetChunkSize { size } = &message {
                 deserializer
-                    .set_max_chunk_size(*size as usize)
+                    .set_chunk_size(*size as usize)
                     .expect("chunk size must apply");
             }
             messages.push(message);
@@ -365,7 +366,7 @@ fn collect_outbound(
 
 fn feed_server(
     session: &mut ServerSession,
-    deserializer: &mut ChunkDeserializer,
+    deserializer: &mut ContiguousDecoder,
     bytes: &[u8],
 ) -> (Vec<RtmpMessage>, Vec<ServerSessionEvent>) {
     let mut responses = Vec::new();
@@ -375,21 +376,21 @@ fn feed_server(
         .expect("server must accept crafted bytes");
     for result in results {
         match result {
-            ServerSessionResult::OutboundResponse(packet) => {
+            ServerSessionResult::Packet(packet) => {
                 let payload = deserializer
-                    .get_next_message(&packet.bytes)
+                    .get_next_message(&packet.to_vec())
                     .expect("server response must decode")
                     .expect("server response must be complete");
                 let message = payload.to_rtmp_message().expect("response must parse");
                 if let RtmpMessage::SetChunkSize { size } = &message {
                     deserializer
-                        .set_max_chunk_size(*size as usize)
+                        .set_chunk_size(*size as usize)
                         .expect("chunk size must apply");
                 }
                 responses.push(message);
             }
-            ServerSessionResult::RaisedEvent(event) => events.push(event),
-            ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            ServerSessionResult::Event(event) => events.push(event),
+            ServerSessionResult::UnhandledMessage(_) => {}
             #[allow(unreachable_patterns)]
             _ => panic!("unexpected future protocol variant"),
         }
@@ -398,20 +399,20 @@ fn feed_server(
 }
 fn send_to_server(
     session: &mut ServerSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
     message: RtmpMessage,
     stream_id: u32,
     timestamp: u32,
     first_on_stream: bool,
 ) -> (Vec<RtmpMessage>, Vec<ServerSessionEvent>) {
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(timestamp), stream_id)
+        .into_raw_message(RtmpTimestamp::new(timestamp), stream_id)
         .expect("message must encode");
     let packet = serializer
         .serialize(&payload, first_on_stream, false)
         .expect("must serialize");
-    feed_server(session, deserializer, &packet.bytes)
+    feed_server(session, deserializer, &packet.to_vec())
 }
 
 fn amf0_command(name: &str, tid: f64, args: Vec<Amf0Value>) -> RtmpMessage {
@@ -452,12 +453,12 @@ fn minimal_connect_message(app: &str, object_encoding: f64) -> RtmpMessage {
 }
 
 fn connected_server(
-    deserializer: &mut ChunkDeserializer,
+    deserializer: &mut ContiguousDecoder,
     object_encoding: f64,
-) -> (ServerSession, ChunkSerializer) {
+) -> (ServerSession, ChunkEncoder) {
     let (mut session, initial) =
         ServerSession::new(ServerSessionConfig::new()).expect("server must start");
-    let mut serializer = ChunkSerializer::new();
+    let mut serializer = ChunkEncoder::new();
     collect_outbound(deserializer, initial);
     let (_, events) = send_to_server(
         &mut session,
@@ -484,8 +485,8 @@ fn connected_server(
 
 fn create_stream(
     session: &mut ServerSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
     tid: f64,
 ) -> u32 {
     let (responses, _) = send_to_server(
@@ -512,8 +513,8 @@ fn create_stream(
 
 fn create_stream_and_publish(
     session: &mut ServerSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
     key: &str,
 ) -> u32 {
     let stream_id = create_stream(session, serializer, deserializer, 2.0);
@@ -556,7 +557,7 @@ fn create_stream_and_publish(
 // publish exactly as for the numeric form.
 #[test]
 fn string_delete_stream_finishes_publish() {
-    let mut deserializer = ChunkDeserializer::new();
+    let mut deserializer = ContiguousDecoder::new();
     let (mut session, mut serializer) = connected_server(&mut deserializer, 0.0);
     let key = "gstreamer-quirk-key";
     let stream_id =
@@ -586,7 +587,7 @@ fn string_delete_stream_finishes_publish() {
 // no error, and the session must still be usable afterwards.
 #[test]
 fn garbage_delete_stream_is_ignored() {
-    let mut deserializer = ChunkDeserializer::new();
+    let mut deserializer = ContiguousDecoder::new();
     let (mut session, mut serializer) = connected_server(&mut deserializer, 0.0);
     let (_, events) = send_to_server(
         &mut session,
@@ -691,7 +692,7 @@ fn publish_rejection_is_onstatus_error() {
     connect(&mut pump, "live");
     let out = pump
         .client
-        .request_publishing("denied-key".to_string(), PublishRequestType::Live)
+        .request_publishing("denied-key".to_string(), PublishMode::Live)
         .expect("publish must build");
     pump.push_client(vec![out]);
     let request_id = pump
@@ -835,7 +836,7 @@ fn amf3_status_code(args: &[Amf3Value]) -> (String, String) {
 // (the pump tests above cover the mirrored-AMF0 case).
 #[test]
 fn amf3_framed_play_rejection_is_amf3_command() {
-    let mut deserializer = ChunkDeserializer::new();
+    let mut deserializer = ContiguousDecoder::new();
     // objectEncoding 3 so the session negotiates AMF3.
     let (mut session, mut serializer) = connected_server(&mut deserializer, 3.0);
     assert_eq!(
@@ -930,15 +931,15 @@ fn amf3_framed_play_rejection_is_amf3_command() {
 }
 
 #[test]
-fn requests_are_exclusive_while_pending_and_cancellation_releases_created_streams() {
-    use rtmpx::sessions::ClientState;
+fn cancellation_releases_created_streams_without_changing_connection_state() {
+    use crate::api::sessions::ConnectionState;
     for publishing in [false, true] {
         let mut pump = Pump::new(
             ClientSessionConfig::default(),
             ServerSessionConfig::default(),
         );
         let connect_result = pump.client.request_connection("live".into()).unwrap();
-        assert_eq!(pump.client.state(), &ClientState::ConnectionRequested);
+        assert_eq!(pump.client.state(), ConnectionState::Connecting);
         assert!(pump.client.request_connection("again".into()).is_err());
         assert!(!pump.client.is_failed());
         pump.push_client(vec![connect_result]);
@@ -958,24 +959,15 @@ fn requests_are_exclusive_while_pending_and_cancellation_releases_created_stream
 
         let request = if publishing {
             pump.client
-                .request_publishing("demo".into(), PublishRequestType::Live)
+                .request_publishing("demo".into(), PublishMode::Live)
                 .unwrap()
         } else {
             pump.client.request_playback("demo".into()).unwrap()
         };
+        assert_eq!(pump.client.state(), ConnectionState::Connected);
         assert_eq!(
-            pump.client.state(),
-            if publishing {
-                &ClientState::CreatingPublishStream
-            } else {
-                &ClientState::CreatingPlayStream
-            }
-        );
-        assert!(pump.client.request_playback("overlap".into()).is_err());
-        assert!(
-            pump.client
-                .request_publishing("overlap".into(), PublishRequestType::Live)
-                .is_err()
+            pump.client.streams().next().unwrap().1,
+            crate::api::sessions::ClientStreamState::Creating
         );
         let cancel = if publishing {
             pump.client.stop_publishing()
@@ -984,30 +976,26 @@ fn requests_are_exclusive_while_pending_and_cancellation_releases_created_stream
         }
         .unwrap();
         assert!(cancel.is_empty());
-        assert_eq!(
-            pump.client.state(),
-            if publishing {
-                &ClientState::CancellingPublish
-            } else {
-                &ClientState::CancellingPlay
-            }
-        );
-        assert!(pump.client.request_playback("too-soon".into()).is_err());
+        assert_eq!(pump.client.state(), ConnectionState::Connected);
+        assert_eq!(pump.client.streams().count(), 0);
         // Deliver the request after cancellation. Its response must delete the newly
         // allocated stream and must never issue a play/publish command.
         pump.push_client(vec![request]);
-        assert_eq!(pump.client.state(), &ClientState::Connected);
+        assert_eq!(pump.client.state(), ConnectionState::Connected);
         assert_eq!(pump.client.active_stream_id(), None);
         assert!(pump.take_server_events().is_empty());
         assert!(pump.take_client_events().is_empty());
         publish(&mut pump, "next");
-        assert_eq!(pump.client.state(), &ClientState::Publishing);
+        assert_eq!(
+            pump.client.streams().next().unwrap().1,
+            crate::api::sessions::ClientStreamState::Publishing
+        );
     }
 }
 
 #[test]
 fn script_messages_relay_both_directions_without_changing_wire_type_or_bytes() {
-    use rtmpx::sessions::{DataMessage, DataMessageType};
+    use crate::api::sessions::{DataMessage, DataMessageType};
     let mut ingest = Pump::new(
         ClientSessionConfig::default(),
         ServerSessionConfig::default(),
@@ -1029,9 +1017,9 @@ fn script_messages_relay_both_directions_without_changing_wire_type_or_bytes() {
                 Amf0Value::Utf8String("retained".into()),
             )])),
         ];
-        let amf0 = rtmpx::amf0::serialize(&values).unwrap();
+        let amf0 = crate::api::amf0::serialize(&values).unwrap();
         let amf3 =
-            rtmpx::amf3::serialize(&values.iter().map(Amf0Value::to_amf3).collect::<Vec<_>>())
+            crate::api::amf3::serialize(&values.iter().map(Amf0Value::to_amf3).collect::<Vec<_>>())
                 .unwrap();
         let mut wrapped0 = vec![0];
         wrapped0.extend_from_slice(&amf0);
@@ -1056,10 +1044,7 @@ fn script_messages_relay_both_directions_without_changing_wire_type_or_bytes() {
                 .take_server_events()
                 .into_iter()
                 .find_map(|e| match e {
-                    ServerSessionEvent::StreamMetadataChanged {
-                        stream_id, message, ..
-                    }
-                    | ServerSessionEvent::StreamDataReceived {
+                    ServerSessionEvent::StreamDataReceived {
                         stream_id, message, ..
                     } => {
                         assert_eq!(stream_id, source_id);
@@ -1070,13 +1055,12 @@ fn script_messages_relay_both_directions_without_changing_wire_type_or_bytes() {
                 .unwrap();
             assert_eq!(received, original);
             let packet = playback.server.send_data(destination_id, received).unwrap();
-            playback.push_server(vec![ServerSessionResult::OutboundResponse(packet)]);
+            playback.push_server(vec![ServerSessionResult::Packet(packet)]);
             let received = playback
                 .take_client_events()
                 .into_iter()
                 .find_map(|e| match e {
-                    ClientSessionEvent::StreamMetadataReceived { message, .. }
-                    | ClientSessionEvent::StreamDataReceived { message, .. } => Some(message),
+                    ClientSessionEvent::StreamDataReceived { message, .. } => Some(message),
                     _ => None,
                 })
                 .unwrap();
@@ -1085,8 +1069,7 @@ fn script_messages_relay_both_directions_without_changing_wire_type_or_bytes() {
             let sent = ingest.client.publish_data(received).unwrap();
             ingest.push_client(vec![sent]);
             assert!(ingest.take_server_events().into_iter().any(|e| match e {
-                ServerSessionEvent::StreamMetadataChanged { message, .. }
-                | ServerSessionEvent::StreamDataReceived { message, .. } => message == original,
+                ServerSessionEvent::StreamDataReceived { message, .. } => message == original,
                 _ => false,
             }));
         }
@@ -1095,7 +1078,7 @@ fn script_messages_relay_both_directions_without_changing_wire_type_or_bytes() {
 
 #[test]
 fn rejection_and_completion_preserve_status_and_allow_another_request() {
-    use rtmpx::sessions::ClientState;
+    use crate::api::sessions::ConnectionState;
     let mut pump = Pump::new(
         ClientSessionConfig::default(),
         ServerSessionConfig::default(),
@@ -1104,7 +1087,7 @@ fn rejection_and_completion_preserve_status_and_allow_another_request() {
     for publishing in [false, true] {
         let request = if publishing {
             pump.client
-                .request_publishing("denied".into(), PublishRequestType::Live)
+                .request_publishing("denied".into(), PublishMode::Live)
                 .unwrap()
         } else {
             pump.client.request_playback("denied".into()).unwrap()
@@ -1144,14 +1127,14 @@ fn rejection_and_completion_preserve_status_and_allow_another_request() {
             }
             _ => false,
         }));
-        assert_eq!(pump.client.state(), &ClientState::Connected);
+        assert_eq!(pump.client.state(), ConnectionState::Connected);
         assert_eq!(pump.client.active_stream_id(), None);
     }
     let stream_id = play(&mut pump, "working");
-    let finished = pump.server.finish_playing(stream_id).unwrap();
-    pump.push_server(vec![ServerSessionResult::OutboundResponse(finished)]);
+    let finished = pump.server.complete_playback(stream_id).unwrap();
+    pump.push_server(vec![ServerSessionResult::Packet(finished)]);
     assert!(pump.take_client_events().into_iter().any(|e| matches!(e,
         ClientSessionEvent::PlaybackFinished { status, .. } if status.code() == Some("NetStream.Play.Complete"))));
-    assert_eq!(pump.client.state(), &ClientState::Connected);
+    assert_eq!(pump.client.state(), ConnectionState::Connected);
     publish(&mut pump, "after-completion");
 }

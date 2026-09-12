@@ -16,7 +16,9 @@
 //! the protocol half of that contract: empty input never blocks, and a full
 //! handshake still completes with trailing bytes preserved for the session.
 
-use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
+#[path = "support/api.rs"]
+mod api;
+use crate::api::handshake::{Handshake, HandshakeProgress, HandshakeRole};
 use std::time::{Duration, Instant};
 
 /// Feeding no bytes must answer promptly instead of spinning.
@@ -26,7 +28,7 @@ use std::time::{Duration, Instant};
 /// holds no socket and performs no I/O, so there is nothing to spin on.
 #[test]
 fn empty_input_returns_promptly_without_blocking() {
-    let mut server = Handshake::new(PeerType::Server);
+    let mut server = Handshake::new(HandshakeRole::Server);
 
     let start = Instant::now();
     let result = server
@@ -35,8 +37,8 @@ fn empty_input_returns_promptly_without_blocking() {
     let elapsed = start.elapsed();
 
     match result {
-        HandshakeProcessResult::InProgress { .. } => {}
-        HandshakeProcessResult::Completed { .. } => {
+        HandshakeProgress::InProgress { .. } => {}
+        HandshakeProgress::Completed { .. } => {
             panic!("handshake cannot complete with no input")
         }
     }
@@ -55,7 +57,7 @@ fn empty_input_returns_promptly_without_blocking() {
         "partial handshake input must also return immediately"
     );
     assert!(
-        matches!(result, HandshakeProcessResult::InProgress { .. }),
+        matches!(result, HandshakeProgress::InProgress { .. }),
         "one version byte cannot complete the handshake"
     );
 }
@@ -64,8 +66,8 @@ fn empty_input_returns_promptly_without_blocking() {
 /// the handshake are carried to the session instead of being swallowed.
 #[test]
 fn full_handshake_completes_and_preserves_trailing_bytes() {
-    let mut client = Handshake::new(PeerType::Client);
-    let mut server = Handshake::new(PeerType::Server);
+    let mut client = Handshake::new(HandshakeRole::Client);
+    let mut server = Handshake::new(HandshakeRole::Server);
 
     let c0_and_c1 = client
         .generate_outbound_p0_and_p1()
@@ -74,7 +76,7 @@ fn full_handshake_completes_and_preserves_trailing_bytes() {
         .process_bytes(&c0_and_c1)
         .expect("server must accept C0+C1")
     {
-        HandshakeProcessResult::InProgress { response_bytes } => response_bytes,
+        HandshakeProgress::InProgress { response_bytes } => response_bytes,
         outcome => panic!("server must stay in progress after C0+C1: {outcome:?}"),
     };
     assert!(!s0_s1_and_s2.is_empty(), "server must answer with S0+S1+S2");
@@ -83,7 +85,7 @@ fn full_handshake_completes_and_preserves_trailing_bytes() {
         .process_bytes(&s0_s1_and_s2)
         .expect("client must accept S0+S1+S2")
     {
-        HandshakeProcessResult::Completed { response_bytes, .. } => response_bytes,
+        HandshakeProgress::Completed { response_bytes, .. } => response_bytes,
         outcome => panic!("client must complete after S0+S1+S2: {outcome:?}"),
     };
 
@@ -96,7 +98,7 @@ fn full_handshake_completes_and_preserves_trailing_bytes() {
         .process_bytes(&c2_plus_trailing)
         .expect("server must accept C2")
     {
-        HandshakeProcessResult::Completed {
+        HandshakeProgress::Completed {
             remaining_bytes, ..
         } => assert_eq!(
             remaining_bytes, trailing,

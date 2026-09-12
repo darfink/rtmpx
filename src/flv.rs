@@ -30,67 +30,89 @@ impl FlvError {
     }
 }
 
-struct Cursor<'a> {
-    raw: &'a Bytes,
+/// Byte storage accepted by the media parser. Implementations preserve slice contents.
+/// Use `Bytes` for owned contiguous views or `PayloadView` for borrowed segments.
+pub trait MediaData: crate::Segments + Clone + private::Sealed {
+    fn media_slice(&self, range: std::ops::Range<usize>) -> Self;
+}
+mod private {
+    pub trait Sealed {}
+    impl Sealed for bytes::Bytes {}
+    impl Sealed for crate::PayloadView<'_> {}
+}
+impl MediaData for Bytes {
+    fn media_slice(&self, range: std::ops::Range<usize>) -> Self {
+        self.slice(range)
+    }
+}
+impl MediaData for crate::PayloadView<'_> {
+    fn media_slice(&self, range: std::ops::Range<usize>) -> Self {
+        self.slice(range)
+    }
+}
+struct Cursor<P> {
+    raw: P,
     pos: usize,
 }
-
-impl<'a> Cursor<'a> {
-    fn new(raw: &'a Bytes) -> Self {
-        Self { raw, pos: 0 }
+impl<P: MediaData> Cursor<P> {
+    fn new(raw: &P) -> Self {
+        Self {
+            raw: raw.clone(),
+            pos: 0,
+        }
     }
-
     fn remaining(&self) -> usize {
-        self.raw.len().saturating_sub(self.pos)
+        self.raw.len() - self.pos
     }
-
     fn read_u8(&mut self) -> Result<u8, FlvError> {
-        if self.pos >= self.raw.len() {
+        if self.remaining() == 0 {
             return Err(FlvError::truncated());
         }
-        let byte = self.raw[self.pos];
+        if self.pos == self.raw.segment(0).len() {
+            self.commit();
+        }
+        let byte = self.raw.segment(0)[self.pos];
         self.pos += 1;
         Ok(byte)
     }
-
-    fn read_u16(&mut self) -> Result<u16, FlvError> {
-        let hi = u16::from(self.read_u8()?);
-        let lo = u16::from(self.read_u8()?);
-        Ok((hi << 8) | lo)
-    }
-
-    fn read_u24(&mut self) -> Result<u32, FlvError> {
-        let a = u32::from(self.read_u8()?);
-        let b = u32::from(self.read_u8()?);
-        let c = u32::from(self.read_u8()?);
-        Ok((a << 16) | (b << 8) | c)
-    }
-
-    fn read_i24(&mut self) -> Result<i32, FlvError> {
-        let value = self.read_u24()?;
-        Ok(sign_extend_cts(value))
-    }
-
-    fn read_fourcc(&mut self) -> Result<[u8; 4], FlvError> {
-        let mut fourcc = [0u8; 4];
-        for slot in fourcc.iter_mut() {
-            *slot = self.read_u8()?;
+    fn commit(&mut self) {
+        if self.pos != 0 {
+            self.raw = self.raw.media_slice(self.pos..self.raw.len());
+            self.pos = 0;
         }
-        Ok(fourcc)
     }
-
-    fn take(&mut self, len: usize) -> Result<Bytes, FlvError> {
+    fn read_u16(&mut self) -> Result<u16, FlvError> {
+        Ok((u16::from(self.read_u8()?) << 8) | u16::from(self.read_u8()?))
+    }
+    fn read_u24(&mut self) -> Result<u32, FlvError> {
+        Ok((u32::from(self.read_u8()?) << 16)
+            | (u32::from(self.read_u8()?) << 8)
+            | u32::from(self.read_u8()?))
+    }
+    fn read_i24(&mut self) -> Result<i32, FlvError> {
+        Ok(sign_extend_cts(self.read_u24()?))
+    }
+    fn read_fourcc(&mut self) -> Result<[u8; 4], FlvError> {
+        Ok([
+            self.read_u8()?,
+            self.read_u8()?,
+            self.read_u8()?,
+            self.read_u8()?,
+        ])
+    }
+    fn take(&mut self, len: usize) -> Result<P, FlvError> {
         if self.remaining() < len {
             return Err(FlvError::truncated());
         }
-        let bytes = self.raw.slice(self.pos..self.pos + len);
-        self.pos += len;
+        self.commit();
+        let bytes = self.raw.media_slice(0..len);
+        self.raw = self.raw.media_slice(len..self.raw.len());
         Ok(bytes)
     }
-
-    fn take_rest(&mut self) -> Bytes {
-        let bytes = self.raw.slice(self.pos..);
-        self.pos = self.raw.len();
+    fn take_rest(&mut self) -> P {
+        self.commit();
+        let bytes = self.raw.clone();
+        self.raw = self.raw.media_slice(self.raw.len()..self.raw.len());
         bytes
     }
 }
@@ -164,20 +186,20 @@ pub struct AudioFourCc(pub [u8; 4]);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VideoFourCc(pub [u8; 4]);
 
-/// Owned typed audio interpretation of one RTMP audio message body.
+/// Typed audio interpretation of one RTMP audio message body.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub struct ParsedAudio {
+pub struct ParsedAudio<P = Bytes> {
     pub header: AudioTagHeader,
-    pub body: AudioTagBody,
+    pub body: AudioTagBody<P>,
 }
 
-/// Owned typed video interpretation of one RTMP video message body.
+/// Typed video interpretation of one RTMP video message body.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub struct ParsedVideo {
+pub struct ParsedVideo<P = Bytes> {
     pub header: VideoTagHeader,
-    pub body: VideoTagBody,
+    pub body: VideoTagBody<P>,
 }
 
 /// Legacy or Enhanced audio tag header.
@@ -226,50 +248,50 @@ pub enum AudioHeaderContent {
 /// Legacy or Enhanced audio tag body.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub enum AudioTagBody {
-    Legacy(LegacyAudioBody),
-    Enhanced(EnhancedAudioBody),
+pub enum AudioTagBody<P = Bytes> {
+    Legacy(LegacyAudioBody<P>),
+    Enhanced(EnhancedAudioBody<P>),
 }
 
 /// Legacy FLV audio tag body.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub enum LegacyAudioBody {
-    AacSequenceHeader(Bytes),
-    AacRaw(Bytes),
-    AacUnknown { packet_type: u8, data: Bytes },
-    Other(Bytes),
+pub enum LegacyAudioBody<P = Bytes> {
+    AacSequenceHeader(P),
+    AacRaw(P),
+    AacUnknown { packet_type: u8, data: P },
+    Other(P),
 }
 
 /// Enhanced audio tag body: one packet or one per track.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub enum EnhancedAudioBody {
+pub enum EnhancedAudioBody<P = Bytes> {
     NoMultitrack {
         four_cc: AudioFourCc,
-        packet: AudioPacket,
+        packet: AudioPacket<P>,
     },
-    ManyTracks(Vec<AudioTrack>),
+    ManyTracks(Vec<AudioTrack<P>>),
 }
 
 /// One track of a multitrack Enhanced audio tag.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub struct AudioTrack {
+pub struct AudioTrack<P = Bytes> {
     pub four_cc: AudioFourCc,
     pub track_id: u8,
-    pub packet: AudioPacket,
+    pub packet: AudioPacket<P>,
 }
 
 /// Enhanced audio packet. Sequence-start bytes are raw slices of the input.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub enum AudioPacket {
-    SequenceStart(Bytes),
-    CodedFrames(Bytes),
+pub enum AudioPacket<P = Bytes> {
+    SequenceStart(P),
+    CodedFrames(P),
     SequenceEnd,
     MultichannelConfig { channel_count: u8 },
-    Unknown { packet_type: u8, data: Bytes },
+    Unknown { packet_type: u8, data: P },
 }
 
 /// Video tag header: frame type plus legacy or Enhanced data.
@@ -341,65 +363,65 @@ pub enum VideoHeaderContent {
 /// Legacy or Enhanced video tag body.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub enum VideoTagBody {
-    Legacy(LegacyVideoBody),
-    Enhanced(EnhancedVideoBody),
+pub enum VideoTagBody<P = Bytes> {
+    Legacy(LegacyVideoBody<P>),
+    Enhanced(EnhancedVideoBody<P>),
 }
 
 /// Legacy FLV video tag body.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub enum LegacyVideoBody {
+pub enum LegacyVideoBody<P = Bytes> {
     Command,
-    AvcSequenceHeader(Bytes),
-    Other(Bytes),
+    AvcSequenceHeader(P),
+    Other(P),
 }
 
 /// Enhanced video tag body: one packet, one per track, or a header command.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub enum EnhancedVideoBody {
+pub enum EnhancedVideoBody<P = Bytes> {
     Command,
     NoMultitrack {
         four_cc: VideoFourCc,
-        packet: VideoPacket,
+        packet: VideoPacket<P>,
     },
-    ManyTracks(Vec<VideoTrack>),
+    ManyTracks(Vec<VideoTrack<P>>),
 }
 
 /// One track of a multitrack Enhanced video tag.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub struct VideoTrack {
+pub struct VideoTrack<P = Bytes> {
     pub four_cc: VideoFourCc,
     pub track_id: u8,
-    pub packet: VideoPacket,
+    pub packet: VideoPacket<P>,
 }
 
 /// Enhanced video packet. Payloads are raw slices of the input; sequence-start
 /// records are validated structurally but never re-serialized.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub enum VideoPacket {
-    SequenceStart(Bytes),
-    Mpeg2TsSequenceStart(Bytes),
+pub enum VideoPacket<P = Bytes> {
+    SequenceStart(P),
+    Mpeg2TsSequenceStart(P),
     CodedFrames {
         composition_time_offset: i32,
-        data: Bytes,
+        data: P,
     },
-    CodedFramesX(Bytes),
-    Metadata(Bytes),
+    CodedFramesX(P),
+    Metadata(P),
     SequenceEnd,
     Unknown {
         packet_type: u8,
-        data: Bytes,
+        data: P,
     },
 }
 
-impl ParsedAudio {
+impl<P: MediaData> ParsedAudio<P> {
     /// Demux one RTMP audio message body. Empty or truncated input is an
     /// error, never a panic; trailing bytes follow the legacy rules below.
-    pub fn demux(raw: &Bytes) -> Result<Self, FlvError> {
+    pub fn demux(raw: &P) -> Result<Self, FlvError> {
         let mut cursor = Cursor::new(raw);
         let first = cursor.read_u8()?;
         let sound_format = first >> 4;
@@ -436,10 +458,10 @@ impl ParsedAudio {
     }
 }
 
-impl ParsedVideo {
+impl<P: MediaData> ParsedVideo<P> {
     /// Demux one RTMP video message body. Empty or truncated input is an
     /// error, never a panic; trailing bytes follow the legacy rules below.
-    pub fn demux(raw: &Bytes) -> Result<Self, FlvError> {
+    pub fn demux(raw: &P) -> Result<Self, FlvError> {
         let mut cursor = Cursor::new(raw);
         let first = cursor.read_u8()?;
         let frame_type = (first >> 4) & 0x07;
@@ -504,7 +526,7 @@ impl ParsedVideo {
 /// Resolve the audio packet type through the ModEx chain. Returns the final
 /// packet type and whether any extension had an unknown type. The nano-offset
 /// extension is length-checked and otherwise ignored.
-fn read_audio_modex(cursor: &mut Cursor<'_>) -> Result<(bool, u8), FlvError> {
+fn read_audio_modex<P: MediaData>(cursor: &mut Cursor<P>) -> Result<(bool, u8), FlvError> {
     let mut size = usize::from(cursor.read_u8()?) + 1;
     if size == 256 {
         size = usize::from(cursor.read_u16()?) + 1;
@@ -524,7 +546,7 @@ fn read_audio_modex(cursor: &mut Cursor<'_>) -> Result<(bool, u8), FlvError> {
 }
 
 /// Resolve the video packet type through the ModEx chain. See read_audio_modex.
-fn read_video_modex(cursor: &mut Cursor<'_>) -> Result<(bool, u8), FlvError> {
+fn read_video_modex<P: MediaData>(cursor: &mut Cursor<P>) -> Result<(bool, u8), FlvError> {
     let mut size = usize::from(cursor.read_u8()?) + 1;
     if size == 256 {
         size = usize::from(cursor.read_u16()?) + 1;
@@ -543,8 +565,8 @@ fn read_video_modex(cursor: &mut Cursor<'_>) -> Result<(bool, u8), FlvError> {
     }
 }
 
-fn enhanced_audio_header(
-    cursor: &mut Cursor<'_>,
+fn enhanced_audio_header<P: MediaData>(
+    cursor: &mut Cursor<P>,
     initial: u8,
 ) -> Result<EnhancedAudioHeader, FlvError> {
     let mut packet_type = initial;
@@ -585,8 +607,8 @@ fn enhanced_audio_header(
     })
 }
 
-fn enhanced_video_header(
-    cursor: &mut Cursor<'_>,
+fn enhanced_video_header<P: MediaData>(
+    cursor: &mut Cursor<P>,
     frame_type: u8,
     initial: u8,
 ) -> Result<EnhancedVideoHeader, FlvError> {
@@ -632,17 +654,17 @@ fn enhanced_video_header(
 
 /// Take a packet payload: exactly the u24 size prefix for multitrack tracks,
 /// otherwise everything that remains.
-fn sized_payload(cursor: &mut Cursor<'_>, size: Option<usize>) -> Result<Bytes, FlvError> {
+fn sized_payload<P: MediaData>(cursor: &mut Cursor<P>, size: Option<usize>) -> Result<P, FlvError> {
     match size {
         Some(len) => cursor.take(len),
         None => Ok(cursor.take_rest()),
     }
 }
 
-fn enhanced_audio_body(
+fn enhanced_audio_body<P: MediaData>(
     header: &EnhancedAudioHeader,
-    cursor: &mut Cursor<'_>,
-) -> Result<EnhancedAudioBody, FlvError> {
+    cursor: &mut Cursor<P>,
+) -> Result<EnhancedAudioBody<P>, FlvError> {
     if let AudioHeaderContent::NoMultitrack(four_cc) = header.content {
         let packet = audio_packet(header.packet_type, false, cursor)?;
         return Ok(EnhancedAudioBody::NoMultitrack { four_cc, packet });
@@ -677,11 +699,11 @@ fn enhanced_audio_body(
     Ok(EnhancedAudioBody::ManyTracks(tracks))
 }
 
-fn audio_packet(
+fn audio_packet<P: MediaData>(
     packet_type: u8,
     sized: bool,
-    cursor: &mut Cursor<'_>,
-) -> Result<AudioPacket, FlvError> {
+    cursor: &mut Cursor<P>,
+) -> Result<AudioPacket<P>, FlvError> {
     // The multitrack size prefix is consumed up front even for packet types
     // that ignore it, matching the reference demuxer.
     let size = if sized {
@@ -716,10 +738,10 @@ fn audio_packet(
     }
 }
 
-fn enhanced_video_body(
+fn enhanced_video_body<P: MediaData>(
     header: &EnhancedVideoHeader,
-    cursor: &mut Cursor<'_>,
-) -> Result<EnhancedVideoBody, FlvError> {
+    cursor: &mut Cursor<P>,
+) -> Result<EnhancedVideoBody<P>, FlvError> {
     if matches!(header.content, VideoHeaderContent::VideoCommand(_)) {
         return Ok(EnhancedVideoBody::Command);
     }
@@ -757,12 +779,12 @@ fn enhanced_video_body(
     Ok(EnhancedVideoBody::ManyTracks(tracks))
 }
 
-fn video_packet(
+fn video_packet<P: MediaData>(
     packet_type: u8,
     four_cc: VideoFourCc,
     sized: bool,
-    cursor: &mut Cursor<'_>,
-) -> Result<VideoPacket, FlvError> {
+    cursor: &mut Cursor<P>,
+) -> Result<VideoPacket<P>, FlvError> {
     // The multitrack size prefix is consumed up front even for packet types
     // that ignore it, matching the reference demuxer.
     let size = if sized {
@@ -815,8 +837,8 @@ fn video_packet(
 
 /// Structural check for an AVC decoder configuration record (avcC): version
 /// byte plus a plausible length. The record is forwarded raw, never decoded.
-fn validate_avc_decoder_config(data: &[u8]) -> Result<(), FlvError> {
-    if data.len() < 7 || data[0] != 1 {
+fn validate_avc_decoder_config<P: MediaData>(data: &P) -> Result<(), FlvError> {
+    if data.len() < 7 || data.segment(0)[0] != 1 {
         return Err(FlvError(
             "invalid AVC decoder configuration record".to_owned(),
         ));
@@ -825,8 +847,8 @@ fn validate_avc_decoder_config(data: &[u8]) -> Result<(), FlvError> {
 }
 
 /// Structural check for an HEVC decoder configuration record (hvcC).
-fn validate_hevc_decoder_config(data: &[u8]) -> Result<(), FlvError> {
-    if data.len() < 23 || data[0] != 1 {
+fn validate_hevc_decoder_config<P: MediaData>(data: &P) -> Result<(), FlvError> {
+    if data.len() < 23 || data.segment(0)[0] != 1 {
         return Err(FlvError(
             "invalid HEVC decoder configuration record".to_owned(),
         ));
@@ -836,8 +858,8 @@ fn validate_hevc_decoder_config(data: &[u8]) -> Result<(), FlvError> {
 
 /// Structural check for an AV1 codec configuration record (av1C): marker bit
 /// plus a plausible length.
-fn validate_av1_decoder_config(data: &[u8]) -> Result<(), FlvError> {
-    if data.len() < 4 || data[0] & 0x80 == 0 {
+fn validate_av1_decoder_config<P: MediaData>(data: &P) -> Result<(), FlvError> {
+    if data.len() < 4 || data.segment(0)[0] & 0x80 == 0 {
         return Err(FlvError(
             "invalid AV1 codec configuration record".to_owned(),
         ));

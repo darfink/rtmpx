@@ -1,4 +1,4 @@
-use super::PublishRequestType;
+use super::PublishMode;
 
 pub enum TransactionPurpose {
     PlayRequest {
@@ -7,12 +7,17 @@ pub enum TransactionPurpose {
 
     PublishRequest {
         stream_key: String,
-        request_type: PublishRequestType,
+        request_type: PublishMode,
     },
 }
 
 pub enum OutstandingTransaction {
-    ConnectionRequested { app_name: String },
+    ConnectionRequested {
+        app_name: String,
+    },
 
-    CreateStream { purpose: TransactionPurpose },
+    CreateStream {
+        stream: crate::sessions::StreamHandle,
+        purpose: TransactionPurpose,
+    },
 }

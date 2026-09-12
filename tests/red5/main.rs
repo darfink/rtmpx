@@ -11,18 +11,21 @@
 //! has no Enhanced media path, so they assert the connection survives and log
 //! what Red5 did with the bytes.
 
+#[path = "../support/api.rs"]
+mod api;
 #[path = "../common/mod.rs"]
 mod common;
 mod fixtures;
 mod harness;
+mod lifecycle;
 
+use crate::api::amf::AmfEncoding;
+use crate::api::amf0::{Amf0Object, Amf0Value};
+use crate::api::sessions::ClientSessionEvent;
 use common::driver::Peer;
 use common::{Result, legacy_metadata, run, stream_key};
 use fixtures::*;
 use harness::{object_encoding_of, red5_endpoint};
-use rtmpx::amf::AmfEncoding;
-use rtmpx::amf0::{Amf0Object, Amf0Value};
-use rtmpx::sessions::ClientSessionEvent;
 
 /// Red5 answers `connect` with a type-20 `_result` whose command object is
 /// always null: the `objectEncoding` confirmation (when present) lives in the
@@ -245,7 +248,7 @@ async fn amf3_script_data_body() -> Result<()> {
             return Err("player never saw the AMF3 @setDataFrame probe".to_string());
         }
         for event in play.next_events().await? {
-            if let ClientSessionEvent::StreamMetadataReceived { message, .. } = event {
+            if let ClientSessionEvent::StreamDataReceived { message, .. } = event {
                 let bytes = message.payload().to_vec();
                 let marker = b"rtmpxRed5Probe";
                 assert!(

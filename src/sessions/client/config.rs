@@ -1,9 +1,8 @@
 use crate::amf::AmfEncoding;
-use crate::chunk_io::ChunkDeserializerConfig;
+use crate::chunk_io::DecoderLimits;
 
 /// Configuration options that govern how a RTMP client session should operate
 #[derive(Clone)]
-#[non_exhaustive]
 pub struct ClientSessionConfig {
     pub flash_version: String,
     pub playback_buffer_length_ms: u32,
@@ -17,8 +16,12 @@ pub struct ClientSessionConfig {
     /// RTMP peer supports; ask for [`AmfEncoding::Amf3`] only when the far side
     /// is known to want it, since most servers ignore or refuse it.
     pub object_encoding: AmfEncoding,
+    /// Optional shared cache of payload descriptors.
+    pub payload_pool: Option<crate::PayloadPool>,
     /// Limits for untrusted inbound chunk state.
-    pub chunk_deserializer: ChunkDeserializerConfig,
+    pub decoder_limits: DecoderLimits,
+    /// Bounds for live streams and pending requests.
+    pub session_limits: crate::sessions::SessionLimits,
 }
 
 impl ClientSessionConfig {
@@ -31,7 +34,9 @@ impl ClientSessionConfig {
             chunk_size: 4096,
             tc_url: None,
             object_encoding: AmfEncoding::Amf0,
-            chunk_deserializer: ChunkDeserializerConfig::default(),
+            payload_pool: None,
+            decoder_limits: DecoderLimits::default(),
+            session_limits: crate::sessions::SessionLimits::default(),
         }
     }
 }
@@ -73,9 +78,17 @@ impl ClientSessionConfig {
         self.object_encoding = value;
         self
     }
-    /// Set `chunk_deserializer`.
-    pub fn with_chunk_deserializer(mut self, value: ChunkDeserializerConfig) -> Self {
-        self.chunk_deserializer = value;
+    /// Set `decoder_limits`.
+    pub fn with_decoder_limits(mut self, value: DecoderLimits) -> Self {
+        self.decoder_limits = value;
+        self
+    }
+}
+
+impl ClientSessionConfig {
+    /// Set the bounds for live streams and pending requests.
+    pub fn with_session_limits(mut self, limits: crate::sessions::SessionLimits) -> Self {
+        self.session_limits = limits;
         self
     }
 }

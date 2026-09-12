@@ -6,7 +6,9 @@ use thiserror::Error;
 /// RTMP chunks.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum ChunkDeserializationError {
+pub enum DecodeError {
+    #[error("Chunk stream {csid} changed message identity before completing it")]
+    InvalidContinuation { csid: u32 },
     /// The RTMP chunk format requires that RTMP chunks that are not type 0 utilize information
     /// from the previously received chunk on that same chunk stream id.  This error occurs when a
     /// non-0 chunk is received on a stream that has not received a type 0 chunk yet.

@@ -1,9 +1,7 @@
 use super::PublishMode;
 use crate::amf0::Amf0Value;
-use crate::sessions::StreamMetadata;
-use crate::sessions::{DataMessage, RequestId, StreamId};
+use crate::sessions::{DataMessage, RequestId, StreamHandle, StreamId};
 use crate::time::RtmpTimestamp;
-use bytes::Bytes;
 use std::sync::Arc;
 
 /// Represents where RTMP playback should start from
@@ -24,13 +22,11 @@ pub enum PlayStartValue {
 /// An event that a server session can raise
 #[derive(Debug, PartialEq, Clone)]
 #[non_exhaustive]
-pub enum ServerSessionEvent {
+pub enum ServerEvent<D = crate::Payload> {
     /// The client is changing the maximum size of the RTMP chunks they will be sending
-    #[non_exhaustive]
     ClientChunkSizeChanged { new_chunk_size: u32 },
 
     /// The client is requesting a connection on the specified RTMP application name
-    #[non_exhaustive]
     ConnectionRequested {
         request_id: RequestId,
         app_name: Arc<str>,
@@ -45,7 +41,6 @@ pub enum ServerSessionEvent {
     },
 
     /// The client is requesting a stream key be released for use.
-    #[non_exhaustive]
     ReleaseStreamRequested {
         request_id: RequestId,
         app_name: Arc<str>,
@@ -53,8 +48,8 @@ pub enum ServerSessionEvent {
     },
 
     /// The client is requesting the ability to publish on the specified stream key,
-    #[non_exhaustive]
     PublishStreamRequested {
+        stream: StreamHandle,
         request_id: RequestId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
@@ -63,59 +58,48 @@ pub enum ServerSessionEvent {
     },
 
     /// The client is finished publishing on the specified stream key
-    #[non_exhaustive]
     PublishStreamFinished {
+        stream: StreamHandle,
         stream_id: StreamId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
     },
 
-    /// The client is changing metadata properties of the stream being published
-    #[non_exhaustive]
-    StreamMetadataChanged {
-        stream_id: StreamId,
-        app_name: Arc<str>,
-        stream_key: Arc<str>,
-        metadata: StreamMetadata,
-        message: DataMessage,
-    },
-
-    /// Script data other than recognized metadata, including undecodable bodies.
+    /// Encoded script data, including metadata, captions, and undecodable bodies.
     ///
     /// The raw encoded payload is carried so relays can preserve events such as
     /// `onCaption` without decoding and re-encoding their application-specific
     /// fields.
-    #[non_exhaustive]
     StreamDataReceived {
+        stream: StreamHandle,
         stream_id: StreamId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
-        message: DataMessage,
+        message: DataMessage<D>,
     },
 
     /// Audio data was received from the client
-    #[non_exhaustive]
     AudioDataReceived {
+        stream: StreamHandle,
         stream_id: StreamId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
-        data: Bytes,
+        data: D,
         timestamp: RtmpTimestamp,
     },
 
     /// Video data received from the client
-    #[non_exhaustive]
     VideoDataReceived {
+        stream: StreamHandle,
         stream_id: StreamId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
-        data: Bytes,
+        data: D,
         timestamp: RtmpTimestamp,
     },
 
-    /// The client sent an Amf0 command that was not able to be handled
-    #[non_exhaustive]
-    UnhandleableAmf0Command {
+    /// The client sent a command that the session could not handle
+    UnhandledCommand {
         stream_id: StreamId,
         command_name: String,
         transaction_id: f64,
@@ -124,8 +108,8 @@ pub enum ServerSessionEvent {
     },
 
     /// The client is requesting playback of the specified stream
-    #[non_exhaustive]
     PlayStreamRequested {
+        stream: StreamHandle,
         request_id: RequestId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
@@ -136,18 +120,163 @@ pub enum ServerSessionEvent {
     },
 
     /// The client is finished with playback of the specified stream
-    #[non_exhaustive]
     PlayStreamFinished {
+        stream: StreamHandle,
         stream_id: StreamId,
         app_name: Arc<str>,
         stream_key: Arc<str>,
     },
 
     /// The client has sent an acknowledgement that they have received the specified number of bytes
-    #[non_exhaustive]
     AcknowledgementReceived { bytes_received: u32 },
 
     /// The client has responded to a ping request
-    #[non_exhaustive]
     PingResponseReceived { timestamp: RtmpTimestamp },
+}
+
+impl<D> ServerEvent<D> {
+    /// Transform media and script-data storage without changing event semantics.
+    pub fn map_payload<T>(self, mut map: impl FnMut(D) -> T) -> ServerEvent<T> {
+        match self {
+            Self::ClientChunkSizeChanged { new_chunk_size } => {
+                ServerEvent::ClientChunkSizeChanged { new_chunk_size }
+            }
+            Self::ConnectionRequested {
+                request_id,
+                app_name,
+                additional_properties,
+            } => ServerEvent::ConnectionRequested {
+                request_id,
+                app_name,
+                additional_properties,
+            },
+            Self::ReleaseStreamRequested {
+                request_id,
+                app_name,
+                stream_key,
+            } => ServerEvent::ReleaseStreamRequested {
+                request_id,
+                app_name,
+                stream_key,
+            },
+            Self::PublishStreamRequested {
+                stream,
+                request_id,
+                app_name,
+                stream_key,
+                mode,
+                stream_id,
+            } => ServerEvent::PublishStreamRequested {
+                stream,
+                request_id,
+                app_name,
+                stream_key,
+                mode,
+                stream_id,
+            },
+            Self::PublishStreamFinished {
+                stream,
+                stream_id,
+                app_name,
+                stream_key,
+            } => ServerEvent::PublishStreamFinished {
+                stream,
+                stream_id,
+                app_name,
+                stream_key,
+            },
+            Self::StreamDataReceived {
+                stream,
+                stream_id,
+                app_name,
+                stream_key,
+                message,
+            } => ServerEvent::StreamDataReceived {
+                stream,
+                stream_id,
+                app_name,
+                stream_key,
+                message: message.map_payload(&mut map),
+            },
+            Self::AudioDataReceived {
+                stream,
+                stream_id,
+                app_name,
+                stream_key,
+                data,
+                timestamp,
+            } => ServerEvent::AudioDataReceived {
+                stream,
+                stream_id,
+                app_name,
+                stream_key,
+                data: map(data),
+                timestamp,
+            },
+            Self::VideoDataReceived {
+                stream,
+                stream_id,
+                app_name,
+                stream_key,
+                data,
+                timestamp,
+            } => ServerEvent::VideoDataReceived {
+                stream,
+                stream_id,
+                app_name,
+                stream_key,
+                data: map(data),
+                timestamp,
+            },
+            Self::UnhandledCommand {
+                stream_id,
+                command_name,
+                transaction_id,
+                command_object,
+                additional_values,
+            } => ServerEvent::UnhandledCommand {
+                stream_id,
+                command_name,
+                transaction_id,
+                command_object,
+                additional_values,
+            },
+            Self::PlayStreamRequested {
+                stream,
+                request_id,
+                app_name,
+                stream_key,
+                start_at,
+                duration,
+                reset,
+                stream_id,
+            } => ServerEvent::PlayStreamRequested {
+                stream,
+                request_id,
+                app_name,
+                stream_key,
+                start_at,
+                duration,
+                reset,
+                stream_id,
+            },
+            Self::PlayStreamFinished {
+                stream,
+                stream_id,
+                app_name,
+                stream_key,
+            } => ServerEvent::PlayStreamFinished {
+                stream,
+                stream_id,
+                app_name,
+                stream_key,
+            },
+            Self::AcknowledgementReceived { bytes_received } => {
+                ServerEvent::AcknowledgementReceived { bytes_received }
+            }
+            Self::PingResponseReceived { timestamp } => {
+                ServerEvent::PingResponseReceived { timestamp }
+            }
+        }
+    }
 }

@@ -1,7 +1,8 @@
 use super::*;
 use crate::amf0::{Amf0Object, Amf0Value};
-use crate::chunk_io::{ChunkDeserializer, ChunkSerializer, Packet};
-use crate::messages::{MessagePayload, RtmpMessage, UserControlEventType};
+use crate::api::sessions::{ClientSession, ClientSessionEvent, ClientSessionResult};
+use crate::chunk_io::{ChunkEncoder, ContiguousDecoder, Packet};
+use crate::messages::{RawMessage, RtmpMessage, UserControlEventType};
 use bytes::Bytes;
 use bytes::BytesMut;
 use rand;
@@ -12,8 +13,8 @@ fn new_session_and_successful_connect_creates_set_chunk_size_message() {
     let mut config = ClientSessionConfig::new();
     config.chunk_size = 1111;
 
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -25,7 +26,7 @@ fn new_session_and_successful_connect_creates_set_chunk_size_message() {
     );
 
     assert_eq!(
-        deserializer.get_max_chunk_size(),
+        deserializer.chunk_size(),
         1111,
         "Incorrect deserializer default chunk size"
     );
@@ -35,7 +36,7 @@ fn new_session_and_successful_connect_creates_set_chunk_size_message() {
 fn can_send_connect_request() {
     let app_name = "test".to_string();
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
+    let mut deserializer = ContiguousDecoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -103,7 +104,7 @@ fn can_send_connect_request_with_tc_url() {
     let tc_url = "rtmp://1.2.3.4:1935/app".to_string();
     config.tc_url = Some(tc_url.clone());
 
-    let mut deserializer = ChunkDeserializer::new();
+    let mut deserializer = ContiguousDecoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -173,8 +174,8 @@ fn can_send_connect_request_with_tc_url() {
 fn can_process_connect_success_response() {
     let app_name = "test".to_string();
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -182,7 +183,7 @@ fn can_process_connect_success_response() {
     consume_results(&mut deserializer, vec![results]);
 
     let response = get_connect_success_response(&mut serializer);
-    let results = session.handle_input(&response.bytes[..]).unwrap();
+    let results = session.handle_input(&response.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Expected one event returned");
@@ -199,8 +200,8 @@ fn can_process_connect_success_response() {
 fn event_raised_when_connect_request_rejected() {
     let app_name = "test".to_string();
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -208,7 +209,7 @@ fn event_raised_when_connect_request_rejected() {
     consume_results(&mut deserializer, vec![results]);
 
     let response = get_connect_error_response(&mut serializer);
-    let results = session.handle_input(&response.bytes[..]).unwrap();
+    let results = session.handle_input(&response.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Expected one event returned");
@@ -228,8 +229,8 @@ fn event_raised_when_connect_request_rejected() {
 fn error_thrown_when_connect_request_made_after_successful_connection() {
     let app_name = "test".to_string();
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -237,7 +238,7 @@ fn error_thrown_when_connect_request_made_after_successful_connection() {
     consume_results(&mut deserializer, vec![results]);
 
     let response = get_connect_success_response(&mut serializer);
-    let results = session.handle_input(&response.bytes[..]).unwrap();
+    let results = session.handle_input(&response.to_vec()[..]).unwrap();
     consume_results(&mut deserializer, results);
 
     let error = session.request_connection(app_name.clone()).unwrap_err();
@@ -254,8 +255,8 @@ fn error_thrown_when_connect_request_made_after_successful_connection() {
 fn successful_connect_request_sends_window_ack_size() {
     let app_name = "test".to_string();
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -263,7 +264,7 @@ fn successful_connect_request_sends_window_ack_size() {
     consume_results(&mut deserializer, vec![results]);
 
     let response = get_connect_success_response(&mut serializer);
-    let results = session.handle_input(&response.bytes[..]).unwrap();
+    let results = session.handle_input(&response.to_vec()[..]).unwrap();
     let (mut responses, _) = split_results(&mut deserializer, results);
 
     assert_eq!(
@@ -293,8 +294,8 @@ fn successful_play_request_workflow() {
     let app_name = "test".to_string();
     let stream_key = "test-key".to_string();
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -336,7 +337,7 @@ fn successful_play_request_workflow() {
     let (created_stream_id, create_stream_response) =
         get_create_stream_success_response(transaction_id, &mut serializer);
     let results = session
-        .handle_input(&create_stream_response.bytes[..])
+        .handle_input(&create_stream_response.to_vec()[..])
         .unwrap();
     let (mut responses, _) = split_results(&mut deserializer, results);
 
@@ -414,7 +415,7 @@ fn successful_play_request_workflow() {
     };
 
     let play_response = get_play_success_response(&mut serializer, created_stream_id);
-    let results = session.handle_input(&play_response.bytes[..]).unwrap();
+    let results = session.handle_input(&play_response.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Expected one event returned");
@@ -430,8 +431,8 @@ fn successful_play_request_workflow() {
 #[test]
 fn active_play_session_raises_events_when_stream_metadata_changes() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -469,15 +470,16 @@ fn active_play_session_raises_events_when_stream_metadata_changes() {
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events received");
     match events.remove(0) {
-        ClientSessionEvent::StreamMetadataReceived { metadata, .. } => {
+        ClientSessionEvent::StreamDataReceived { message, .. } => {
+            let metadata = crate::api::sessions::metadata(&message);
             assert_eq!(metadata.video_width, Some(1920), "Unexpected video width");
             assert_eq!(metadata.video_height, Some(1080), "Unexpected video height");
             assert_eq!(metadata.video_codec_id, Some(10), "Unexpected video codec");
@@ -532,8 +534,8 @@ fn active_play_session_unwraps_set_data_frame_metadata() {
     // that framing through); the player must unwrap it into a metadata
     // event instead of ignoring it.
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -562,15 +564,16 @@ fn active_play_session_unwraps_set_data_frame_metadata() {
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events received");
     match events.remove(0) {
-        ClientSessionEvent::StreamMetadataReceived { metadata, .. } => {
+        ClientSessionEvent::StreamDataReceived { message, .. } => {
+            let metadata = crate::api::sessions::metadata(&message);
             assert_eq!(metadata.video_width, Some(1920), "Unexpected video width");
             assert_eq!(
                 metadata.encoder,
@@ -589,8 +592,8 @@ fn active_play_session_unwraps_set_data_frame_metadata() {
 #[test]
 fn active_play_session_raises_events_when_video_data_received() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -608,10 +611,10 @@ fn active_play_session_raises_events_when_video_data_received() {
         data: video_data.clone(),
     };
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(1234), stream_id)
+        .into_raw_message(RtmpTimestamp::new(1234), stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events received");
@@ -633,8 +636,8 @@ fn active_play_session_raises_events_when_video_data_received() {
 #[test]
 fn active_play_session_raises_events_when_audio_data_received() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -652,10 +655,10 @@ fn active_play_session_raises_events_when_audio_data_received() {
         data: audio_data.clone(),
     };
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(1234), stream_id)
+        .into_raw_message(RtmpTimestamp::new(1234), stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events received");
@@ -679,8 +682,8 @@ fn can_receive_audio_data_prior_to_play_request_being_accepted() {
     let app_name = "test".to_string();
     let stream_key = "test-key".to_string();
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -722,7 +725,7 @@ fn can_receive_audio_data_prior_to_play_request_being_accepted() {
     let (created_stream_id, create_stream_response) =
         get_create_stream_success_response(transaction_id, &mut serializer);
     let results = session
-        .handle_input(&create_stream_response.bytes[..])
+        .handle_input(&create_stream_response.to_vec()[..])
         .unwrap();
     let (mut responses, _) = split_results(&mut deserializer, results);
 
@@ -804,10 +807,10 @@ fn can_receive_audio_data_prior_to_play_request_being_accepted() {
         data: audio_data.clone(),
     };
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(1234), created_stream_id)
+        .into_raw_message(RtmpTimestamp::new(1234), created_stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events received");
@@ -831,8 +834,8 @@ fn can_receive_video_data_prior_to_play_request_being_accepted() {
     let app_name = "test".to_string();
     let stream_key = "test-key".to_string();
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -874,7 +877,7 @@ fn can_receive_video_data_prior_to_play_request_being_accepted() {
     let (created_stream_id, create_stream_response) =
         get_create_stream_success_response(transaction_id, &mut serializer);
     let results = session
-        .handle_input(&create_stream_response.bytes[..])
+        .handle_input(&create_stream_response.to_vec()[..])
         .unwrap();
     let (mut responses, _) = split_results(&mut deserializer, results);
 
@@ -956,10 +959,10 @@ fn can_receive_video_data_prior_to_play_request_being_accepted() {
         data: video_data.clone(),
     };
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(1234), created_stream_id)
+        .into_raw_message(RtmpTimestamp::new(1234), created_stream_id)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events received");
@@ -981,8 +984,8 @@ fn can_receive_video_data_prior_to_play_request_being_accepted() {
 #[test]
 fn can_stop_playback() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -1009,10 +1012,7 @@ fn can_stop_playback() {
                 additional_arguments,
             },
         ) => {
-            assert_eq!(
-                payload.message_stream_id, stream_id,
-                "Unexpected message stream id"
-            );
+            assert_eq!(payload.message_stream_id, 0, "Unexpected message stream id");
             assert_eq!(command_name, "deleteStream", "Unexpected command name");
             assert_eq!(command_object, Amf0Value::Null, "Unexpected command object");
             assert_eq!(
@@ -1035,8 +1035,8 @@ fn can_stop_playback() {
 #[test]
 fn automatically_responds_to_ping_requests() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -1055,10 +1055,10 @@ fn automatically_responds_to_ping_requests() {
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(6000), 0)
+        .into_raw_message(RtmpTimestamp::new(6000), 0)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (mut responses, _) = split_results(&mut deserializer, results);
 
     assert_eq!(
@@ -1091,8 +1091,8 @@ fn automatically_responds_to_ping_requests() {
 #[test]
 fn event_raised_when_ping_response_received() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -1111,10 +1111,10 @@ fn event_raised_when_ping_response_received() {
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(6000), 0)
+        .into_raw_message(RtmpTimestamp::new(6000), 0)
         .unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "One event expected");
@@ -1134,8 +1134,8 @@ fn event_raised_when_ping_response_received() {
 #[test]
 fn can_send_ping_request() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -1148,7 +1148,7 @@ fn can_send_ping_request() {
 
     let (packet, sent_timestamp) = session.send_ping_request().unwrap();
     let payload = deserializer
-        .get_next_message(&packet.bytes[..])
+        .get_next_message(&packet.to_vec()[..])
         .unwrap()
         .unwrap();
     let message = payload.to_rtmp_message().unwrap();
@@ -1178,8 +1178,8 @@ fn can_send_ping_request() {
 #[test]
 fn sends_ack_after_receiving_window_ack_bytes() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -1194,12 +1194,14 @@ fn sends_ack_after_receiving_window_ack_bytes() {
 
     let window_ack_message = RtmpMessage::WindowAcknowledgement { size: 100 };
     let window_ack_payload = window_ack_message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .unwrap();
     let window_ack_packet = serializer
         .serialize(&window_ack_payload, false, false)
         .unwrap();
-    let results = session.handle_input(&window_ack_packet.bytes[..]).unwrap();
+    let results = session
+        .handle_input(&window_ack_packet.to_vec()[..])
+        .unwrap();
     consume_results(&mut deserializer, results);
 
     let mut bytes = BytesMut::new();
@@ -1208,10 +1210,10 @@ fn sends_ack_after_receiving_window_ack_bytes() {
         data: bytes.freeze(),
     };
     let video_payload = video_message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .unwrap();
     let video_packet = serializer.serialize(&video_payload, false, false).unwrap();
-    let results = session.handle_input(&video_packet.bytes[..]).unwrap();
+    let results = session.handle_input(&video_packet.to_vec()[..]).unwrap();
     let (mut responses, _) = split_results(&mut deserializer, results);
 
     assert_eq!(responses.len(), 1, "Unexpected number of responses");
@@ -1226,10 +1228,10 @@ fn sends_ack_after_receiving_window_ack_bytes() {
         data: bytes.freeze(),
     };
     let video_payload = video_message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .unwrap();
     let video_packet = serializer.serialize(&video_payload, false, false).unwrap();
-    let results = session.handle_input(&video_packet.bytes[..]).unwrap();
+    let results = session.handle_input(&video_packet.to_vec()[..]).unwrap();
     let (responses, _) = split_results(&mut deserializer, results);
     assert_eq!(responses.len(), 0, "Expected no responses");
 
@@ -1239,10 +1241,10 @@ fn sends_ack_after_receiving_window_ack_bytes() {
         data: bytes.freeze(),
     };
     let video_payload = video_message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .unwrap();
     let video_packet = serializer.serialize(&video_payload, false, false).unwrap();
-    let results = session.handle_input(&video_packet.bytes[..]).unwrap();
+    let results = session.handle_input(&video_packet.to_vec()[..]).unwrap();
     let (mut responses, _) = split_results(&mut deserializer, results);
     assert_eq!(responses.len(), 1, "Unexpected number of responses");
     match responses.remove(0) {
@@ -1254,8 +1256,8 @@ fn sends_ack_after_receiving_window_ack_bytes() {
 #[test]
 fn event_raised_when_server_sends_an_acknowledgement() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -1269,11 +1271,9 @@ fn event_raised_when_server_sends_an_acknowledgement() {
     let message = RtmpMessage::Acknowledgement {
         sequence_number: 1234,
     };
-    let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
-        .unwrap();
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
-    let results = session.handle_input(&packet.bytes[..]).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events");
@@ -1296,8 +1296,8 @@ fn event_raised_when_server_sends_an_acknowledgement() {
 fn successful_publish_request_workflow() {
     let stream_key = "test-key".to_string();
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -1309,7 +1309,7 @@ fn successful_publish_request_workflow() {
     );
 
     let result = session
-        .request_publishing(stream_key.clone(), PublishRequestType::Live)
+        .request_publishing(stream_key.clone(), PublishMode::Live)
         .unwrap();
     let (mut responses, _) = split_results(&mut deserializer, vec![result]);
 
@@ -1341,7 +1341,7 @@ fn successful_publish_request_workflow() {
     let (created_stream_id, create_stream_response) =
         get_create_stream_success_response(transaction_id, &mut serializer);
     let results = session
-        .handle_input(&create_stream_response.bytes[..])
+        .handle_input(&create_stream_response.to_vec()[..])
         .unwrap();
     let (mut responses, _) = split_results(&mut deserializer, results);
 
@@ -1385,7 +1385,9 @@ fn successful_publish_request_workflow() {
     };
 
     let publish_response = get_publish_success_response(&mut serializer, created_stream_id);
-    let results = session.handle_input(&publish_response.bytes[..]).unwrap();
+    let results = session
+        .handle_input(&publish_response.to_vec()[..])
+        .unwrap();
     let (_, mut events) = split_results(&mut deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events");
@@ -1401,8 +1403,8 @@ fn successful_publish_request_workflow() {
 #[test]
 fn publisher_can_send_metadata() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -1525,8 +1527,8 @@ fn publisher_can_send_metadata() {
 #[test]
 fn publisher_can_send_video_data() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -1567,8 +1569,8 @@ fn publisher_can_send_video_data() {
 #[test]
 fn publisher_can_send_audio_data() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -1609,8 +1611,8 @@ fn publisher_can_send_audio_data() {
 #[test]
 fn can_stop_publishing() {
     let config = ClientSessionConfig::new();
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     let (mut session, initial_results) = ClientSession::new(config.clone()).unwrap();
     consume_results(&mut deserializer, initial_results);
 
@@ -1637,10 +1639,7 @@ fn can_stop_publishing() {
                 additional_arguments,
             },
         ) => {
-            assert_eq!(
-                payload.message_stream_id, stream_id,
-                "Unexpected message stream id"
-            );
+            assert_eq!(payload.message_stream_id, 0, "Unexpected message stream id");
             assert_eq!(command_name, "deleteStream", "Unexpected command name");
             assert_eq!(command_object, Amf0Value::Null, "Unexpected command object");
             assert_eq!(
@@ -1661,23 +1660,23 @@ fn can_stop_publishing() {
 }
 
 fn split_results(
-    deserializer: &mut ChunkDeserializer,
+    deserializer: &mut ContiguousDecoder,
     mut results: Vec<ClientSessionResult>,
-) -> (Vec<(MessagePayload, RtmpMessage)>, Vec<ClientSessionEvent>) {
+) -> (Vec<(RawMessage, RtmpMessage)>, Vec<ClientSessionEvent>) {
     let mut responses = Vec::new();
     let mut events = Vec::new();
 
     for result in results.drain(..) {
         match result {
-            ClientSessionResult::OutboundResponse(packet) => {
+            ClientSessionResult::Packet(packet) => {
                 let payload = deserializer
-                    .get_next_message(&packet.bytes[..])
+                    .get_next_message(&packet.to_vec()[..])
                     .unwrap()
                     .unwrap();
                 let message = payload.to_rtmp_message().unwrap();
                 match message {
                     RtmpMessage::SetChunkSize { size } => {
-                        deserializer.set_max_chunk_size(size as usize).unwrap()
+                        deserializer.set_chunk_size(size as usize).unwrap()
                     }
                     _ => (),
                 }
@@ -1686,12 +1685,12 @@ fn split_results(
                 responses.push((payload, message));
             }
 
-            ClientSessionResult::RaisedEvent(event) => {
+            ClientSessionResult::Event(event) => {
                 println!("event received: {:?}", event);
                 events.push(event);
             }
 
-            ClientSessionResult::UnhandleableMessageReceived(payload) => {
+            ClientSessionResult::UnhandledMessage(payload) => {
                 println!("unhandleable message: {:?}", payload);
             }
         }
@@ -1700,12 +1699,12 @@ fn split_results(
     (responses, events)
 }
 
-fn consume_results(deserializer: &mut ChunkDeserializer, results: Vec<ClientSessionResult>) {
+fn consume_results(deserializer: &mut ContiguousDecoder, results: Vec<ClientSessionResult>) {
     // Needed to keep the deserializer up to date
     split_results(deserializer, results);
 }
 
-fn get_connect_success_response(serializer: &mut ChunkSerializer) -> Packet {
+fn get_connect_success_response(serializer: &mut ChunkEncoder) -> Packet {
     let mut command_properties = Amf0Object::new();
     command_properties.insert(
         "fmsVer".to_string(),
@@ -1735,13 +1734,11 @@ fn get_connect_success_response(serializer: &mut ChunkSerializer) -> Packet {
         additional_arguments: vec![Amf0Value::Object(additional_properties)],
     };
 
-    let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
-        .unwrap();
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
     serializer.serialize(&payload, false, false).unwrap()
 }
 
-fn get_connect_error_response(serializer: &mut ChunkSerializer) -> Packet {
+fn get_connect_error_response(serializer: &mut ChunkEncoder) -> Packet {
     let mut command_properties = Amf0Object::new();
     command_properties.insert(
         "fmsVer".to_string(),
@@ -1771,15 +1768,13 @@ fn get_connect_error_response(serializer: &mut ChunkSerializer) -> Packet {
         additional_arguments: vec![Amf0Value::Object(additional_properties)],
     };
 
-    let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
-        .unwrap();
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
     serializer.serialize(&payload, false, false).unwrap()
 }
 
 fn get_create_stream_success_response(
     transaction_id: f64,
-    serializer: &mut ChunkSerializer,
+    serializer: &mut ChunkEncoder,
 ) -> (u32, Packet) {
     let stream_id = rand::random::<u32>();
     let message = RtmpMessage::Amf0Command {
@@ -1789,14 +1784,12 @@ fn get_create_stream_success_response(
         transaction_id,
     };
 
-    let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), 0)
-        .unwrap();
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
     let packet = serializer.serialize(&payload, false, false).unwrap();
     (stream_id, packet)
 }
 
-fn get_play_success_response(serializer: &mut ChunkSerializer, stream_id: u32) -> Packet {
+fn get_play_success_response(serializer: &mut ChunkEncoder, stream_id: u32) -> Packet {
     let mut additional_properties = Amf0Object::new();
     additional_properties.insert(
         "level".to_string(),
@@ -1819,12 +1812,12 @@ fn get_play_success_response(serializer: &mut ChunkSerializer, stream_id: u32) -
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     serializer.serialize(&payload, false, false).unwrap()
 }
 
-fn get_publish_success_response(serializer: &mut ChunkSerializer, stream_id: u32) -> Packet {
+fn get_publish_success_response(serializer: &mut ChunkEncoder, stream_id: u32) -> Packet {
     let mut additional_properties = Amf0Object::new();
     additional_properties.insert(
         "level".to_string(),
@@ -1847,7 +1840,7 @@ fn get_publish_success_response(serializer: &mut ChunkSerializer, stream_id: u32
     };
 
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .unwrap();
     serializer.serialize(&payload, false, false).unwrap()
 }
@@ -1855,14 +1848,14 @@ fn get_publish_success_response(serializer: &mut ChunkSerializer, stream_id: u32
 fn perform_successful_connect(
     app_name: String,
     session: &mut ClientSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
 ) {
     let results = session.request_connection(app_name).unwrap();
     consume_results(deserializer, vec![results]);
 
     let response = get_connect_success_response(serializer);
-    let results = session.handle_input(&response.bytes[..]).unwrap();
+    let results = session.handle_input(&response.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(deserializer, results);
 
     assert_eq!(events.len(), 1, "Expected one event returned");
@@ -1878,8 +1871,8 @@ fn perform_successful_connect(
 fn perform_successful_play_request(
     config: ClientSessionConfig,
     session: &mut ClientSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
 ) -> u32 {
     let stream_key = "abcd".to_string();
     let result = session.request_playback(stream_key.clone()).unwrap();
@@ -1913,7 +1906,7 @@ fn perform_successful_play_request(
     let (created_stream_id, create_stream_response) =
         get_create_stream_success_response(transaction_id, serializer);
     let results = session
-        .handle_input(&create_stream_response.bytes[..])
+        .handle_input(&create_stream_response.to_vec()[..])
         .unwrap();
     let (mut responses, _) = split_results(deserializer, results);
 
@@ -1991,7 +1984,7 @@ fn perform_successful_play_request(
     };
 
     let play_response = get_play_success_response(serializer, created_stream_id);
-    let results = session.handle_input(&play_response.bytes[..]).unwrap();
+    let results = session.handle_input(&play_response.to_vec()[..]).unwrap();
     let (_, mut events) = split_results(deserializer, results);
 
     assert_eq!(events.len(), 1, "Expected one event returned");
@@ -2008,12 +2001,12 @@ fn perform_successful_play_request(
 
 fn perform_successful_publish_request(
     session: &mut ClientSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
 ) -> u32 {
     let stream_key = "abcd".to_string();
     let result = session
-        .request_publishing(stream_key.clone(), PublishRequestType::Live)
+        .request_publishing(stream_key.clone(), PublishMode::Live)
         .unwrap();
     let (mut responses, _) = split_results(deserializer, vec![result]);
 
@@ -2045,7 +2038,7 @@ fn perform_successful_publish_request(
     let (created_stream_id, create_stream_response) =
         get_create_stream_success_response(transaction_id, serializer);
     let results = session
-        .handle_input(&create_stream_response.bytes[..])
+        .handle_input(&create_stream_response.to_vec()[..])
         .unwrap();
     let (mut responses, _) = split_results(deserializer, results);
 
@@ -2089,7 +2082,9 @@ fn perform_successful_publish_request(
     };
 
     let publish_response = get_publish_success_response(serializer, created_stream_id);
-    let results = session.handle_input(&publish_response.bytes[..]).unwrap();
+    let results = session
+        .handle_input(&publish_response.to_vec()[..])
+        .unwrap();
     let (_, mut events) = split_results(deserializer, results);
 
     assert_eq!(events.len(), 1, "Unexpected number of events");
@@ -2108,9 +2103,12 @@ fn perform_successful_publish_request(
 fn late_status_from_an_old_stream_cannot_change_the_active_operation() {
     let (mut client, _) = ClientSession::new(ClientSessionConfig::default()).unwrap();
     // Simulate the state after cancellation followed by a new publish operation.
-    client.current_state = super::ClientState::PublishRequested;
-    client.active_stream_id = Some(2);
-    let mut serializer = ChunkSerializer::new();
+    client.current_state = super::ConnectionState::Connected;
+    let handle = client.streams.insert(
+        super::ClientStreamState::StartingPublish,
+        Some(crate::sessions::StreamId::new(2)),
+    );
+    let mut serializer = ChunkEncoder::new();
     for (stream_id, code) in [
         (1, "NetStream.Publish.Start"),
         (1, "NetStream.Publish.BadName"),
@@ -2131,14 +2129,17 @@ fn late_status_from_an_old_stream_cannot_change_the_active_operation() {
             additional_arguments: vec![Amf0Value::Object(properties.clone())],
         };
         let payload = message
-            .into_message_payload(RtmpTimestamp::new(0), stream_id)
+            .into_raw_message(RtmpTimestamp::new(0), stream_id)
             .unwrap();
         let packet = serializer.serialize(&payload, false, false).unwrap();
-        let result = client.handle_input(&packet.bytes).unwrap();
+        let result = client.handle_input(&packet.to_vec()).unwrap();
         assert!(
-            matches!(&result[0], ClientSessionResult::RaisedEvent(ClientSessionEvent::StatusReceived { status }) if status.properties() == &properties && status.stream_id().unwrap().get() == stream_id)
+            matches!(&result[0], ClientSessionResult::Event(ClientSessionEvent::StatusReceived { status, .. }) if status.properties() == &properties && status.stream_id().unwrap().get() == stream_id)
         );
-        assert_eq!(client.state(), &super::ClientState::PublishRequested);
+        assert_eq!(
+            client.stream_state(handle),
+            Some(super::ClientStreamState::StartingPublish)
+        );
         assert_eq!(client.active_stream_id().unwrap().get(), 2);
     }
 }
@@ -2148,18 +2149,18 @@ fn create_stream_rejection_is_recoverable_including_during_cancellation() {
     for publishing in [false, true] {
         for cancelled in [false, true] {
             let (mut client, _) = ClientSession::new(ClientSessionConfig::default()).unwrap();
-            client.current_state = super::ClientState::Connected;
+            client.current_state = super::ConnectionState::Connected;
             let request = if publishing {
-                client.request_publishing("demo".into(), PublishRequestType::Live)
+                client.request_publishing("demo".into(), PublishMode::Live)
             } else {
                 client.request_playback("demo".into())
             }
             .unwrap();
-            let ClientSessionResult::OutboundResponse(packet) = request else {
+            let ClientSessionResult::Packet(packet) = request else {
                 panic!("missing createStream")
             };
-            let mut decoder = ChunkDeserializer::new();
-            let payload = decoder.get_next_message(&packet.bytes).unwrap().unwrap();
+            let mut decoder = ContiguousDecoder::new();
+            let payload = decoder.get_next_message(&packet.to_vec()).unwrap().unwrap();
             let RtmpMessage::Amf0Command { transaction_id, .. } =
                 payload.to_rtmp_message().unwrap()
             else {
@@ -2185,21 +2186,19 @@ fn create_stream_rejection_is_recoverable_including_during_cancellation() {
                 command_object: Amf0Value::Null,
                 additional_arguments: vec![Amf0Value::Object(properties.clone())],
             };
-            let payload = error
-                .into_message_payload(RtmpTimestamp::new(0), 0)
-                .unwrap();
-            let packet = ChunkSerializer::new()
+            let payload = error.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
+            let packet = ChunkEncoder::new()
                 .serialize(&payload, false, false)
                 .unwrap();
-            let results = client.handle_input(&packet.bytes).unwrap();
-            assert_eq!(client.state(), &super::ClientState::Connected);
+            let results = client.handle_input(&packet.to_vec()).unwrap();
+            assert_eq!(client.state(), super::ConnectionState::Connected);
             assert!(!client.is_failed());
             if cancelled {
                 assert!(results.is_empty());
             } else {
-                assert!(matches!(&results[0], ClientSessionResult::RaisedEvent(
-                    ClientSessionEvent::PlaybackRequestRejected { status }
-                    | ClientSessionEvent::PublishRequestRejected { status }
+                assert!(matches!(&results[0], ClientSessionResult::Event(
+                    ClientSessionEvent::PlaybackRequestRejected { status, .. }
+                    | ClientSessionEvent::PublishRequestRejected { status, .. }
                 ) if status.properties() == &properties));
             }
             assert!(client.request_playback("retry".into()).is_ok());

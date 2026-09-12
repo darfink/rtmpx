@@ -39,14 +39,14 @@ pub const MAX_AMF3_INTEGER: i32 = (1 << 28) - 1;
 const U29_MASK: u32 = 0x1FFF_FFFF;
 /// An AMF3 value.
 ///
-/// This is a *tree*: `Amf3Value` owns its children, so a cyclic graph cannot be
-/// represented. That is deliberate and has two consequences the codec relies on:
-/// a cyclic or forward object reference on the wire is rejected at decode time
-/// with [`Amf3DeserializationError::CyclicReference`], and the serializer never
-/// needs to emit object references for correctness (see [`serialize`]).
+/// Inline values form a tree. `Reference` values belong to an [`Amf3Document`].
+/// The document owns each complex object once and supports shared children and
+/// cycles. The convenience decoder expands acyclic graphs under a budget.
 #[derive(PartialEq, Debug, Clone)]
 #[non_exhaustive]
 pub enum Amf3Value {
+    /// A document-local object identity. Resolve through `Amf3Document::get`.
+    Reference(crate::amf::ObjectId),
     Undefined,
     Null,
     Boolean(bool),
@@ -152,6 +152,15 @@ pub fn is_known_externalizable(class_name: &str) -> bool {
     externalizable_layout(class_name).is_some()
 }
 impl Amf3Value {
+    /// Borrow string storage without allocating.
+    pub fn as_str(&self) -> Option<&str> {
+        if let Self::String(value) = self {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
     pub fn get_number(&self) -> Option<f64> {
         match self {
             Amf3Value::Integer(v) => Some(*v as f64),
@@ -243,6 +252,7 @@ impl Amf3Value {
     pub fn to_amf0(&self) -> crate::amf0::Amf0Value {
         use crate::amf0::Amf0Value as A;
         match self {
+            Amf3Value::Reference(id) => A::Reference(*id),
             Amf3Value::Undefined => A::Undefined,
             Amf3Value::Null => A::Null,
             Amf3Value::Boolean(b) => A::Boolean(*b),
@@ -305,7 +315,16 @@ impl Amf3Value {
     }
     /// True when [`Self::to_amf0`] is structural rather than an `avmplus` escape.
     pub fn is_amf0_representable(&self) -> bool {
-        !matches!(self.to_amf0(), crate::amf0::Amf0Value::AvmPlus(_))
+        match self {
+            Self::Externalizable { value, .. } => value.is_amf0_representable(),
+            Self::ByteArray(_)
+            | Self::VectorInt { .. }
+            | Self::VectorUint { .. }
+            | Self::VectorDouble { .. }
+            | Self::VectorObject { .. }
+            | Self::Dictionary { .. } => false,
+            _ => true,
+        }
     }
 }
 impl From<crate::amf0::Amf0Value> for Amf3Value {
@@ -319,6 +338,8 @@ impl From<crate::amf0::Amf0Value> for Amf3Value {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Amf3SerializationError {
+    #[error("AMF3 reference requires a document containing a complex object at {0:?}")]
+    InvalidReference(crate::amf::ObjectId),
     #[error("AMF3 string too long: {0} bytes")]
     StringTooLong(usize),
     #[error("AMF3 collection too large: {0} items")]
@@ -335,6 +356,8 @@ pub enum Amf3SerializationError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Amf3DeserializationError {
+    #[error("AMF3 graph expansion exceeds the tree budget; use deserialize_document")]
+    ExpansionLimit,
     #[error("AMF3 input ended unexpectedly")]
     UnexpectedEof,
     #[error("AMF3 unknown value marker")]
@@ -427,12 +450,81 @@ fn u29_to_integer(raw: u32) -> i32 {
 /// distinct values; collapsing them into a reference would invent sharing that
 /// the source did not express. Inline objects are always valid AMF3.
 pub fn serialize(values: &[Amf3Value]) -> Result<Vec<u8>, Amf3SerializationError> {
-    let mut buf = Vec::new();
-    let mut ctx = EncodeContext::default();
-    for value in values {
-        write_value(&mut buf, &mut ctx, value, 0)?;
+    let mut output = Vec::new();
+    serialize_into(values, &mut output)?;
+    Ok(output)
+}
+/// Append one encoding context to reusable output. On failure, output is unchanged.
+pub fn serialize_into(
+    values: &[Amf3Value],
+    output: &mut Vec<u8>,
+) -> Result<(), Amf3SerializationError> {
+    encode_document(values, &[], output)
+}
+pub(crate) fn encode_document(
+    roots: &[Amf3Value],
+    objects: &[Amf3Value],
+    output: &mut Vec<u8>,
+) -> Result<(), Amf3SerializationError> {
+    let start = output.len();
+    let mut ctx = EncodeContext {
+        objects,
+        ..Default::default()
+    };
+    for value in roots {
+        if let Err(error) = write_value(output, &mut ctx, value, 0) {
+            output.truncate(start);
+            return Err(error);
+        }
     }
-    Ok(buf)
+    Ok(())
+}
+/// Decode object identity, sharing and cycles without expanding object references.
+pub fn deserialize_document<R: crate::amf::AmfRead>(
+    input: &mut R,
+) -> Result<Amf3Document, Amf3DeserializationError> {
+    let mut ctx = DecodeContext {
+        ..Default::default()
+    };
+    let mut roots = Vec::new();
+    while let Some(value) = read_optional_value(input, &mut ctx, 0)? {
+        if roots.len() >= MAX_COLLECTION_LEN {
+            return Err(Amf3DeserializationError::CollectionTooLarge(
+                roots.len() + 1,
+            ));
+        }
+        roots.push(value);
+    }
+    Ok(crate::amf::Document::from_parts(roots, ctx.objects))
+}
+pub(crate) fn deserialize_document_single<R: crate::amf::AmfRead>(
+    input: &mut R,
+) -> Result<Amf3Document, Amf3DeserializationError> {
+    let mut ctx = DecodeContext {
+        ..Default::default()
+    };
+    let value = read_value(input, &mut ctx, 0)?;
+    Ok(crate::amf::Document::from_parts(vec![value], ctx.objects))
+}
+/// Arena-backed AMF3 roots and complex objects. IDs are local to this document.
+pub type Amf3Document = crate::amf::Document<Amf3Value>;
+impl Amf3Document {
+    /// Resolve a reference, or borrow an inline value unchanged.
+    pub fn resolve<'a>(&'a self, value: &'a Amf3Value) -> Option<&'a Amf3Value> {
+        match value {
+            Amf3Value::Reference(id) => self.get(*id),
+            inline => Some(inline),
+        }
+    }
+
+    pub fn serialize_into(&self, output: &mut Vec<u8>) -> Result<(), Amf3SerializationError> {
+        encode_document(self.roots(), self.objects(), output)
+    }
+    pub fn serialize(&self) -> Result<Vec<u8>, Amf3SerializationError> {
+        let mut out = Vec::new();
+        self.serialize_into(&mut out)?;
+        Ok(out)
+    }
 }
 /// Serialize one value with fresh reference tables.
 pub fn serialize_single(value: &Amf3Value) -> Result<Vec<u8>, Amf3SerializationError> {
@@ -441,18 +533,27 @@ pub fn serialize_single(value: &Amf3Value) -> Result<Vec<u8>, Amf3SerializationE
 pub fn deserialize<R: crate::amf::AmfRead>(
     cursor: &mut R,
 ) -> Result<Vec<Amf3Value>, Amf3DeserializationError> {
-    let mut ctx = DecodeContext::default();
-    let mut out = Vec::new();
-    while let Some(value) = read_optional_value(cursor, &mut ctx, 0)? {
-        out.push(value);
-    }
-    Ok(out)
+    deserialize_document(cursor)?
+        .to_tree(crate::amf::TreeLimits::default())
+        .map_err(tree_error)
 }
 pub fn deserialize_single<R: crate::amf::AmfRead>(
     cursor: &mut R,
 ) -> Result<Amf3Value, Amf3DeserializationError> {
-    let mut ctx = DecodeContext::default();
-    read_value(cursor, &mut ctx, 0)
+    Ok(deserialize_document_single(cursor)?
+        .to_tree(crate::amf::TreeLimits::default())
+        .map_err(tree_error)?
+        .pop()
+        .unwrap())
+}
+fn tree_error(error: crate::amf::TreeError) -> Amf3DeserializationError {
+    match error {
+        crate::amf::TreeError::Cycle(id) => Amf3DeserializationError::CyclicReference(id.0 as u32),
+        crate::amf::TreeError::InvalidReference(id) => {
+            Amf3DeserializationError::BadObjectReference(id.0 as u32)
+        }
+        crate::amf::TreeError::Limit => Amf3DeserializationError::ExpansionLimit,
+    }
 }
 /// Read one value, returning `None` at a clean end of input.
 fn read_optional_value<R: common::AmfRead>(
@@ -495,11 +596,14 @@ struct TraitInfo {
 /// Only strings and traits are deduplicated; see [`serialize`] for why object
 /// references are not emitted.
 #[derive(Default)]
-struct EncodeContext {
+struct EncodeContext<'a> {
+    objects: &'a [Amf3Value],
+    object_refs: HashMap<crate::amf::ObjectId, u32>,
+    next_object: u32,
     strings: HashMap<String, u32>,
     traits: HashMap<TraitInfo, u32>,
 }
-impl EncodeContext {
+impl EncodeContext<'_> {
     fn string_ref(&self, s: &str) -> Option<u32> {
         self.strings.get(s).copied()
     }
@@ -522,21 +626,22 @@ impl EncodeContext {
     }
 }
 impl DecodeContext {
-    /// Resolve an object-table reference.
-    ///
-    /// Complex values are pushed as `Null` placeholders before their members
-    /// are read so that reference indices are assigned in wire order. A
-    /// reference that still resolves to the placeholder therefore points at a
-    /// value that is not finished yet, which means the graph is cyclic. Since
-    /// [`Amf3Value`] is a tree such a graph cannot be represented, so it is
-    /// reported as [`Amf3DeserializationError::CyclicReference`] rather than as
-    /// an out-of-bounds index. A genuine `Null` is never table-backed, so the
-    /// placeholder is unambiguous.
+    fn finish_object(&mut self, index: usize, value: Amf3Value) -> Amf3Value {
+        self.objects[index] = value;
+        Amf3Value::Reference(crate::amf::ObjectId(index))
+    }
+    fn store_object(&mut self, value: Amf3Value) -> Result<Amf3Value, Amf3DeserializationError> {
+        let index = self.objects.len();
+        self.push_object(Amf3Value::Null)?;
+        Ok(self.finish_object(index, value))
+    }
+
+    // Slots are reserved before children, so references to enclosing objects work.
     fn resolve_object(&self, index: u32) -> Result<Amf3Value, Amf3DeserializationError> {
-        match self.objects.get(index as usize) {
-            None => Err(Amf3DeserializationError::BadObjectReference(index)),
-            Some(Amf3Value::Null) => Err(Amf3DeserializationError::CyclicReference(index)),
-            Some(value) => Ok(value.clone()),
+        if (index as usize) < self.objects.len() {
+            Ok(Amf3Value::Reference(crate::amf::ObjectId(index as usize)))
+        } else {
+            Err(Amf3DeserializationError::BadObjectReference(index))
         }
     }
     fn push_string(&mut self, s: String) -> Result<(), Amf3DeserializationError> {
@@ -582,7 +687,30 @@ fn write_value(
     depth: usize,
 ) -> Result<(), Amf3SerializationError> {
     check_depth_ser(depth)?;
+    if let Amf3Value::Reference(id) = value {
+        let target = ctx
+            .objects
+            .get(id.0)
+            .ok_or(Amf3SerializationError::InvalidReference(*id))?;
+        let marker = object_marker(target).ok_or(Amf3SerializationError::InvalidReference(*id))?;
+        if let Some(index) = ctx.object_refs.get(id).copied() {
+            buf.push(marker);
+            write_u29(buf, index << 1);
+            return Ok(());
+        }
+        ctx.object_refs.insert(*id, ctx.next_object);
+        return write_value(buf, ctx, target, depth);
+    }
+    if object_marker(value).is_some() {
+        if ctx.next_object as usize >= MAX_REFERENCES {
+            return Err(Amf3SerializationError::CollectionTooLarge(
+                ctx.next_object as usize + 1,
+            ));
+        }
+        ctx.next_object += 1;
+    }
     match value {
+        Amf3Value::Reference(_) => unreachable!(),
         Amf3Value::Undefined => buf.push(MARK_UNDEFINED),
         Amf3Value::Null => buf.push(MARK_NULL),
         Amf3Value::Boolean(false) => buf.push(MARK_FALSE),
@@ -1081,8 +1209,7 @@ fn read_xml_doc<R: common::AmfRead>(
     let bytes = read_exact(cursor, len)?;
     let s = String::from_utf8(bytes)?;
     let v = Amf3Value::XmlDoc(s);
-    ctx.push_object(v.clone())?;
-    Ok(v)
+    ctx.store_object(v)
 }
 
 fn read_xml<R: common::AmfRead>(
@@ -1100,8 +1227,7 @@ fn read_xml<R: common::AmfRead>(
     let bytes = read_exact(cursor, len)?;
     let s = String::from_utf8(bytes)?;
     let v = Amf3Value::Xml(s);
-    ctx.push_object(v.clone())?;
-    Ok(v)
+    ctx.store_object(v)
 }
 
 fn read_byte_array<R: common::AmfRead>(
@@ -1118,8 +1244,7 @@ fn read_byte_array<R: common::AmfRead>(
     }
     let bytes = read_exact(cursor, len)?;
     let v = Amf3Value::ByteArray(bytes);
-    ctx.push_object(v.clone())?;
-    Ok(v)
+    ctx.store_object(v)
 }
 
 fn read_date<R: common::AmfRead>(
@@ -1132,8 +1257,7 @@ fn read_date<R: common::AmfRead>(
     }
     let millis = read_f64(cursor)?;
     let v = Amf3Value::Date(millis);
-    ctx.push_object(v.clone())?;
-    Ok(v)
+    ctx.store_object(v)
 }
 fn read_array<R: common::AmfRead>(
     cursor: &mut R,
@@ -1174,10 +1298,7 @@ fn read_array<R: common::AmfRead>(
         dense.push(read_value(cursor, ctx, depth + 1)?);
     }
     let v = Amf3Value::Array { dense, associative };
-    if let Some(slot) = ctx.objects.get_mut(placeholder) {
-        *slot = v.clone();
-    }
-    Ok(v)
+    Ok(ctx.finish_object(placeholder, v))
 }
 fn install_externalizable(
     ctx: &mut DecodeContext,
@@ -1189,10 +1310,7 @@ fn install_externalizable(
         class_name,
         value: Box::new(inner),
     };
-    if let Some(slot) = ctx.objects.get_mut(placeholder) {
-        *slot = v.clone();
-    }
-    v
+    ctx.finish_object(placeholder, v)
 }
 
 fn read_nested_externalizable<R: common::AmfRead>(
@@ -1358,10 +1476,7 @@ fn read_object<R: common::AmfRead>(
         sealed,
         dynamic: dyn_members,
     };
-    if let Some(slot) = ctx.objects.get_mut(placeholder) {
-        *slot = v.clone();
-    }
-    Ok(v)
+    Ok(ctx.finish_object(placeholder, v))
 }
 fn read_vector_int<R: common::AmfRead>(
     cursor: &mut R,
@@ -1384,10 +1499,7 @@ fn read_vector_int<R: common::AmfRead>(
         values.push(v);
     }
     let v = Amf3Value::VectorInt { fixed, values };
-    if let Some(slot) = ctx.objects.get_mut(placeholder) {
-        *slot = v.clone();
-    }
-    Ok(v)
+    Ok(ctx.finish_object(placeholder, v))
 }
 fn read_vector_uint<R: common::AmfRead>(
     cursor: &mut R,
@@ -1410,10 +1522,7 @@ fn read_vector_uint<R: common::AmfRead>(
         values.push(v);
     }
     let v = Amf3Value::VectorUint { fixed, values };
-    if let Some(slot) = ctx.objects.get_mut(placeholder) {
-        *slot = v.clone();
-    }
-    Ok(v)
+    Ok(ctx.finish_object(placeholder, v))
 }
 
 fn read_vector_double<R: common::AmfRead>(
@@ -1436,10 +1545,7 @@ fn read_vector_double<R: common::AmfRead>(
         values.push(read_f64(cursor)?);
     }
     let v = Amf3Value::VectorDouble { fixed, values };
-    if let Some(slot) = ctx.objects.get_mut(placeholder) {
-        *slot = v.clone();
-    }
-    Ok(v)
+    Ok(ctx.finish_object(placeholder, v))
 }
 fn read_vector_object<R: common::AmfRead>(
     cursor: &mut R,
@@ -1467,10 +1573,7 @@ fn read_vector_object<R: common::AmfRead>(
         fixed,
         values,
     };
-    if let Some(slot) = ctx.objects.get_mut(placeholder) {
-        *slot = v.clone();
-    }
-    Ok(v)
+    Ok(ctx.finish_object(placeholder, v))
 }
 
 fn read_dictionary<R: common::AmfRead>(
@@ -1496,8 +1599,194 @@ fn read_dictionary<R: common::AmfRead>(
         entries.push((k, v));
     }
     let v = Amf3Value::Dictionary { weak_keys, entries };
-    if let Some(slot) = ctx.objects.get_mut(placeholder) {
-        *slot = v.clone();
+    Ok(ctx.finish_object(placeholder, v))
+}
+
+fn object_marker(value: &Amf3Value) -> Option<u8> {
+    Some(match value {
+        Amf3Value::XmlDoc(_) => MARK_XML_DOC,
+        Amf3Value::Date(_) => MARK_DATE,
+        Amf3Value::Array { .. } => MARK_ARRAY,
+        Amf3Value::Object { .. } | Amf3Value::Externalizable { .. } => MARK_OBJECT,
+        Amf3Value::Xml(_) => MARK_XML,
+        Amf3Value::ByteArray(_) => MARK_BYTE_ARRAY,
+        Amf3Value::VectorInt { .. } => MARK_VECTOR_INT,
+        Amf3Value::VectorUint { .. } => MARK_VECTOR_UINT,
+        Amf3Value::VectorDouble { .. } => MARK_VECTOR_DOUBLE,
+        Amf3Value::VectorObject { .. } => MARK_VECTOR_OBJECT,
+        Amf3Value::Dictionary { .. } => MARK_DICTIONARY,
+        _ => return None,
+    })
+}
+
+// Relocate document-local IDs when importing an embedded AMF3 arena.
+pub(crate) fn relocate(value: &mut Amf3Value, base: usize) {
+    match value {
+        Amf3Value::Reference(id) => id.0 += base,
+        Amf3Value::Array { dense, associative } => {
+            for v in dense {
+                relocate(v, base);
+            }
+            for (_, v) in associative {
+                relocate(v, base);
+            }
+        }
+        Amf3Value::Object {
+            sealed, dynamic, ..
+        } => {
+            for (_, v) in sealed {
+                relocate(v, base);
+            }
+            if let Some(members) = dynamic {
+                for (_, v) in members {
+                    relocate(v, base);
+                }
+            }
+        }
+        Amf3Value::Externalizable { value, .. } => relocate(value, base),
+        Amf3Value::VectorObject { values, .. } => {
+            for v in values {
+                relocate(v, base);
+            }
+        }
+        Amf3Value::Dictionary { entries, .. } => {
+            for (k, v) in entries {
+                relocate(k, base);
+                relocate(v, base);
+            }
+        }
+        _ => {}
     }
-    Ok(v)
+}
+
+impl crate::amf::graph::GraphValue for Amf3Value {
+    fn reference(&self) -> Option<crate::amf::ObjectId> {
+        if let Self::Reference(id) = self {
+            Some(*id)
+        } else {
+            None
+        }
+    }
+    fn heap_bytes(&self) -> usize {
+        let pairs = |p: &[(String, Self)]| {
+            p.len()
+                .saturating_mul(std::mem::size_of::<(String, Self)>())
+                .saturating_add(p.iter().map(|(k, _)| k.len()).sum::<usize>())
+        };
+        match self {
+            Self::String(s) | Self::Xml(s) | Self::XmlDoc(s) => s.len(),
+            Self::ByteArray(b) => b.len(),
+            Self::Array { dense, associative } => dense
+                .len()
+                .saturating_mul(std::mem::size_of::<Self>())
+                .saturating_add(pairs(associative)),
+            Self::Object {
+                class_name,
+                sealed,
+                dynamic,
+            } => class_name
+                .as_ref()
+                .map_or(0, |s| s.len())
+                .saturating_add(pairs(sealed))
+                .saturating_add(dynamic.as_ref().map_or(0, |p| pairs(p))),
+            Self::Externalizable { class_name, .. } => {
+                class_name.len() + std::mem::size_of::<Self>()
+            }
+            Self::VectorInt { values, .. } => values.len() * 4,
+            Self::VectorUint { values, .. } => values.len() * 4,
+            Self::VectorDouble { values, .. } => values.len() * 8,
+            Self::VectorObject {
+                type_name, values, ..
+            } => type_name.len() + values.len() * std::mem::size_of::<Self>(),
+            Self::Dictionary { entries, .. } => entries.len() * std::mem::size_of::<(Self, Self)>(),
+            _ => 0,
+        }
+    }
+    fn children(
+        &self,
+        visit: &mut dyn FnMut(&Self) -> Result<(), crate::amf::TreeError>,
+    ) -> Result<(), crate::amf::TreeError> {
+        match self {
+            Self::Array { dense, associative } => {
+                for v in dense {
+                    visit(v)?;
+                }
+                for (_, v) in associative {
+                    visit(v)?;
+                }
+            }
+            Self::Object {
+                sealed, dynamic, ..
+            } => {
+                for (_, v) in sealed {
+                    visit(v)?;
+                }
+                if let Some(p) = dynamic {
+                    for (_, v) in p {
+                        visit(v)?;
+                    }
+                }
+            }
+            Self::Externalizable { value, .. } => visit(value)?,
+            Self::VectorObject { values, .. } => {
+                for v in values {
+                    visit(v)?;
+                }
+            }
+            Self::Dictionary { entries, .. } => {
+                for (k, v) in entries {
+                    visit(k)?;
+                    visit(v)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn children_mut(&mut self, visit: &mut dyn FnMut(&mut Self)) {
+        match self {
+            Self::Array { dense, associative } => {
+                for v in dense {
+                    visit(v);
+                }
+                for (_, v) in associative {
+                    visit(v);
+                }
+            }
+            Self::Object {
+                sealed, dynamic, ..
+            } => {
+                for (_, v) in sealed {
+                    visit(v);
+                }
+                if let Some(p) = dynamic {
+                    for (_, v) in p {
+                        visit(v);
+                    }
+                }
+            }
+            Self::Externalizable { value, .. } => visit(value),
+            Self::VectorObject { values, .. } => {
+                for v in values {
+                    visit(v);
+                }
+            }
+            Self::Dictionary { entries, .. } => {
+                for (k, v) in entries {
+                    visit(k);
+                    visit(v);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+impl Amf3Document {
+    /// Expand sharing into an owned tree only after validating the complete budget.
+    pub fn to_tree(
+        &self,
+        limits: crate::amf::TreeLimits,
+    ) -> Result<Vec<Amf3Value>, crate::amf::TreeError> {
+        crate::amf::graph::expand(self.roots(), self.objects(), limits)
+    }
 }

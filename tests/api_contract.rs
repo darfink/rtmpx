@@ -1,15 +1,17 @@
 //! External-consumer regression tests for the 2.0 API contracts.
-use bytes::Bytes;
-use rtmpx::chunk_io::ChunkSerializer;
-use rtmpx::messages::{RtmpMessage, UserControlEventType};
-use rtmpx::sessions::{
-    ClientSession, ClientSessionConfig, ClientSessionError, ClientState, DataMessage,
+#[path = "support/api.rs"]
+mod api;
+use crate::api::chunk_io::ChunkEncoder;
+use crate::api::messages::{RtmpMessage, UserControlEventType};
+use crate::api::sessions::{
+    ClientSession, ClientSessionConfig, ClientSessionError, ConnectionState, DataMessage,
     DataMessageType, ServerSession, ServerSessionConfig, ServerSessionError, StreamId,
 };
-use rtmpx::time::RtmpTimestamp;
-use rtmpx::{
+use crate::api::time::RtmpTimestamp;
+use crate::api::{
     Amf0Value, AmfRead, EnhancedValidationMode, ValidatedMedia, media::MediaValidationError,
 };
+use bytes::Bytes;
 use std::io::{self, BufReader, Cursor, Read};
 
 #[test]
@@ -23,50 +25,50 @@ fn custom_and_buffered_readers_can_use_both_amf_decoders() {
     impl AmfRead for Custom {}
     let mut reader = Custom(Cursor::new(vec![5]));
     assert_eq!(
-        rtmpx::amf0::deserialize(&mut reader).unwrap(),
+        crate::api::amf0::deserialize(&mut reader).unwrap(),
         vec![Amf0Value::Null]
     );
     let mut reader = BufReader::with_capacity(8, Cursor::new(vec![5, 5]));
     assert_eq!(
-        rtmpx::amf0::deserialize_single(&mut reader).unwrap(),
+        crate::api::amf0::deserialize_single(&mut reader).unwrap(),
         Amf0Value::Null
     );
     assert_eq!(reader.remaining_hint(), Some(1));
     assert_eq!(
-        rtmpx::amf0::deserialize(&mut reader).unwrap(),
+        crate::api::amf0::deserialize(&mut reader).unwrap(),
         vec![Amf0Value::Null]
     );
     let mut reader = BufReader::new(Custom(Cursor::new(vec![1])));
     assert_eq!(
-        rtmpx::amf3::deserialize(&mut reader).unwrap(),
-        vec![rtmpx::Amf3Value::Null]
+        crate::api::amf3::deserialize(&mut reader).unwrap(),
+        vec![crate::api::Amf3Value::Null]
     );
 }
 
 #[test]
 fn input_failure_is_terminal_even_after_a_response_was_generated_in_the_same_read() {
-    let mut serializer = ChunkSerializer::new();
+    let mut serializer = ChunkEncoder::new();
     let ping = RtmpMessage::UserControl {
         event_type: UserControlEventType::PingRequest,
         stream_id: None,
         timestamp: Some(RtmpTimestamp::new(123)),
         buffer_length: None,
     }
-    .into_message_payload(RtmpTimestamp::new(0), 0)
+    .into_raw_message(RtmpTimestamp::new(0), 0)
     .unwrap();
     let invalid_window = RtmpMessage::WindowAcknowledgement { size: 0 }
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .unwrap();
-    let mut input = serializer.serialize(&ping, false, false).unwrap().bytes;
+    let mut input = serializer.serialize(&ping, false, false).unwrap().to_vec();
     input.extend(
         serializer
             .serialize(&invalid_window, false, false)
             .unwrap()
-            .bytes,
+            .to_vec(),
     );
     let (mut client, _) = ClientSession::new(ClientSessionConfig::default()).unwrap();
     assert!(client.handle_input(&input).is_err());
-    assert_eq!(client.state(), &ClientState::Failed);
+    assert_eq!(client.state(), ConnectionState::Failed);
     assert!(matches!(
         client.handle_input(&[]),
         Err(ClientSessionError::SessionFailed)

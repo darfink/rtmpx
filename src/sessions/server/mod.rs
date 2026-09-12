@@ -1,9 +1,11 @@
+use crate::sessions::streams::Streams;
+use crate::sessions::{ConnectionState, ServerStreamState, StreamHandle};
 mod active_stream;
 mod config;
 mod errors;
 mod events;
 mod outstanding_requests;
-mod publish_mode;
+
 mod result;
 mod session_state;
 
@@ -15,9 +17,12 @@ use self::outstanding_requests::OutstandingRequest;
 use self::session_state::SessionState;
 use crate::amf::{self, AmfEncoding};
 use crate::amf0::{Amf0Object, Amf0Value};
-use crate::chunk_io::{ChunkDeserializationError, ChunkDeserializer, ChunkSerializer, Packet};
+use crate::chunk_io::{ChunkEncoder, DecodeError, MessageDecoder, Packet};
+use crate::messages::RawMessage;
 use crate::messages::{PeerBandwidthLimitType, RtmpMessage, UserControlEventType};
-use crate::sessions::{DataMessage, DataMessageType, RequestId, StreamId, StreamMetadata};
+use crate::sessions::{
+    DataMessage as GenericDataMessage, DataMessageType, RequestId, StreamId, StreamMetadata,
+};
 use crate::time::RtmpTimestamp;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -27,9 +32,10 @@ use std::time::Instant;
 
 pub use self::config::ServerSessionConfig;
 pub use self::errors::ServerSessionError;
-pub use self::events::{PlayStartValue, ServerSessionEvent};
-pub use self::publish_mode::PublishMode;
-pub use self::result::ServerSessionResult;
+pub use self::events::{PlayStartValue, ServerEvent};
+pub use self::result::ServerOutput;
+use crate::sessions::PublishMode;
+type ServerSessionResult<D = Bytes> = ServerOutput<D>;
 
 /// A session that represents the server side of a single RTMP connection.
 ///
@@ -50,8 +56,9 @@ pub use self::result::ServerSessionResult;
 pub struct ServerSession {
     failed: bool,
     start_time: Instant,
-    serializer: ChunkSerializer,
-    deserializer: ChunkDeserializer,
+    serializer: ChunkEncoder,
+    deserializer: MessageDecoder,
+    pending: std::collections::VecDeque<ServerOutput>,
     connected_app_name: Option<Arc<str>>,
     outstanding_requests: HashMap<u32, OutstandingRequest>,
     next_request_number: u32,
@@ -75,7 +82,9 @@ pub struct ServerSession {
     /// what value is echoed; this decides what actually goes out.
     response_encoding: AmfEncoding,
     active_streams: HashMap<u32, ActiveStream>,
+    stream_handles: Streams<()>,
     next_stream_id: u32,
+    session_limits: crate::sessions::SessionLimits,
     peer_window_ack_size: Option<u32>,
     // The window size we advertised to the peer, used as the
     // acknowledgement trigger when the peer never advertises its own.
@@ -89,6 +98,49 @@ pub struct ServerSession {
 }
 
 impl ServerSession {
+    /// Connection state, independent of individual message streams.
+    pub fn state(&self) -> ConnectionState {
+        if self.failed {
+            ConnectionState::Failed
+        } else if self.current_state == SessionState::Connected {
+            ConnectionState::Connected
+        } else if self
+            .outstanding_requests
+            .values()
+            .any(|r| matches!(r, OutstandingRequest::ConnectionRequest { .. }))
+        {
+            ConnectionState::Connecting
+        } else {
+            ConnectionState::Disconnected
+        }
+    }
+    pub fn stream_id(&self, stream: StreamHandle) -> Option<StreamId> {
+        self.stream_handles.get(stream).and_then(|e| e.wire_id)
+    }
+    pub fn stream_state(&self, stream: StreamHandle) -> Option<ServerStreamState> {
+        let wire = self.stream_id(stream)?;
+        Some(match &self.active_streams.get(&wire.get())?.current_state {
+            StreamState::Created => ServerStreamState::Created,
+            StreamState::Playing { .. } => ServerStreamState::Playing,
+            StreamState::Publishing { .. } => ServerStreamState::Publishing,
+            StreamState::Completed => ServerStreamState::Completed,
+        })
+    }
+    fn playback_id(&self, stream: StreamHandle) -> Result<StreamId, ServerSessionError> {
+        let state = self
+            .stream_state(stream)
+            .ok_or(ServerSessionError::InvalidStreamHandle)?;
+        if state != ServerStreamState::Playing {
+            return Err(ServerSessionError::StreamInInvalidState { stream, state });
+        }
+        Ok(self.stream_id(stream).expect("live playback stream"))
+    }
+    pub fn streams(&self) -> impl Iterator<Item = (StreamHandle, StreamId)> + '_ {
+        self.stream_handles
+            .iter()
+            .filter_map(|(h, e)| e.wire_id.map(|id| (h, id)))
+    }
+
     /// Whether an input error has permanently terminated this session.
     pub fn is_failed(&self) -> bool {
         self.failed
@@ -102,74 +154,6 @@ impl ServerSession {
         }
     }
 
-    /// Process bytes in transport order.
-    ///
-    /// Any error is terminal: close the transport and discard this session. Outputs
-    /// accumulated during the failing call are discarded; no further operation may
-    /// generate bytes. Successful calls return outputs in their required wire order.
-    /// Caller errors from other methods (for example an invalid request ID) are not
-    /// input failures and do not set this terminal state.
-    pub fn handle_input(
-        &mut self,
-        bytes: &[u8],
-    ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
-        self.ensure_active()?;
-        let result = self.handle_input_inner(bytes);
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-
-    fn handle_data_message(
-        &self,
-        stream_id: u32,
-        message: DataMessage,
-    ) -> Vec<ServerSessionResult> {
-        let Some(app_name) = self.connected_app_name.clone() else {
-            return Vec::new();
-        };
-        let Some(ActiveStream {
-            current_state: StreamState::Publishing { stream_key, .. },
-        }) = self.active_streams.get(&stream_id)
-        else {
-            return Vec::new();
-        };
-        let stream_key = stream_key.clone();
-        let stream_id = StreamId::new(stream_id);
-        let event = if let Ok(Some(properties)) = message.metadata() {
-            let mut metadata = StreamMetadata::new();
-            metadata.apply_metadata_values(properties);
-            ServerSessionEvent::StreamMetadataChanged {
-                stream_id,
-                app_name,
-                stream_key,
-                metadata,
-                message,
-            }
-        } else {
-            ServerSessionEvent::StreamDataReceived {
-                stream_id,
-                app_name,
-                stream_key,
-                message,
-            }
-        };
-        vec![ServerSessionResult::RaisedEvent(event)]
-    }
-
-    /// Send encoded script data using this session's chunk serializer.
-    pub fn send_data(
-        &mut self,
-        stream_id: StreamId,
-        message: DataMessage,
-    ) -> Result<Packet, ServerSessionError> {
-        self.ensure_active()?;
-        self.serializer
-            .serialize(&message.to_message_payload(stream_id.get()), false, false)
-            .map_err(Into::into)
-    }
-
     /// Cumulative bytes handed to `handle_input`, exposed so tests
     /// can assert the acknowledgement sequence number exactly.
     #[cfg(test)]
@@ -181,11 +165,9 @@ impl ServerSession {
     ///
     /// The initial output list is empty. Required control messages are retained
     /// until the application accepts the client's connection request.
-    pub fn new(
-        config: ServerSessionConfig,
-    ) -> Result<(ServerSession, Vec<ServerSessionResult>), ServerSessionError> {
+    pub fn new(config: ServerSessionConfig) -> Result<Self, ServerSessionError> {
         if config.window_ack_size == 0 {
-            return Err(ChunkDeserializationError::ResourceLimitExceeded {
+            return Err(DecodeError::ResourceLimitExceeded {
                 resource: "acknowledgement window",
                 attempted: 0,
                 maximum: u32::MAX as usize,
@@ -195,8 +177,15 @@ impl ServerSession {
         let mut session = ServerSession {
             failed: false,
             start_time: Instant::now(),
-            serializer: ChunkSerializer::new(),
-            deserializer: ChunkDeserializer::with_config(config.chunk_deserializer),
+            serializer: ChunkEncoder::new(),
+            deserializer: {
+                let mut decoder = MessageDecoder::with_limits(config.decoder_limits);
+                if let Some(pool) = &config.payload_pool {
+                    decoder.set_payload_pool(pool.clone());
+                }
+                decoder
+            },
+            pending: std::collections::VecDeque::new(),
             connected_app_name: None,
             outstanding_requests: HashMap::new(),
             next_request_number: 0,
@@ -207,7 +196,9 @@ impl ServerSession {
             peer_uses_amf3_framing: false,
             response_encoding: AmfEncoding::Amf0,
             active_streams: HashMap::new(),
+            stream_handles: Streams::new(),
             next_stream_id: 1,
+            session_limits: config.session_limits,
             peer_window_ack_size: None,
             self_window_ack_size: Some(config.window_ack_size),
             bytes_received: 0,
@@ -219,8 +210,8 @@ impl ServerSession {
 
         let chunk_size_packet = session
             .serializer
-            .set_max_chunk_size(config.chunk_size, RtmpTimestamp::new(0))?;
-        results.push(ServerSessionResult::OutboundResponse(chunk_size_packet));
+            .set_chunk_size(config.chunk_size, RtmpTimestamp::new(0))?;
+        results.push(ServerSessionResult::Packet(chunk_size_packet));
 
         let window_ack_message = RtmpMessage::WindowAcknowledgement {
             size: config.window_ack_size,
@@ -229,7 +220,7 @@ impl ServerSession {
         let window_ack_packet = session
             .serializer
             .serialize(&window_ack_payload, true, false)?;
-        results.push(ServerSessionResult::OutboundResponse(window_ack_packet));
+        results.push(ServerSessionResult::Packet(window_ack_packet));
 
         let begin_message = RtmpMessage::UserControl {
             event_type: UserControlEventType::StreamBegin,
@@ -240,7 +231,7 @@ impl ServerSession {
 
         let begin_payload = session.to_payload(begin_message, 0)?;
         let begin_packet = session.serializer.serialize(&begin_payload, true, false)?;
-        results.push(ServerSessionResult::OutboundResponse(begin_packet));
+        results.push(ServerSessionResult::Packet(begin_packet));
 
         let peer_message = RtmpMessage::SetPeerBandwidth {
             size: config.peer_bandwidth,
@@ -248,7 +239,7 @@ impl ServerSession {
         };
         let peer_payload = session.to_payload(peer_message, 0)?;
         let peer_packet = session.serializer.serialize(&peer_payload, true, false)?;
-        results.push(ServerSessionResult::OutboundResponse(peer_packet));
+        results.push(ServerSessionResult::Packet(peer_packet));
 
         if config.send_on_bw_done_message_on_start {
             let bw_done_message = RtmpMessage::Amf0Command {
@@ -262,188 +253,248 @@ impl ServerSession {
             let bw_done_packet = session
                 .serializer
                 .serialize(&bw_done_payload, true, false)?;
-            results.push(ServerSessionResult::OutboundResponse(bw_done_packet));
+            results.push(ServerSessionResult::Packet(bw_done_packet));
         }
 
         session.pending_connection_control = results;
-        Ok((session, Vec::new()))
+        Ok(session)
     }
 
-    /// Takes in bytes that are encoding RTMP chunks and returns any responses or events that can
-    /// be reacted to.
-    fn handle_input_inner(
+    /// Recycle payload descriptors after consumers release their messages.
+    /// Cloned pools can be shared with other sessions and relay tasks.
+    pub fn set_payload_pool(&mut self, pool: crate::PayloadPool) {
+        self.deserializer.set_payload_pool(pool);
+    }
+
+    /// Return one output without retaining unread transport input.
+    /// Call again with the same buffer after handling the output. `None` means more
+    /// input is required. Drain pending outputs even when the input buffer is empty.
+    /// Errors are terminal; discard the session and unsent packets.
+    pub fn receive(
         &mut self,
-        bytes: &[u8],
-    ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
-        let mut results = Vec::new();
-        self.bytes_received += bytes.len() as u64;
-
-        // Fall back to the window we advertised when the peer never
-        // advertises one of its own.
-        //
-        // Upstream only acknowledged after receiving the peer's
-        // `WindowAcknowledgement`. ffmpeg's RTMP client never sends one when
-        // publishing (verified against ffmpeg 9.0.1: it sends only
-        // `SetChunkSize`), so a publisher could stream indefinitely without ever
-        // being acknowledged. Encoders that track their unacknowledged window -
-        // and the RTMP spec tells senders to stop once it is exhausted - can
-        // stall or drop the connection.
-        //
-        // Acknowledging on our own advertised window is both spec-legal and what
-        // the peer asked for when we sent `WindowAcknowledgement`.
-        let effective_ack_size = self.peer_window_ack_size.or(self.self_window_ack_size);
-        if let Some(peer_ack_size) = effective_ack_size {
-            self.bytes_received_since_last_ack = self
-                .bytes_received_since_last_ack
-                .wrapping_add(bytes.len() as u32);
-            if self.bytes_received_since_last_ack >= peer_ack_size {
-                // The RTMP spec defines the acknowledgement sequence
-                // number as the *cumulative* number of bytes received on the
-                // connection, not the count since the last ack. Upstream sent
-                // the per-window delta, which effectively reports a stalled
-                // byte counter to the peer. Strict senders that track the
-                // acknowledged window will throttle or drop the connection.
-                // The value wraps at 2^32 by design.
-                let ack_message = RtmpMessage::Acknowledgement {
-                    sequence_number: self.bytes_received as u32,
-                };
-                let ack_payload = self.to_payload(ack_message, 0)?;
-                let ack_packet = self.serializer.serialize(&ack_payload, false, false)?;
-
-                self.bytes_received_since_last_ack %= peer_ack_size;
-                results.push(ServerSessionResult::OutboundResponse(ack_packet));
-            }
+        input: &mut Bytes,
+    ) -> Result<Option<ServerOutput>, ServerSessionError> {
+        self.ensure_active()?;
+        let result = self.receive_inner(input);
+        if result.is_err() {
+            self.failed = true;
+            self.pending.clear();
         }
-
-        let mut bytes_to_process = bytes;
-
+        result
+    }
+    fn receive_inner(
+        &mut self,
+        input: &mut Bytes,
+    ) -> Result<Option<ServerOutput>, ServerSessionError> {
+        if let Some(output) = self.pending.pop_front() {
+            return Ok(Some(output));
+        }
         loop {
-            match self.deserializer.get_next_message(bytes_to_process)? {
-                None => break,
-                Some(payload) => {
-                    if let Some(wire_type) = DataMessageType::from_type_id(payload.type_id) {
-                        if wire_type == DataMessageType::Amf3 {
-                            self.peer_uses_amf3_framing = true;
-                        }
-                        let message = DataMessage::new(wire_type, payload.timestamp, payload.data);
-                        results
-                            .extend(self.handle_data_message(payload.message_stream_id, message));
-                        bytes_to_process = &[];
-                        continue;
-                    }
-                    let message = payload.to_rtmp_message()?;
-
-                    let mut message_results = match message {
-                        RtmpMessage::Abort { stream_id } => self.handle_abort_message(stream_id)?,
-
-                        RtmpMessage::Acknowledgement { sequence_number } => {
-                            self.handle_acknowledgement_message(sequence_number)?
-                        }
-
-                        RtmpMessage::Amf0Command {
-                            command_name,
-                            transaction_id,
-                            command_object,
-                            additional_arguments,
-                        } => {
-                            self.response_encoding = AmfEncoding::Amf0;
-                            self.handle_amf0_command(
-                                payload.message_stream_id,
-                                command_name,
-                                transaction_id,
-                                command_object,
-                                additional_arguments,
-                            )?
-                        }
-
-                        RtmpMessage::Amf3Command {
-                            command_name,
-                            transaction_id,
-                            command_object,
-                            additional_arguments,
-                            format: _,
-                        } => {
-                            // Type 17 and type 20 carry the same NetConnection
-                            // and NetStream commands; only the encoding
-                            // differs. Project into the AMF0 value model and
-                            // run the one set of handlers, so an AMF3 client
-                            // gets identical behaviour - including Enhanced
-                            // RTMP capability validation - instead of a
-                            // parallel implementation that drifts.
-                            self.peer_uses_amf3_framing = true;
-                            self.response_encoding = AmfEncoding::Amf3;
-                            self.handle_amf0_command(
-                                payload.message_stream_id,
-                                command_name,
-                                transaction_id,
-                                command_object.to_amf0(),
-                                additional_arguments.iter().map(|v| v.to_amf0()).collect(),
-                            )?
-                        }
-
-                        RtmpMessage::Amf0SharedObject { data: _ }
-                        | RtmpMessage::Amf3SharedObject { data: _ } => {
-                            vec![ServerSessionResult::UnhandleableMessageReceived(payload)]
-                        }
-
-                        RtmpMessage::AudioData { data } => self.handle_audio_data(
-                            data,
-                            payload.message_stream_id,
-                            payload.timestamp,
-                        )?,
-
-                        RtmpMessage::SetChunkSize { size } => self.handle_set_chunk_size(size)?,
-
-                        RtmpMessage::SetPeerBandwidth { size, limit_type } => {
-                            self.handle_set_peer_bandwidth(size, limit_type)?
-                        }
-
-                        RtmpMessage::UserControl {
-                            event_type,
-                            stream_id,
-                            buffer_length,
-                            timestamp,
-                        } => self.handle_user_control(
-                            event_type,
-                            stream_id,
-                            buffer_length,
-                            timestamp,
-                        )?,
-
-                        RtmpMessage::VideoData { data } => self.handle_video_data(
-                            data,
-                            payload.message_stream_id,
-                            payload.timestamp,
-                        )?,
-
-                        RtmpMessage::WindowAcknowledgement { size } => {
-                            self.handle_window_acknowledgement(size)?
-                        }
-
-                        _ => vec![ServerSessionResult::UnhandleableMessageReceived(payload)],
+            let before = input.len();
+            let payload = self.deserializer.decode(input)?;
+            let consumed = before - input.len();
+            self.bytes_received = self.bytes_received.wrapping_add(consumed as u64);
+            let effective_ack_size = self.peer_window_ack_size.or(self.self_window_ack_size);
+            if let Some(peer_ack_size) = effective_ack_size {
+                self.bytes_received_since_last_ack = self
+                    .bytes_received_since_last_ack
+                    .wrapping_add(consumed as u32);
+                if self.bytes_received_since_last_ack >= peer_ack_size {
+                    // The RTMP spec defines the acknowledgement sequence
+                    // number as the *cumulative* number of bytes received on the
+                    // connection, not the count since the last ack. Upstream sent
+                    // the per-window delta, which effectively reports a stalled
+                    // byte counter to the peer. Strict senders that track the
+                    // acknowledged window will throttle or drop the connection.
+                    // The value wraps at 2^32 by design.
+                    let ack_message = RtmpMessage::Acknowledgement {
+                        sequence_number: self.bytes_received as u32,
                     };
+                    let ack_payload = self.to_payload(ack_message, 0)?;
+                    let ack_packet = self.serializer.serialize(&ack_payload, false, false)?;
 
-                    results.append(&mut message_results);
-                    bytes_to_process = &[];
+                    self.bytes_received_since_last_ack %= peer_ack_size;
+                    self.pending.push_back(ServerOutput::Packet(ack_packet));
                 }
             }
-        }
 
-        Ok(results)
+            let Some(payload) = payload else {
+                return Ok(self.pending.pop_front());
+            };
+            // Acknowledgements precede outputs caused by the acknowledged message.
+            let acknowledgement = self.pending.pop_front();
+            let output = self.process_payload(payload)?;
+            if let Some(ack) = acknowledgement {
+                if let Some(output) = output {
+                    self.pending.push_front(output);
+                }
+                return Ok(Some(ack));
+            }
+            if output.is_some() {
+                return Ok(output);
+            }
+        }
+    }
+    fn process_payload(
+        &mut self,
+        payload: RawMessage<crate::Payload>,
+    ) -> Result<Option<ServerOutput>, ServerSessionError> {
+        if let Some(wire_type) = DataMessageType::from_type_id(payload.type_id) {
+            if wire_type == DataMessageType::Amf3 {
+                self.peer_uses_amf3_framing = true;
+            }
+            let message = DataMessage::new(wire_type, payload.timestamp, payload.data);
+            let Some(app_name) = self.connected_app_name.clone() else {
+                return Ok(None);
+            };
+            let Some(ActiveStream {
+                current_state: StreamState::Publishing { stream_key, .. },
+            }) = self.active_streams.get(&payload.message_stream_id)
+            else {
+                return Ok(None);
+            };
+            let event = ServerSessionEvent::StreamDataReceived {
+                stream: self
+                    .stream_handles
+                    .find(payload.message_stream_id)
+                    .expect("known stream"),
+                stream_id: StreamId::new(payload.message_stream_id),
+                app_name,
+                stream_key: stream_key.clone(),
+                message,
+            };
+            return Ok(Some(ServerOutput::Event(event)));
+        }
+        let event = match payload.type_id {
+            8 => self.audio_event(payload.data, payload.message_stream_id, payload.timestamp)?,
+            9 => self.video_event(payload.data, payload.message_stream_id, payload.timestamp)?,
+            _ => {
+                if !matches!(payload.type_id, 1..=6 | 17 | 20) {
+                    return Ok(Some(ServerOutput::UnhandledMessage(payload)));
+                }
+                let payload = RawMessage {
+                    timestamp: payload.timestamp,
+                    type_id: payload.type_id,
+                    message_stream_id: payload.message_stream_id,
+                    data: payload.data.into_bytes(),
+                };
+                let outputs = self.handle_message(payload)?;
+                self.pending.extend(
+                    outputs
+                        .into_iter()
+                        .map(|output| output.map_payload(crate::Payload::from)),
+                );
+                return Ok(self.pending.pop_front());
+            }
+        };
+        Ok(event.map(ServerOutput::Event))
+    }
+    fn handle_message(
+        &mut self,
+        payload: RawMessage,
+    ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+        let message = payload.to_rtmp_message()?;
+
+        let message_results = match message {
+            RtmpMessage::Abort { stream_id } => self.handle_abort_message(stream_id)?,
+
+            RtmpMessage::Acknowledgement { sequence_number } => {
+                self.handle_acknowledgement_message(sequence_number)?
+            }
+
+            RtmpMessage::Amf0Command {
+                command_name,
+                transaction_id,
+                command_object,
+                additional_arguments,
+            } => {
+                self.response_encoding = AmfEncoding::Amf0;
+                self.handle_amf0_command(
+                    payload.message_stream_id,
+                    command_name,
+                    transaction_id,
+                    command_object,
+                    additional_arguments,
+                )?
+            }
+
+            RtmpMessage::Amf3Command {
+                command_name,
+                transaction_id,
+                command_object,
+                additional_arguments,
+                format: _,
+            } => {
+                // Type 17 and type 20 carry the same NetConnection
+                // and NetStream commands; only the encoding
+                // differs. Project into the AMF0 value model and
+                // run the one set of handlers, so an AMF3 client
+                // gets identical behaviour - including Enhanced
+                // RTMP capability validation - instead of a
+                // parallel implementation that drifts.
+                self.peer_uses_amf3_framing = true;
+                self.response_encoding = AmfEncoding::Amf3;
+                self.handle_amf0_command(
+                    payload.message_stream_id,
+                    command_name,
+                    transaction_id,
+                    command_object.to_amf0(),
+                    additional_arguments.iter().map(|v| v.to_amf0()).collect(),
+                )?
+            }
+
+            RtmpMessage::Amf0SharedObject { data: _ }
+            | RtmpMessage::Amf3SharedObject { data: _ } => {
+                vec![ServerSessionResult::UnhandledMessage(payload)]
+            }
+
+            RtmpMessage::AudioData { data } => self
+                .audio_event(data, payload.message_stream_id, payload.timestamp)?
+                .map(ServerSessionResult::Event)
+                .into_iter()
+                .collect(),
+
+            RtmpMessage::SetChunkSize { size } => self.handle_set_chunk_size(size)?,
+
+            RtmpMessage::SetPeerBandwidth { size, limit_type } => {
+                self.handle_set_peer_bandwidth(size, limit_type)?
+            }
+
+            RtmpMessage::UserControl {
+                event_type,
+                stream_id,
+                buffer_length,
+                timestamp,
+            } => self.handle_user_control(event_type, stream_id, buffer_length, timestamp)?,
+
+            RtmpMessage::VideoData { data } => self
+                .video_event(data, payload.message_stream_id, payload.timestamp)?
+                .map(ServerSessionResult::Event)
+                .into_iter()
+                .collect(),
+
+            RtmpMessage::WindowAcknowledgement { size } => {
+                self.handle_window_acknowledgement(size)?
+            }
+
+            _ => vec![ServerSessionResult::UnhandledMessage(payload)],
+        };
+
+        Ok(message_results)
     }
 
     /// Tells the server session that it should accept an outstanding request
-    pub fn accept_request(
+    fn accept_request_inner(
         &mut self,
         request_id: RequestId,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
         self.ensure_active()?;
-        self.accept_request_with_properties(request_id, Amf0Object::new())
+        self.accept_request_with_properties_inner(request_id, Amf0Object::new())
     }
 
     /// Accept a request and add server capability fields to a successful
     /// `connect` result. Properties are ignored for non-connection requests.
-    pub fn accept_request_with_properties(
+    fn accept_request_with_properties_inner(
         &mut self,
         request_id: RequestId,
         response_properties: Amf0Object,
@@ -565,14 +616,14 @@ impl ServerSession {
         &self,
         message: RtmpMessage,
         stream_id: u32,
-    ) -> Result<crate::messages::MessagePayload, ServerSessionError> {
+    ) -> Result<crate::messages::RawMessage, ServerSessionError> {
         Ok(self
             .encode_response(message)
-            .into_message_payload(self.get_epoch(), stream_id)?)
+            .into_raw_message(self.get_epoch(), stream_id)?)
     }
 
     /// Tells the server session that it should reject an outstanding request
-    pub fn reject_request(
+    fn reject_request_inner(
         &mut self,
         request_id: RequestId,
         code: &str,
@@ -649,16 +700,18 @@ impl ServerSession {
             }
         };
 
-        results.push(ServerSessionResult::OutboundResponse(packet));
+        results.push(ServerSessionResult::Packet(packet));
         Ok(results)
     }
 
     /// Prepares metadata information to be sent to the client
     pub fn send_metadata(
         &mut self,
-        stream_id: StreamId,
+        stream: StreamHandle,
         metadata: &StreamMetadata,
     ) -> Result<Packet, ServerSessionError> {
+        self.ensure_output_drained()?;
+        let stream_id = self.playback_id(stream)?;
         self.ensure_active()?;
         let stream_id = stream_id.get();
         self.response_encoding = self.server_initiated_encoding();
@@ -721,40 +774,9 @@ impl ServerSession {
         Ok(packet)
     }
 
-    /// Prepare video data to be sent to the client
-    pub fn send_video_data(
-        &mut self,
-        stream_id: StreamId,
-        data: Bytes,
-        timestamp: RtmpTimestamp,
-        can_be_dropped: bool,
-    ) -> Result<Packet, ServerSessionError> {
-        self.ensure_active()?;
-        let stream_id = stream_id.get();
-        let message = RtmpMessage::VideoData { data };
-        let payload = message.into_message_payload(timestamp, stream_id)?;
-        let packet = self.serializer.serialize(&payload, false, can_be_dropped)?;
-        Ok(packet)
-    }
-
-    /// Prepare audio data to be sent to the client
-    pub fn send_audio_data(
-        &mut self,
-        stream_id: StreamId,
-        data: Bytes,
-        timestamp: RtmpTimestamp,
-        can_be_dropped: bool,
-    ) -> Result<Packet, ServerSessionError> {
-        self.ensure_active()?;
-        let stream_id = stream_id.get();
-        let message = RtmpMessage::AudioData { data };
-        let payload = message.into_message_payload(timestamp, stream_id)?;
-        let packet = self.serializer.serialize(&payload, false, can_be_dropped)?;
-        Ok(packet)
-    }
-
     /// Sends a ping request to the client
     pub fn send_ping_request(&mut self) -> Result<(Packet, RtmpTimestamp), ServerSessionError> {
+        self.ensure_output_drained()?;
         self.ensure_active()?;
         let epoch = self.get_epoch();
         let message = RtmpMessage::UserControl {
@@ -764,14 +786,21 @@ impl ServerSession {
             stream_id: None,
         };
 
-        let payload = message.into_message_payload(epoch.clone(), 0)?;
+        let payload = message.into_raw_message(epoch.clone(), 0)?;
         let packet = self.serializer.serialize(&payload, false, false)?;
         Ok((packet, epoch))
     }
 
     /// Changes stream to Completed, and sends out an
     /// `onStatus(code: NetStream.Play.Complete)`
-    pub fn finish_playing(&mut self, stream_id: StreamId) -> Result<Packet, ServerSessionError> {
+    pub fn complete_playback(
+        &mut self,
+        stream: StreamHandle,
+    ) -> Result<Packet, ServerSessionError> {
+        self.ensure_output_drained()?;
+        let stream_id = self
+            .stream_id(stream)
+            .ok_or(ServerSessionError::InvalidStreamHandle)?;
         self.ensure_active()?;
         let stream_id = stream_id.get();
         self.response_encoding = self.server_initiated_encoding();
@@ -831,7 +860,7 @@ impl ServerSession {
         let event = ServerSessionEvent::AcknowledgementReceived {
             bytes_received: sequence_number,
         };
-        Ok(vec![ServerSessionResult::RaisedEvent(event)])
+        Ok(vec![ServerSessionResult::Event(event)])
     }
 
     fn handle_amf0_command(
@@ -850,8 +879,8 @@ impl ServerSession {
             "play" => self.handle_command_play(stream_id, transaction_id, additional_args)?,
             "publish" => self.handle_command_publish(stream_id, transaction_id, additional_args)?,
 
-            _ => vec![ServerSessionResult::RaisedEvent(
-                ServerSessionEvent::UnhandleableAmf0Command {
+            _ => vec![ServerSessionResult::Event(
+                ServerSessionEvent::UnhandledCommand {
                     stream_id: StreamId::new(stream_id),
                     command_name: name,
                     additional_values: additional_args,
@@ -913,6 +942,8 @@ impl ServerSession {
 
         let request_number = self.next_request_number;
         self.next_request_number = self.next_request_number.wrapping_add(1);
+        self.session_limits
+            .check_requests(self.outstanding_requests.len())?;
         self.outstanding_requests.insert(request_number, request);
 
         let event = ServerSessionEvent::ConnectionRequested {
@@ -923,7 +954,7 @@ impl ServerSession {
             additional_properties: properties,
         };
 
-        Ok(vec![ServerSessionResult::RaisedEvent(event)])
+        Ok(vec![ServerSessionResult::Event(event)])
     }
 
     fn handle_command_close_stream(
@@ -962,22 +993,24 @@ impl ServerSession {
                 mode: _,
             } => {
                 let event = ServerSessionEvent::PublishStreamFinished {
+                    stream: self.stream_handles.find(stream_id).expect("known stream"),
                     stream_id: StreamId::new(stream_id),
                     app_name,
                     stream_key: stream_key.clone(),
                 };
 
-                vec![ServerSessionResult::RaisedEvent(event)]
+                vec![ServerSessionResult::Event(event)]
             }
 
             StreamState::Playing { ref stream_key } => {
                 let event = ServerSessionEvent::PlayStreamFinished {
+                    stream: self.stream_handles.find(stream_id).expect("known stream"),
                     stream_id: StreamId::new(stream_id),
                     app_name,
                     stream_key: stream_key.clone(),
                 };
 
-                vec![ServerSessionResult::RaisedEvent(event)]
+                vec![ServerSessionResult::Event(event)]
             }
 
             _ => Vec::new(),
@@ -994,14 +1027,21 @@ impl ServerSession {
         &mut self,
         transaction_id: f64,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+        self.session_limits
+            .check_streams(self.active_streams.len())?;
         let new_stream_id = self.next_stream_id;
-        self.next_stream_id = self.next_stream_id + 1;
+        self.next_stream_id = self
+            .next_stream_id
+            .checked_add(1)
+            .ok_or(ServerSessionError::StreamIdsExhausted)?;
 
         let new_stream = ActiveStream {
             current_state: StreamState::Created,
         };
 
         self.active_streams.insert(new_stream_id, new_stream);
+        self.stream_handles
+            .insert((), Some(StreamId::new(new_stream_id)));
 
         let packet = self.create_success_response(
             transaction_id,
@@ -1010,7 +1050,7 @@ impl ServerSession {
             0,
         )?; // Stream create result must always be on stream 0 for flash clients
 
-        Ok(vec![ServerSessionResult::OutboundResponse(packet)])
+        Ok(vec![ServerSessionResult::Packet(packet)])
     }
 
     fn handle_command_delete_stream(
@@ -1048,32 +1088,43 @@ impl ServerSession {
             None => return Ok(Vec::new()),
         };
 
+        self.outstanding_requests
+            .retain(|_, request| match request {
+                OutstandingRequest::PlayRequested { stream_id: id, .. }
+                | OutstandingRequest::PublishRequested { stream_id: id, .. } => *id != stream_id,
+                _ => true,
+            });
         let result = match stream.current_state {
             StreamState::Publishing {
                 ref stream_key,
                 mode: _,
             } => {
                 let event = ServerSessionEvent::PublishStreamFinished {
+                    stream: self.stream_handles.find(stream_id).expect("known stream"),
                     stream_id: StreamId::new(stream_id),
                     stream_key: stream_key.clone(),
                     app_name,
                 };
 
-                vec![ServerSessionResult::RaisedEvent(event)]
+                vec![ServerSessionResult::Event(event)]
             }
 
             StreamState::Playing { ref stream_key } => {
                 let event = ServerSessionEvent::PlayStreamFinished {
+                    stream: self.stream_handles.find(stream_id).expect("known stream"),
                     stream_id: StreamId::new(stream_id),
                     app_name,
                     stream_key: stream_key.clone(),
                 };
 
-                vec![ServerSessionResult::RaisedEvent(event)]
+                vec![ServerSessionResult::Event(event)]
             }
             _ => Vec::new(),
         };
 
+        if let Some(handle) = self.stream_handles.find(stream_id) {
+            self.stream_handles.remove(handle);
+        }
         Ok(result)
     }
 
@@ -1090,7 +1141,7 @@ impl ServerSession {
                 transaction_id,
                 stream_id,
             )?;
-            return Ok(vec![ServerSessionResult::OutboundResponse(packet)]);
+            return Ok(vec![ServerSessionResult::Packet(packet)]);
         }
 
         if self.current_state != SessionState::Connected {
@@ -1100,7 +1151,17 @@ impl ServerSession {
                 transaction_id,
                 stream_id,
             )?;
-            return Ok(vec![ServerSessionResult::OutboundResponse(packet)]);
+            return Ok(vec![ServerSessionResult::Packet(packet)]);
+        }
+
+        if self.stream_handles.find(stream_id).is_none() {
+            let packet = self.create_error_packet(
+                "NetStream.Failed",
+                "Unknown message stream",
+                transaction_id,
+                stream_id,
+            )?;
+            return Ok(vec![ServerSessionResult::Packet(packet)]);
         }
 
         let app_name = match self.connected_app_name {
@@ -1112,7 +1173,7 @@ impl ServerSession {
                     transaction_id,
                     stream_id,
                 )?;
-                return Ok(vec![ServerSessionResult::OutboundResponse(packet)]);
+                return Ok(vec![ServerSessionResult::Packet(packet)]);
             }
         };
 
@@ -1125,7 +1186,7 @@ impl ServerSession {
                     transaction_id,
                     stream_id,
                 )?;
-                return Ok(vec![ServerSessionResult::OutboundResponse(packet)]);
+                return Ok(vec![ServerSessionResult::Packet(packet)]);
             }
         };
 
@@ -1147,7 +1208,7 @@ impl ServerSession {
                         stream_id,
                     )?;
 
-                    return Ok(vec![ServerSessionResult::OutboundResponse(packet)]);
+                    return Ok(vec![ServerSessionResult::Packet(packet)]);
                 }
             },
 
@@ -1158,7 +1219,7 @@ impl ServerSession {
                     transaction_id,
                     stream_id,
                 )?;
-                return Ok(vec![ServerSessionResult::OutboundResponse(packet)]);
+                return Ok(vec![ServerSessionResult::Packet(packet)]);
             }
         };
 
@@ -1171,9 +1232,12 @@ impl ServerSession {
 
         let request_number = self.next_request_number;
         self.next_request_number = self.next_request_number.wrapping_add(1);
+        self.session_limits
+            .check_requests(self.outstanding_requests.len())?;
         self.outstanding_requests.insert(request_number, request);
 
         let event = ServerSessionEvent::PublishStreamRequested {
+            stream: self.stream_handles.find(stream_id).expect("known stream"),
             request_id: RequestId(request_number),
             app_name,
             stream_key,
@@ -1181,7 +1245,7 @@ impl ServerSession {
             stream_id: StreamId::new(stream_id),
         };
 
-        Ok(vec![ServerSessionResult::RaisedEvent(event)])
+        Ok(vec![ServerSessionResult::Event(event)])
     }
 
     fn handle_command_play(
@@ -1197,7 +1261,7 @@ impl ServerSession {
                 transaction_id,
                 stream_id,
             )?;
-            return Ok(vec![ServerSessionResult::OutboundResponse(packet)]);
+            return Ok(vec![ServerSessionResult::Packet(packet)]);
         }
 
         if self.current_state != SessionState::Connected {
@@ -1207,7 +1271,17 @@ impl ServerSession {
                 transaction_id,
                 stream_id,
             )?;
-            return Ok(vec![ServerSessionResult::OutboundResponse(packet)]);
+            return Ok(vec![ServerSessionResult::Packet(packet)]);
+        }
+
+        if self.stream_handles.find(stream_id).is_none() {
+            let packet = self.create_error_packet(
+                "NetStream.Failed",
+                "Unknown message stream",
+                transaction_id,
+                stream_id,
+            )?;
+            return Ok(vec![ServerSessionResult::Packet(packet)]);
         }
 
         let app_name = match self.connected_app_name {
@@ -1219,7 +1293,7 @@ impl ServerSession {
                     transaction_id,
                     stream_id,
                 )?;
-                return Ok(vec![ServerSessionResult::OutboundResponse(packet)]);
+                return Ok(vec![ServerSessionResult::Packet(packet)]);
             }
         };
 
@@ -1232,7 +1306,7 @@ impl ServerSession {
                     transaction_id,
                     stream_id,
                 )?;
-                return Ok(vec![ServerSessionResult::OutboundResponse(packet)]);
+                return Ok(vec![ServerSessionResult::Packet(packet)]);
             }
         };
 
@@ -1289,9 +1363,12 @@ impl ServerSession {
 
         let request_number = self.next_request_number;
         self.next_request_number = self.next_request_number.wrapping_add(1);
+        self.session_limits
+            .check_requests(self.outstanding_requests.len())?;
         self.outstanding_requests.insert(request_number, request);
 
         let event = ServerSessionEvent::PlayStreamRequested {
+            stream: self.stream_handles.find(stream_id).expect("known stream"),
             request_id: RequestId(request_number),
             app_name,
             stream_key,
@@ -1301,23 +1378,23 @@ impl ServerSession {
             stream_id: StreamId::new(stream_id),
         };
 
-        Ok(vec![ServerSessionResult::RaisedEvent(event)])
+        Ok(vec![ServerSessionResult::Event(event)])
     }
 
-    fn handle_audio_data(
+    fn audio_event<D>(
         &self,
-        data: Bytes,
+        data: D,
         stream_id: u32,
         timestamp: RtmpTimestamp,
-    ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+    ) -> Result<Option<ServerSessionEvent<D>>, ServerSessionError> {
         if self.current_state != SessionState::Connected {
             // Audio data sent before connected, just ignore it.
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         let app_name = match self.connected_app_name {
             Some(ref x) => x.clone(),
-            None => return Ok(Vec::new()), // No app name so we aren't in a valid connection state.
+            None => return Ok(None), // No app name so we aren't in a valid connection state.
         };
 
         let publish_stream_key = match self.active_streams.get(&stream_id) {
@@ -1327,14 +1404,15 @@ impl ServerSession {
                         ref stream_key,
                         mode: _,
                     } => stream_key.clone(),
-                    _ => return Ok(Vec::new()), // Not a publishing stream so ignore it
+                    _ => return Ok(None), // Not a publishing stream so ignore it
                 }
             }
 
-            None => return Ok(Vec::new()), // Audio sent over an invalid stream, ignore it
+            None => return Ok(None), // Audio sent over an invalid stream, ignore it
         };
 
         let event = ServerSessionEvent::AudioDataReceived {
+            stream: self.stream_handles.find(stream_id).expect("known stream"),
             stream_id: StreamId::new(stream_id),
             stream_key: publish_stream_key,
             app_name,
@@ -1342,14 +1420,14 @@ impl ServerSession {
             data,
         };
 
-        Ok(vec![ServerSessionResult::RaisedEvent(event)])
+        Ok(Some(event))
     }
 
     fn handle_set_chunk_size(
         &mut self,
         size: u32,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
-        self.deserializer.set_max_chunk_size(size as usize)?;
+        self.deserializer.set_chunk_size(size as usize)?;
         Ok(Vec::new())
     }
 
@@ -1379,33 +1457,33 @@ impl ServerSession {
 
                 let payload = self.to_payload(message, 0)?;
                 let response = self.serializer.serialize(&payload, false, false)?;
-                Ok(vec![ServerSessionResult::OutboundResponse(response)])
+                Ok(vec![ServerSessionResult::Packet(response)])
             }
 
             UserControlEventType::PingResponse => {
                 let timestamp = timestamp.unwrap_or(RtmpTimestamp::new(0));
                 let event = ServerSessionEvent::PingResponseReceived { timestamp };
-                Ok(vec![ServerSessionResult::RaisedEvent(event)])
+                Ok(vec![ServerSessionResult::Event(event)])
             }
 
             _ => Ok(Vec::new()),
         }
     }
 
-    fn handle_video_data(
+    fn video_event<D>(
         &self,
-        data: Bytes,
+        data: D,
         stream_id: u32,
         timestamp: RtmpTimestamp,
-    ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+    ) -> Result<Option<ServerSessionEvent<D>>, ServerSessionError> {
         if self.current_state != SessionState::Connected {
             // Video data sent before connected, just ignore it.
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         let app_name = match self.connected_app_name {
             Some(ref x) => x.clone(),
-            None => return Ok(Vec::new()), // No app name so we aren't in a valid connection state.
+            None => return Ok(None), // No app name so we aren't in a valid connection state.
         };
 
         let publish_stream_key = match self.active_streams.get(&stream_id) {
@@ -1415,14 +1493,15 @@ impl ServerSession {
                         ref stream_key,
                         mode: _,
                     } => stream_key.clone(),
-                    _ => return Ok(Vec::new()), // Not a publishing stream so ignore it
+                    _ => return Ok(None), // Not a publishing stream so ignore it
                 }
             }
 
-            None => return Ok(Vec::new()), // Video sent over an invalid stream, ignore it
+            None => return Ok(None), // Video sent over an invalid stream, ignore it
         };
 
         let event = ServerSessionEvent::VideoDataReceived {
+            stream: self.stream_handles.find(stream_id).expect("known stream"),
             stream_id: StreamId::new(stream_id),
             stream_key: publish_stream_key,
             app_name,
@@ -1430,7 +1509,7 @@ impl ServerSession {
             data,
         };
 
-        Ok(vec![ServerSessionResult::RaisedEvent(event)])
+        Ok(Some(event))
     }
 
     fn handle_window_acknowledgement(
@@ -1438,7 +1517,7 @@ impl ServerSession {
         size: u32,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
         if size == 0 {
-            return Err(ChunkDeserializationError::ResourceLimitExceeded {
+            return Err(DecodeError::ResourceLimitExceeded {
                 resource: "acknowledgement window",
                 attempted: 0,
                 maximum: u32::MAX as usize,
@@ -1488,7 +1567,7 @@ impl ServerSession {
         let packet = self.serializer.serialize(&payload, false, false)?;
 
         let mut results = mem::replace(&mut self.pending_connection_control, Vec::new());
-        results.push(ServerSessionResult::OutboundResponse(packet));
+        results.push(ServerSessionResult::Packet(packet));
         Ok(results)
     }
 
@@ -1546,8 +1625,8 @@ impl ServerSession {
             .serialize(&publish_start_payload, false, false)?;
 
         Ok(vec![
-            ServerSessionResult::OutboundResponse(stream_begin_packet),
-            ServerSessionResult::OutboundResponse(publish_packet),
+            ServerSessionResult::Packet(stream_begin_packet),
+            ServerSessionResult::Packet(publish_packet),
         ])
     }
 
@@ -1636,11 +1715,11 @@ impl ServerSession {
         let reset_packet = self.serializer.serialize(&reset_payload, false, false)?;
 
         Ok(vec![
-            ServerSessionResult::OutboundResponse(reset_packet),
-            ServerSessionResult::OutboundResponse(stream_begin_packet),
-            ServerSessionResult::OutboundResponse(start_packet),
-            ServerSessionResult::OutboundResponse(data1_packet),
-            ServerSessionResult::OutboundResponse(data2_packet),
+            ServerSessionResult::Packet(reset_packet),
+            ServerSessionResult::Packet(stream_begin_packet),
+            ServerSessionResult::Packet(start_packet),
+            ServerSessionResult::Packet(data1_packet),
+            ServerSessionResult::Packet(data2_packet),
         ])
     }
 
@@ -1717,3 +1796,149 @@ fn create_status_object(level: &str, code: &str, description: &str) -> Amf0Objec
     );
     properties
 }
+
+impl ServerSession {
+    /// Prepare audio without copying. Accepts `Bytes`, segmented `Payload`, or owned vectors.
+    pub fn send_audio(
+        &mut self,
+        stream: StreamHandle,
+        data: impl Into<crate::Payload>,
+        timestamp: RtmpTimestamp,
+        drop_policy: crate::chunk_io::DropPolicy,
+    ) -> Result<crate::chunk_io::Packet, ServerSessionError> {
+        self.ensure_output_drained()?;
+        let stream_id = self.playback_id(stream)?;
+        self.ensure_active()?;
+        let stream_id = stream_id.get();
+        Ok(self.serializer.encode(
+            RawMessage {
+                timestamp,
+                type_id: 8,
+                message_stream_id: stream_id,
+                data: data.into(),
+            },
+            crate::chunk_io::EncodeOptions {
+                drop_policy,
+                ..Default::default()
+            },
+        )?)
+    }
+}
+
+impl ServerSession {
+    /// Prepare video without copying. Accepts `Bytes`, segmented `Payload`, or owned vectors.
+    pub fn send_video(
+        &mut self,
+        stream: StreamHandle,
+        data: impl Into<crate::Payload>,
+        timestamp: RtmpTimestamp,
+        drop_policy: crate::chunk_io::DropPolicy,
+    ) -> Result<crate::chunk_io::Packet, ServerSessionError> {
+        self.ensure_output_drained()?;
+        let stream_id = self.playback_id(stream)?;
+        self.ensure_active()?;
+        let stream_id = stream_id.get();
+        Ok(self.serializer.encode(
+            RawMessage {
+                timestamp,
+                type_id: 9,
+                message_stream_id: stream_id,
+                data: data.into(),
+            },
+            crate::chunk_io::EncodeOptions {
+                drop_policy,
+                ..Default::default()
+            },
+        )?)
+    }
+}
+
+impl ServerSession {
+    /// Prepare encoded script data verbatim, without decoding or copying its body.
+    pub fn send_data<D: Into<crate::Payload>>(
+        &mut self,
+        stream: StreamHandle,
+        message: DataMessage<D>,
+    ) -> Result<crate::chunk_io::Packet, ServerSessionError> {
+        self.ensure_output_drained()?;
+        let stream_id = self.playback_id(stream)?;
+        self.ensure_active()?;
+        let stream_id = stream_id.get();
+        let timestamp = message.timestamp();
+        let type_id = message.wire_type().type_id();
+        Ok(self.serializer.encode(
+            RawMessage {
+                timestamp,
+                type_id,
+                message_stream_id: stream_id,
+                data: message.into_payload().into(),
+            },
+            crate::chunk_io::EncodeOptions::default(),
+        )?)
+    }
+}
+
+type ServerSessionEvent<D = Bytes> = ServerEvent<D>;
+
+impl ServerSession {
+    /// Queue the protocol outputs. Drain them through `receive`, including with empty input.
+    pub fn accept_request(&mut self, request_id: RequestId) -> Result<(), ServerSessionError> {
+        let outputs = self.accept_request_inner(request_id)?;
+        self.pending.extend(
+            outputs
+                .into_iter()
+                .map(|output| output.map_payload(crate::Payload::from)),
+        );
+        Ok(())
+    }
+}
+
+impl ServerSession {
+    /// Queue the protocol outputs. Drain them through `receive`, including with empty input.
+    pub fn accept_request_with_properties(
+        &mut self,
+        request_id: RequestId,
+        response_properties: Amf0Object,
+    ) -> Result<(), ServerSessionError> {
+        let outputs = self.accept_request_with_properties_inner(request_id, response_properties)?;
+        self.pending.extend(
+            outputs
+                .into_iter()
+                .map(|output| output.map_payload(crate::Payload::from)),
+        );
+        Ok(())
+    }
+}
+
+impl ServerSession {
+    /// Queue the protocol outputs. Drain them through `receive`, including with empty input.
+    pub fn reject_request(
+        &mut self,
+        request_id: RequestId,
+        code: &str,
+        description: &str,
+    ) -> Result<(), ServerSessionError> {
+        let outputs = self.reject_request_inner(request_id, code, description)?;
+        self.pending.extend(
+            outputs
+                .into_iter()
+                .map(|output| output.map_payload(crate::Payload::from)),
+        );
+        Ok(())
+    }
+}
+
+impl ServerSession {
+    fn ensure_output_drained(&self) -> Result<(), ServerSessionError> {
+        self.ensure_active()?;
+        if !self.pending.is_empty() {
+            return Err(ServerSessionError::PendingOutput);
+        }
+        if self.current_state != SessionState::Connected {
+            return Err(ServerSessionError::NotConnected);
+        }
+        Ok(())
+    }
+}
+
+type DataMessage<D = Bytes> = GenericDataMessage<D>;

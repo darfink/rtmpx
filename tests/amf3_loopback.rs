@@ -8,18 +8,19 @@
 //! this file does: two sans-I/O sessions shuttling bytes in-process, no
 //! network, no binaries.
 
-use bytes::Bytes;
-use rtmpx::amf::AmfEncoding;
-use rtmpx::amf0::Amf0Value;
-use rtmpx::amf3::{self, Amf3Value};
-use rtmpx::chunk_io::ChunkDeserializer;
-use rtmpx::messages::RtmpMessage;
-use rtmpx::sessions::{
-    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult,
-    PublishRequestType, ServerSession, ServerSessionConfig, ServerSessionEvent,
-    ServerSessionResult, StreamMetadata,
+#[path = "support/api.rs"]
+mod api;
+use crate::api::amf::AmfEncoding;
+use crate::api::amf0::Amf0Value;
+use crate::api::amf3::{self, Amf3Value};
+use crate::api::chunk_io::ContiguousDecoder;
+use crate::api::messages::RtmpMessage;
+use crate::api::sessions::{
+    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishMode,
+    ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult, StreamMetadata,
 };
-use rtmpx::time::RtmpTimestamp;
+use crate::api::time::RtmpTimestamp;
+use bytes::Bytes;
 
 /// Two sessions wired back to back. Every outbound packet from one side is fed
 /// straight into the other until neither side has anything left to say, so
@@ -57,11 +58,11 @@ impl Pump {
         let mut bytes = Vec::new();
         for result in results {
             match result {
-                ClientSessionResult::OutboundResponse(packet) => {
-                    bytes.extend_from_slice(&packet.bytes);
+                ClientSessionResult::Packet(packet) => {
+                    bytes.extend_from_slice(&packet.to_vec());
                 }
-                ClientSessionResult::RaisedEvent(event) => self.client_events.push(event),
-                ClientSessionResult::UnhandleableMessageReceived(_) => {}
+                ClientSessionResult::Event(event) => self.client_events.push(event),
+                ClientSessionResult::UnhandledMessage(_) => {}
                 #[allow(unreachable_patterns)]
                 _ => panic!("unexpected future protocol variant"),
             }
@@ -81,11 +82,11 @@ impl Pump {
         let mut bytes = Vec::new();
         for result in results {
             match result {
-                ServerSessionResult::OutboundResponse(packet) => {
-                    bytes.extend_from_slice(&packet.bytes);
+                ServerSessionResult::Packet(packet) => {
+                    bytes.extend_from_slice(&packet.to_vec());
                 }
-                ServerSessionResult::RaisedEvent(event) => self.server_events.push(event),
-                ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                ServerSessionResult::Event(event) => self.server_events.push(event),
+                ServerSessionResult::UnhandledMessage(_) => {}
                 #[allow(unreachable_patterns)]
                 _ => panic!("unexpected future protocol variant"),
             }
@@ -113,7 +114,7 @@ impl Pump {
 /// Decode every message in a captured byte stream, honouring in-band chunk
 /// size changes the way a real peer would.
 fn decode_all(raw: &[u8]) -> Vec<RtmpMessage> {
-    let mut deserializer = ChunkDeserializer::new();
+    let mut deserializer = ContiguousDecoder::new();
     let mut messages = Vec::new();
     let mut first = true;
     loop {
@@ -135,7 +136,7 @@ fn decode_all(raw: &[u8]) -> Vec<RtmpMessage> {
                     .expect("captured payload must parse");
                 if let RtmpMessage::SetChunkSize { size } = &message {
                     deserializer
-                        .set_max_chunk_size(*size as usize)
+                        .set_chunk_size(*size as usize)
                         .expect("chunk size must apply");
                 }
                 messages.push(message);
@@ -176,7 +177,7 @@ fn connect_and_publish(pump: &mut Pump, stream_key: &str) {
 
     let out = pump
         .client
-        .request_publishing(stream_key.to_string(), PublishRequestType::Live)
+        .request_publishing(stream_key.to_string(), PublishMode::Live)
         .expect("publish must build");
     pump.push_client(vec![out]);
     let request_id = pump
@@ -279,15 +280,13 @@ fn amf3_client_publishes_into_our_server() {
     let meta = events
         .iter()
         .find_map(|event| match event {
-            ServerSessionEvent::StreamMetadataChanged {
-                metadata, message, ..
-            } => Some((
-                metadata.clone(),
-                message.wire_type() == rtmpx::sessions::DataMessageType::Amf3,
+            ServerSessionEvent::StreamDataReceived { message, .. } => Some((
+                crate::api::sessions::metadata(message),
+                message.wire_type() == crate::api::sessions::DataMessageType::Amf3,
             )),
             _ => None,
         })
-        .expect("metadata must raise StreamMetadataChanged");
+        .expect("metadata must raise StreamDataReceived");
     assert!(!meta.1, "typed metadata must arrive as AMF0 even on AMF3");
     assert_eq!(meta.0.video_width, Some(1280));
     assert_eq!(meta.0.video_codec_id, Some(7));
@@ -325,8 +324,8 @@ fn amf3_client_publishes_into_our_server() {
     let probe = amf3_probe_body();
     let out = pump
         .client
-        .publish_data(rtmpx::sessions::DataMessage::new(
-            rtmpx::sessions::DataMessageType::Amf3,
+        .publish_data(crate::api::sessions::DataMessage::new(
+            crate::api::sessions::DataMessageType::Amf3,
             RtmpTimestamp::new(0),
             probe.clone(),
         ))
@@ -336,13 +335,13 @@ fn amf3_client_publishes_into_our_server() {
     let probe_event = events
         .iter()
         .find_map(|event| match event {
-            ServerSessionEvent::StreamMetadataChanged { message, .. } => Some((
+            ServerSessionEvent::StreamDataReceived { message, .. } => Some((
                 message.payload().clone(),
-                message.wire_type() == rtmpx::sessions::DataMessageType::Amf3,
+                message.wire_type() == crate::api::sessions::DataMessageType::Amf3,
             )),
             _ => None,
         })
-        .expect("amf3 setDataFrame must raise StreamMetadataChanged");
+        .expect("amf3 setDataFrame must raise StreamDataReceived");
     assert!(probe_event.1, "type-15 data must be flagged AMF3");
     assert_eq!(
         probe_event.0, probe,

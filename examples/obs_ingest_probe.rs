@@ -21,10 +21,11 @@
 
 use std::time::{Duration, Instant};
 
-use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rtmpx::sessions::{
-    ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
-};
+#[path = "support/io.rs"]
+mod transport;
+use bytes::Bytes;
+use rtmpx::handshake::{Handshake, HandshakeProgress, HandshakeRole};
+use rtmpx::sessions::{ServerEvent, ServerOutput, ServerSession, ServerSessionConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -32,19 +33,19 @@ type ProbeResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 async fn write_results(
     stream: &mut tokio::net::TcpStream,
-    results: Vec<ServerSessionResult>,
+    mut input: Bytes,
     session: &mut ServerSession,
 ) -> ProbeResult<(usize, usize, usize)> {
     let mut meta = 0;
     let mut audio = 0;
     let mut video = 0;
-    for result in results {
+    while let Some(result) = session.receive(&mut input)? {
         match result {
-            ServerSessionResult::OutboundResponse(packet) => {
-                stream.write_all(&packet.bytes).await?;
+            ServerOutput::Packet(packet) => {
+                transport::write_packet(stream, packet).await?;
             }
-            ServerSessionResult::RaisedEvent(event) => match event {
-                ServerSessionEvent::ConnectionRequested {
+            ServerOutput::Event(event) => match event {
+                ServerEvent::ConnectionRequested {
                     app_name,
                     request_id,
                     additional_properties,
@@ -54,13 +55,9 @@ async fn write_results(
                     for (k, v) in additional_properties.iter() {
                         println!("          prop {k} = {v:?}");
                     }
-                    let follow = session.accept_request(request_id)?;
-                    let (m, a, v) = Box::pin(write_results(stream, follow, session)).await?;
-                    meta += m;
-                    audio += a;
-                    video += v;
+                    session.accept_request(request_id)?;
                 }
-                ServerSessionEvent::PublishStreamRequested {
+                ServerEvent::PublishStreamRequested {
                     stream_key,
                     request_id,
                     mode,
@@ -68,18 +65,18 @@ async fn write_results(
                     ..
                 } => {
                     println!("[publish] key={stream_key} mode={mode:?} stream={stream_id}");
-                    let follow = session.accept_request(request_id)?;
-                    let (m, a, v) = Box::pin(write_results(stream, follow, session)).await?;
-                    meta += m;
-                    audio += a;
-                    video += v;
+                    session.accept_request(request_id)?;
                 }
-                ServerSessionEvent::StreamMetadataChanged {
+                ServerEvent::StreamDataReceived {
                     message,
-                    metadata,
                     stream_key,
                     ..
                 } => {
+                    let Some(properties) = message.metadata()? else {
+                        continue;
+                    };
+                    let mut metadata = rtmpx::sessions::StreamMetadata::new();
+                    metadata.apply_metadata_values(properties);
                     let is_amf3 = message.wire_type() == rtmpx::sessions::DataMessageType::Amf3;
                     meta += 1;
                     println!(
@@ -91,7 +88,7 @@ async fn write_results(
                         metadata.encoder
                     );
                 }
-                ServerSessionEvent::AudioDataReceived {
+                ServerEvent::AudioDataReceived {
                     data, timestamp, ..
                 } => {
                     audio += 1;
@@ -100,11 +97,11 @@ async fn write_results(
                             "[audio #{audio}] {} bytes ts={} head={:02x?}",
                             data.len(),
                             timestamp.value,
-                            &data[..data.len().min(4)]
+                            &data.to_bytes()[..data.len().min(4)]
                         );
                     }
                 }
-                ServerSessionEvent::VideoDataReceived {
+                ServerEvent::VideoDataReceived {
                     data, timestamp, ..
                 } => {
                     video += 1;
@@ -113,16 +110,16 @@ async fn write_results(
                             "[video #{video}] {} bytes ts={} head={:02x?}",
                             data.len(),
                             timestamp.value,
-                            &data[..data.len().min(6)]
+                            &data.to_bytes()[..data.len().min(6)]
                         );
                     }
                 }
-                ServerSessionEvent::UnhandleableAmf0Command { command_name, .. } => {
+                ServerEvent::UnhandledCommand { command_name, .. } => {
                     println!("[quirk] {command_name} (tolerated, no server semantics)");
                 }
                 other => println!("[event] {other:?}"),
             },
-            ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            ServerOutput::UnhandledMessage(_) => {}
             _ => return Err("unsupported protocol result; update the adapter".into()),
         }
     }
@@ -166,7 +163,7 @@ async fn main() -> ProbeResult<()> {
     stream.set_nodelay(true)?;
 
     // RTMP handshake as server.
-    let mut handshake = Handshake::new(PeerType::Server);
+    let mut handshake = Handshake::new(HandshakeRole::Server);
     let mut buf = vec![0u8; 16 * 1024];
     let carry = loop {
         let n = stream.read(&mut buf).await?;
@@ -174,13 +171,13 @@ async fn main() -> ProbeResult<()> {
             return Err("publisher went away during handshake".into());
         }
         match handshake.process_bytes(&buf[..n])? {
-            HandshakeProcessResult::InProgress { response_bytes } => {
+            HandshakeProgress::InProgress { response_bytes } => {
                 if !response_bytes.is_empty() {
                     stream.write_all(&response_bytes).await?;
                     stream.flush().await?;
                 }
             }
-            HandshakeProcessResult::Completed {
+            HandshakeProgress::Completed {
                 response_bytes,
                 remaining_bytes,
             } => {
@@ -193,11 +190,10 @@ async fn main() -> ProbeResult<()> {
         }
     };
 
-    let (mut session, initial) = ServerSession::new(ServerSessionConfig::new())?;
-    assert!(initial.is_empty(), "server must not write before connect");
+    let mut session = ServerSession::new(ServerSessionConfig::new())?;
     let (mut total_meta, mut total_audio, mut total_video) = (0, 0, 0);
     if !carry.is_empty() {
-        let results = session.handle_input(&carry)?;
+        let results = Bytes::from(carry);
         let (m, a, v) = write_results(&mut stream, results, &mut session).await?;
         total_meta += m;
         total_audio += a;
@@ -215,7 +211,7 @@ async fn main() -> ProbeResult<()> {
                 break;
             }
             Ok(Ok(n)) => {
-                let results = session.handle_input(&buf[..n])?;
+                let results = Bytes::copy_from_slice(&buf[..n]);
                 let (m, a, v) = write_results(&mut stream, results, &mut session).await?;
                 total_meta += m;
                 total_audio += a;

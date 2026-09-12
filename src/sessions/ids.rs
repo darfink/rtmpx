@@ -22,6 +22,8 @@ impl RequestId {
 pub struct StreamId(u32);
 
 impl StreamId {
+    /// Connection-level message channel. This is distinct from chunk stream ID 2.
+    pub const CONTROL: Self = Self(0);
     pub const fn new(value: u32) -> Self {
         Self(value)
     }

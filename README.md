@@ -24,6 +24,12 @@ embeds in any async runtime or proxy without mandating one.
 The AMF0/AMF3 codecs are intentionally inlined into this crate: they exist to
 serve its RTMP framing, not as general-purpose libraries.
 
+Client and server sessions expose one `receive(&mut Bytes)` loop. Each media operation has a local `StreamHandle`.
+Clients can play and publish concurrently, or delete a stream and immediately start another operation.
+Media sends return an owned `Packet` with resumable vectored writes. See the [API and ownership guide](docs/zero-copy.md).
+
+Version 3 replaces the version 2 public API. See the [release notes](CHANGELOG.md) for migration details.
+
 ## Testing
 
 Comprehensively tested. Around 300 tests in the default suite (`cargo test`, no network,
@@ -43,7 +49,7 @@ publishers, encoders, and RTMP clients.
 Based on `rml_rtmp` 0.8.0 (upstream master `953fc41d`, 2023-05-31), with the
 AMF0 codec derived from `rml_amf0` 0.3.0.
 
-- `ClientSession::request_connection_with_properties` merges extra AMF0 properties into the `connect` command object, so a proxy can forward the E-RTMP capability advertisement (`fourCcList`, `capsEx`, FourCC info maps). `request_connection` delegates to it, upstream behaviour unchanged.
+- `ClientSession::connect_with_properties` merges extra AMF0 properties into the `connect` command object. Proxies can forward E-RTMP capabilities (`fourCcList`, `capsEx`, FourCC info maps). `connect` uses the default properties.
 - `ServerSession` keeps the original metadata message (`DataMessage`) and exposes unconsumed connect fields (`additional_properties`), so proxies relay metadata and connect properties verbatim instead of dropping them.
 - Acknowledgements are cumulative (total bytes received, per spec) and fall back to the advertised window when the peer never sends one (ffmpeg never does); overshoot is kept modulo the window, zero windows are rejected.
 - Timestamp deltas across the u32 rollover (~49 days of continuous streaming) are computed with wrapping arithmetic, so long-lived publishes keep correct deltas past the boundary; pinned by round-trip regression tests.
@@ -51,14 +57,14 @@ AMF0 codec derived from `rml_amf0` 0.3.0.
 - `reject_request` answers `connect` with `_error` but `publish`/`play` with `onStatus` errors -- the shape encoders actually watch for.
 - The AMF0 codec is hardened (depth/collection caps, exact reads, strict arrays, long-string/date/xml/typed-object/avmplus markers, no `drain(..3)` panic); a new AMF3 codec converts losslessly both ways; Enhanced RTMP is validated with an in-house FLV parser with original bytes authoritative for relay.
 - Also: `deleteStream` accepts GStreamer decimal-string stream ids, clients see full result property maps, publish modes match case-insensitively.
-- Playback interop: `play` always sends `start` (`-2.0`, live-first default) - strict servers ignore single-argument `play` -- and script data still arrives when mistyped (client unwraps `@setDataFrame`, type 18 falls back to bare AMF3).
+- Playback interop: `play` always sends `start` (`-2.0`, live-first default) - strict servers ignore single-argument `play` -- and script data still arrives when mistyped (explicit metadata inspection handles `@setDataFrame` and falls back to bare AMF3 for type 18).
 
 ## Examples
 
 Minimal client and server to copy the sans-I/O glue from:
 
 - Barebone publisher (`examples/publish.rs`): connect, publish, metadata, audio/video. Media bytes are placeholders; swap in real frames.
-- Barebone listener (`examples/serve.rs`): handshake, accept, per-frame logging. Accepts ffmpeg, OBS, or the publisher above.
+- Barebone listener (`examples/serve.rs`): handshake, accept, borrowed media inspection. Accepts ffmpeg, OBS, or the publisher above.
 - Manual OBS probe (`examples/obs_ingest_probe.rs`): logs exactly what a real OBS build sends, for eyeballing new OBS versions.
 
 Run the listener, then publish into it:
@@ -85,3 +91,8 @@ derives from (Copyright 2017 Matthew Shapiro).
 [docs]: https://docs.rs/rtmpx/
 [license-shield]: https://img.shields.io/crates/l/rtmpx.svg?style=for-the-badge
 [license]: https://github.com/darfink/rtmpx
+
+## Zero-copy APIs
+
+The [allocation and ownership guide](docs/zero-copy.md) covers packet cursors, borrowed input, segmented session events, and AMF object graphs.
+Run `cargo run --example zero_copy` for a complete example.

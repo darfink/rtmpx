@@ -24,11 +24,11 @@ pub(crate) fn encode_body(
             // to_amf0 parks AMF3-only values behind the avmplus escape, so this
             // is lossless in both directions.
             let as_amf0: Vec<_> = values.iter().map(|v| v.to_amf0()).collect();
-            payload.extend_from_slice(&crate::amf0::serialize(&as_amf0)?);
+            crate::amf0::serialize_into(&as_amf0, &mut payload)?;
         }
         AmfEncoding::Amf3 => {
             payload.push(FORMAT_SELECTOR_AMF3);
-            payload.extend_from_slice(&amf3::serialize(values)?);
+            amf3::serialize_into(values, &mut payload)?;
         }
     }
     Ok(Bytes::from(payload))

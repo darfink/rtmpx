@@ -7,43 +7,43 @@
 //! The deserializer keeps a single `current_payload_data` buffer shared across
 //! all chunk streams, so an interleaved message corrupts the in-progress one.
 
+#[path = "support/api.rs"]
+mod api;
+use crate::api::chunk_io::{ChunkEncoder, ContiguousDecoder};
+use crate::api::messages::RtmpMessage;
+use crate::api::time::RtmpTimestamp;
 use bytes::{BufMut, BytesMut};
-use rtmpx::chunk_io::{ChunkDeserializer, ChunkSerializer};
-use rtmpx::messages::RtmpMessage;
-use rtmpx::time::RtmpTimestamp;
 
 #[test]
 fn control_message_interleaved_into_a_split_video_message() {
-    let mut serializer = ChunkSerializer::new();
-    let mut deserializer = ChunkDeserializer::new();
+    let mut serializer = ChunkEncoder::new();
+    let mut deserializer = ContiguousDecoder::new();
 
     // Small chunk size so the video message must span several chunks.
     let chunk_size = 128;
     let packet = serializer
-        .set_max_chunk_size(chunk_size, RtmpTimestamp::new(0))
+        .set_chunk_size(chunk_size, RtmpTimestamp::new(0))
         .unwrap();
     let mut wire = BytesMut::new();
-    wire.put_slice(&packet.bytes);
+    wire.put_slice(&packet.to_vec());
 
     // A video message several chunks long.
     let video = RtmpMessage::VideoData {
         data: bytes::Bytes::from(vec![0x27u8; 1024]),
     };
-    let video_payload = video
-        .into_message_payload(RtmpTimestamp::new(0), 1)
-        .unwrap();
+    let video_payload = video.into_raw_message(RtmpTimestamp::new(0), 1).unwrap();
     let video_packet = serializer.serialize(&video_payload, false, false).unwrap();
 
     // An acknowledgement, which travels on its own chunk stream.
     let ack = RtmpMessage::Acknowledgement {
         sequence_number: 4096,
     };
-    let ack_payload = ack.into_message_payload(RtmpTimestamp::new(0), 0).unwrap();
+    let ack_payload = ack.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
     let ack_packet = serializer.serialize(&ack_payload, false, false).unwrap();
 
     // Feed the chunk-size change, then the video message, then the ack.
-    wire.put_slice(&video_packet.bytes);
-    wire.put_slice(&ack_packet.bytes);
+    wire.put_slice(&video_packet.to_vec());
+    wire.put_slice(&ack_packet.to_vec());
 
     let mut input: &[u8] = &wire;
     let mut messages = Vec::new();
@@ -66,7 +66,7 @@ fn control_message_interleaved_into_a_split_video_message() {
 /// message on csid 5 is injected between its chunks. This is legal RTMP.
 #[test]
 fn manually_interleaved_chunk_streams_do_not_panic() {
-    let mut deserializer = ChunkDeserializer::new();
+    let mut deserializer = ContiguousDecoder::new();
     let mut wire = BytesMut::new();
 
     // Type 0 header on csid 4 announcing a 600 byte video message.
@@ -146,7 +146,7 @@ fn manually_interleaved_chunk_streams_do_not_panic() {
 /// produce a protocol error, not an arithmetic panic.
 #[test]
 fn message_length_shorter_than_buffered_payload_is_an_error_not_a_panic() {
-    let mut deserializer = ChunkDeserializer::new();
+    let mut deserializer = ContiguousDecoder::new();
     let mut wire = BytesMut::new();
 
     // Announce 600 bytes on csid 4 and send one full 128 byte chunk.

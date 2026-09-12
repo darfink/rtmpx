@@ -7,37 +7,39 @@
 //! `releaseStream` -> `FCPublish` -> `createStream` -> `publish` ->
 //! `@setDataFrame onMetaData` -> audio/video -> `FCUnpublish` ->
 //! `deleteStream`. `releaseStream`/`FCPublish`/`FCUnpublish` have no RTMP
-//! semantics on our side; they must surface as `UnhandleableAmf0Command`
+//! semantics on our side; they must surface as `UnhandledCommand`
 //! and leave the session usable, exactly as the live ffmpeg leg already
 //! proves for ffmpeg's own `releaseStream`/`FCPublish`.
 //!
 //! No network, no binaries: raw chunk bytes in-process, mirroring
 //! `tests/data_events.rs`.
 
-use bytes::Bytes;
-use rtmpx::amf0::{Amf0Object, Amf0Value};
-use rtmpx::chunk_io::{ChunkDeserializer, ChunkSerializer};
-use rtmpx::messages::RtmpMessage;
-use rtmpx::sessions::{
+#[path = "support/api.rs"]
+mod api;
+use crate::api::amf0::{Amf0Object, Amf0Value};
+use crate::api::chunk_io::{ChunkEncoder, ContiguousDecoder};
+use crate::api::messages::RtmpMessage;
+use crate::api::sessions::{
     ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
 };
-use rtmpx::time::RtmpTimestamp;
+use crate::api::time::RtmpTimestamp;
+use bytes::Bytes;
 
 fn consume_server_outbound(
-    deserializer: &mut ChunkDeserializer,
+    deserializer: &mut ContiguousDecoder,
     results: Vec<ServerSessionResult>,
 ) {
     for result in results {
-        if let ServerSessionResult::OutboundResponse(packet) = result {
+        if let ServerSessionResult::Packet(packet) = result {
             let payload = deserializer
-                .get_next_message(&packet.bytes)
+                .get_next_message(&packet.to_vec())
                 .expect("server response must decode")
                 .expect("server response must be complete");
             if let RtmpMessage::SetChunkSize { size } =
                 payload.to_rtmp_message().expect("response must parse")
             {
                 deserializer
-                    .set_max_chunk_size(size as usize)
+                    .set_chunk_size(size as usize)
                     .expect("chunk size must apply");
             }
         }
@@ -46,7 +48,7 @@ fn consume_server_outbound(
 
 fn feed_server(
     session: &mut ServerSession,
-    deserializer: &mut ChunkDeserializer,
+    deserializer: &mut ContiguousDecoder,
     bytes: &[u8],
 ) -> (Vec<RtmpMessage>, Vec<ServerSessionEvent>) {
     let mut responses = Vec::new();
@@ -56,21 +58,21 @@ fn feed_server(
         .expect("server must accept OBS bytes");
     for result in results {
         match result {
-            ServerSessionResult::OutboundResponse(packet) => {
+            ServerSessionResult::Packet(packet) => {
                 let payload = deserializer
-                    .get_next_message(&packet.bytes)
+                    .get_next_message(&packet.to_vec())
                     .expect("server response must decode")
                     .expect("server response must be complete");
                 let message = payload.to_rtmp_message().expect("response must parse");
                 if let RtmpMessage::SetChunkSize { size } = &message {
                     deserializer
-                        .set_max_chunk_size(*size as usize)
+                        .set_chunk_size(*size as usize)
                         .expect("chunk size must apply");
                 }
                 responses.push(message);
             }
-            ServerSessionResult::RaisedEvent(event) => events.push(event),
-            ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            ServerSessionResult::Event(event) => events.push(event),
+            ServerSessionResult::UnhandledMessage(_) => {}
             #[allow(unreachable_patterns)]
             _ => panic!("unexpected future protocol variant"),
         }
@@ -80,20 +82,20 @@ fn feed_server(
 
 fn send_to_server(
     session: &mut ServerSession,
-    serializer: &mut ChunkSerializer,
-    deserializer: &mut ChunkDeserializer,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
     message: RtmpMessage,
     stream_id: u32,
     timestamp: u32,
     first_on_stream: bool,
 ) -> (Vec<RtmpMessage>, Vec<ServerSessionEvent>) {
     let payload = message
-        .into_message_payload(RtmpTimestamp::new(timestamp), stream_id)
+        .into_raw_message(RtmpTimestamp::new(timestamp), stream_id)
         .expect("message must encode");
     let packet = serializer
         .serialize(&payload, first_on_stream, false)
         .expect("must serialize");
-    feed_server(session, deserializer, &packet.bytes)
+    feed_server(session, deserializer, &packet.to_vec())
 }
 
 fn amf0_command(name: &str, tid: f64, args: Vec<Amf0Value>) -> RtmpMessage {
@@ -173,8 +175,8 @@ fn aac_sequence_header() -> Bytes {
 fn obs_connect_sequence_ingests_media() {
     let (mut session, initial) =
         ServerSession::new(ServerSessionConfig::new()).expect("server must start");
-    let mut deserializer = ChunkDeserializer::new();
-    let mut serializer = ChunkSerializer::new();
+    let mut deserializer = ContiguousDecoder::new();
+    let mut serializer = ChunkEncoder::new();
     consume_server_outbound(&mut deserializer, initial);
 
     // connect
@@ -214,8 +216,8 @@ fn obs_connect_sequence_ingests_media() {
             false,
         );
         assert!(
-            events.iter().any(|e| matches!(e, ServerSessionEvent::UnhandleableAmf0Command { command_name, .. } if command_name == name)),
-            "{name} must surface as UnhandleableAmf0Command, saw {events:?}"
+            events.iter().any(|e| matches!(e, ServerSessionEvent::UnhandledCommand { command_name, .. } if command_name == name)),
+            "{name} must surface as UnhandledCommand, saw {events:?}"
         );
     }
 
@@ -285,14 +287,14 @@ fn obs_connect_sequence_ingests_media() {
     let meta = events
         .iter()
         .find_map(|e| match e {
-            ServerSessionEvent::StreamMetadataChanged {
-                metadata,
+            ServerSessionEvent::StreamDataReceived {
+                message,
                 stream_key,
                 ..
-            } if stream_key.as_ref() == key => Some(metadata.clone()),
+            } if stream_key.as_ref() == key => Some(crate::api::sessions::metadata(message)),
             _ => None,
         })
-        .expect("metadata must raise StreamMetadataChanged");
+        .expect("metadata must raise StreamDataReceived");
     assert_eq!(meta.video_width, Some(1920));
     assert_eq!(meta.video_height, Some(1080));
     assert_eq!(meta.video_codec_id, Some(7));
@@ -351,7 +353,7 @@ fn obs_connect_sequence_ingests_media() {
         0,
         false,
     );
-    assert!(events.iter().any(|e| matches!(e, ServerSessionEvent::UnhandleableAmf0Command { command_name, .. } if command_name == "FCUnpublish")), "FCUnpublish must be unhandleable-but-harmless, saw {events:?}");
+    assert!(events.iter().any(|e| matches!(e, ServerSessionEvent::UnhandledCommand { command_name, .. } if command_name == "FCUnpublish")), "FCUnpublish must be unhandleable-but-harmless, saw {events:?}");
     let (_, events) = send_to_server(
         &mut session,
         &mut serializer,

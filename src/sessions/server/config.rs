@@ -1,9 +1,8 @@
 use crate::amf::AmfEncoding;
-use crate::chunk_io::ChunkDeserializerConfig;
+use crate::chunk_io::DecoderLimits;
 
 /// The configuration options that govern how a RTMP server session should operate
 #[derive(Clone)]
-#[non_exhaustive]
 pub struct ServerSessionConfig {
     pub fms_version: String,
     pub chunk_size: u32,
@@ -21,8 +20,12 @@ pub struct ServerSessionConfig {
     /// inbound type 15/17 messages are decoded either way, so lowering this is
     /// safe against a peer that sends AMF3 regardless.
     pub max_object_encoding: AmfEncoding,
+    /// Optional shared cache of payload descriptors.
+    pub payload_pool: Option<crate::PayloadPool>,
     /// Limits for untrusted inbound chunk state.
-    pub chunk_deserializer: ChunkDeserializerConfig,
+    pub decoder_limits: DecoderLimits,
+    /// Bounds for live streams and pending requests.
+    pub session_limits: crate::sessions::SessionLimits,
 }
 
 impl ServerSessionConfig {
@@ -35,7 +38,9 @@ impl ServerSessionConfig {
             chunk_size: 4096,
             send_on_bw_done_message_on_start: true,
             max_object_encoding: AmfEncoding::Amf3,
-            chunk_deserializer: ChunkDeserializerConfig::default(),
+            payload_pool: None,
+            decoder_limits: DecoderLimits::default(),
+            session_limits: crate::sessions::SessionLimits::default(),
         }
     }
 }
@@ -77,9 +82,17 @@ impl ServerSessionConfig {
         self.max_object_encoding = value;
         self
     }
-    /// Set `chunk_deserializer`.
-    pub fn with_chunk_deserializer(mut self, value: ChunkDeserializerConfig) -> Self {
-        self.chunk_deserializer = value;
+    /// Set `decoder_limits`.
+    pub fn with_decoder_limits(mut self, value: DecoderLimits) -> Self {
+        self.decoder_limits = value;
+        self
+    }
+}
+
+impl ServerSessionConfig {
+    /// Set the bounds for live streams and pending requests.
+    pub fn with_session_limits(mut self, limits: crate::sessions::SessionLimits) -> Self {
+        self.session_limits = limits;
         self
     }
 }

@@ -2,7 +2,6 @@ use crate::sessions::DataMessage;
 use std::collections::BTreeMap;
 
 use crate::amf0::{Amf0Object, Amf0Value};
-use bytes::Bytes;
 use thiserror::Error;
 
 use crate::{EnhancedValidationMode, MediaInterpretation};
@@ -10,9 +9,9 @@ use crate::{EnhancedValidationMode, MediaInterpretation};
 /// A typed `onMetaData` view plus the exact encoded AMF payload.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub struct ValidatedMetadata {
+pub struct ValidatedMetadata<D = crate::Payload> {
     /// Original RTMP message body, authoritative for forwarding and demuxing.
-    message: DataMessage,
+    message: DataMessage<D>,
     interpretation: MediaInterpretation<ParsedMetadata>,
 }
 
@@ -212,10 +211,10 @@ pub struct MetadataValidationError {
     reason: String,
 }
 
-impl ValidatedMetadata {
+impl<D: crate::Segments> ValidatedMetadata<D> {
     /// Decode and validate metadata from the original encoded message.
     pub fn parse(
-        message: DataMessage,
+        message: DataMessage<D>,
         mode: EnhancedValidationMode,
     ) -> Result<Self, MetadataValidationError> {
         let parsed = message
@@ -238,16 +237,16 @@ impl ValidatedMetadata {
         }
     }
     /// Original encoded message, including its wire type and timestamp.
-    pub fn message(&self) -> &DataMessage {
+    pub fn message(&self) -> &DataMessage<D> {
         &self.message
     }
-    pub fn raw(&self) -> &Bytes {
+    pub fn raw(&self) -> &D {
         self.message.payload()
     }
     pub fn interpretation(&self) -> &MediaInterpretation<ParsedMetadata> {
         &self.interpretation
     }
-    pub fn into_parts(self) -> (DataMessage, MediaInterpretation<ParsedMetadata>) {
+    pub fn into_parts(self) -> (DataMessage<D>, MediaInterpretation<ParsedMetadata>) {
         (self.message, self.interpretation)
     }
 }
@@ -487,6 +486,7 @@ fn parse_codec(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     fn four_cc(value: &[u8; 4]) -> Amf0Value {
         Amf0Value::Number(f64::from(u32::from_be_bytes(*value)))

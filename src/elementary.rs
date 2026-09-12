@@ -85,6 +85,16 @@ impl ValidatedMedia<ParsedAudio> {
     // them. One Enhanced tag may carry several tracks; each mapped track is
     // its own unit so a packed ManyTracks message does not drop siblings.
     pub fn elementary_units(&self) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
+        let mut output = Vec::new();
+        self.visit_elementary_units(|unit| output.push(unit))?;
+        Ok(output)
+    }
+
+    /// Emit mapped units without allocating a result collection.
+    pub fn visit_elementary_units(
+        &self,
+        mut emit: impl FnMut(ElementaryUnit),
+    ) -> Result<(), MediaValidationError> {
         match self.interpretation() {
             MediaInterpretation::Opaque { reason } => Err(MediaValidationError::Malformed {
                 kind: "audio",
@@ -92,34 +102,43 @@ impl ValidatedMedia<ParsedAudio> {
             }),
             MediaInterpretation::Parsed(parsed) => match &parsed.body {
                 AudioTagBody::Legacy(LegacyAudioBody::AacSequenceHeader(_)) => {
-                    Ok(vec![ElementaryUnit::Configuration {
+                    emit(ElementaryUnit::Configuration {
                         codec: ElementaryCodec::Aac,
                         extradata: slice_after(self.raw(), LEGACY_AAC_HEADER_BYTES, "audio")?,
                         track_id: None,
-                    }])
+                    });
+                    Ok(())
                 }
                 AudioTagBody::Legacy(LegacyAudioBody::AacRaw(_)) => {
-                    Ok(vec![ElementaryUnit::Sample {
+                    emit(ElementaryUnit::Sample {
                         codec: ElementaryCodec::Aac,
                         payload: slice_after(self.raw(), LEGACY_AAC_HEADER_BYTES, "audio")?,
                         keyframe: true,
                         composition_time_offset: 0,
                         track_id: None,
-                    }])
+                    });
+                    Ok(())
                 }
-                AudioTagBody::Legacy(_) => Ok(Vec::new()),
-                AudioTagBody::Enhanced(body) => enhanced_audio(body),
+                AudioTagBody::Legacy(_) => Ok(()),
+                AudioTagBody::Enhanced(body) => enhanced_audio(body, &mut emit),
             },
         }
     }
 
     /// Return zero or one mapped unit. Multiple units produce an error.
     pub fn elementary_unit(&self) -> Result<Option<ElementaryUnit>, MediaValidationError> {
-        let units = self.elementary_units()?;
-        if units.len() > 1 {
-            return Err(MediaValidationError::MultipleUnits { count: units.len() });
+        let mut first = None;
+        let mut count = 0;
+        self.visit_elementary_units(|unit| {
+            count += 1;
+            if first.is_none() {
+                first = Some(unit);
+            }
+        })?;
+        if count > 1 {
+            return Err(MediaValidationError::MultipleUnits { count });
         }
-        Ok(units.into_iter().next())
+        Ok(first)
     }
 }
 
@@ -128,6 +147,16 @@ impl ValidatedMedia<ParsedVideo> {
     //
     // A packed Enhanced ManyTracks tag yields one unit per mapped track.
     pub fn elementary_units(&self) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
+        let mut output = Vec::new();
+        self.visit_elementary_units(|unit| output.push(unit))?;
+        Ok(output)
+    }
+
+    /// Emit mapped units without allocating a result collection.
+    pub fn visit_elementary_units(
+        &self,
+        mut emit: impl FnMut(ElementaryUnit),
+    ) -> Result<(), MediaValidationError> {
         match self.interpretation() {
             MediaInterpretation::Opaque { reason } => Err(MediaValidationError::Malformed {
                 kind: "video",
@@ -142,11 +171,14 @@ impl ValidatedMedia<ParsedVideo> {
                             LegacyAvcPacket::SequenceHeader,
                         )),
                         _,
-                    ) => Ok(vec![ElementaryUnit::Configuration {
-                        codec: ElementaryCodec::Avc,
-                        extradata: slice_after(self.raw(), LEGACY_AVC_HEADER_BYTES, "video")?,
-                        track_id: None,
-                    }]),
+                    ) => {
+                        emit(ElementaryUnit::Configuration {
+                            codec: ElementaryCodec::Avc,
+                            extradata: slice_after(self.raw(), LEGACY_AVC_HEADER_BYTES, "video")?,
+                            track_id: None,
+                        });
+                        Ok(())
+                    }
                     (
                         VideoTagHeaderData::Legacy(LegacyVideoHeader::AvcPacket(
                             LegacyAvcPacket::Nalu {
@@ -154,15 +186,18 @@ impl ValidatedMedia<ParsedVideo> {
                             },
                         )),
                         VideoTagBody::Legacy(LegacyVideoBody::Other(_)),
-                    ) => Ok(vec![ElementaryUnit::Sample {
-                        codec: ElementaryCodec::Avc,
-                        payload: slice_after(self.raw(), LEGACY_AVC_HEADER_BYTES, "video")?,
-                        keyframe,
-                        composition_time_offset: *composition_time_offset,
-                        track_id: None,
-                    }]),
-                    (_, VideoTagBody::Enhanced(body)) => enhanced_video(body, keyframe),
-                    _ => Ok(Vec::new()),
+                    ) => {
+                        emit(ElementaryUnit::Sample {
+                            codec: ElementaryCodec::Avc,
+                            payload: slice_after(self.raw(), LEGACY_AVC_HEADER_BYTES, "video")?,
+                            keyframe,
+                            composition_time_offset: *composition_time_offset,
+                            track_id: None,
+                        });
+                        Ok(())
+                    }
+                    (_, VideoTagBody::Enhanced(body)) => enhanced_video(body, keyframe, &mut emit),
+                    _ => Ok(()),
                 }
             }
         }
@@ -170,11 +205,18 @@ impl ValidatedMedia<ParsedVideo> {
 
     /// Return zero or one mapped unit. Multiple units produce an error.
     pub fn elementary_unit(&self) -> Result<Option<ElementaryUnit>, MediaValidationError> {
-        let units = self.elementary_units()?;
-        if units.len() > 1 {
-            return Err(MediaValidationError::MultipleUnits { count: units.len() });
+        let mut first = None;
+        let mut count = 0;
+        self.visit_elementary_units(|unit| {
+            count += 1;
+            if first.is_none() {
+                first = Some(unit);
+            }
+        })?;
+        if count > 1 {
+            return Err(MediaValidationError::MultipleUnits { count });
         }
-        Ok(units.into_iter().next())
+        Ok(first)
     }
 }
 
@@ -195,21 +237,26 @@ fn slice_after(
     Ok(raw.slice(header_bytes..))
 }
 
-fn enhanced_audio(body: &EnhancedAudioBody) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
+fn enhanced_audio(
+    body: &EnhancedAudioBody,
+    emit: &mut impl FnMut(ElementaryUnit),
+) -> Result<(), MediaValidationError> {
     match body {
         EnhancedAudioBody::NoMultitrack { four_cc, packet } => {
-            Ok(audio_packet(*four_cc, packet, None)?.into_iter().collect())
+            if let Some(unit) = audio_packet(*four_cc, packet, None)? {
+                emit(unit);
+            }
+            Ok(())
         }
         EnhancedAudioBody::ManyTracks(tracks) => {
-            let mut units = Vec::with_capacity(tracks.len());
             for track in tracks {
                 if let Some(unit) =
                     audio_packet(track.four_cc, &track.packet, Some(track.track_id))?
                 {
-                    units.push(unit);
+                    emit(unit);
                 }
             }
-            Ok(units)
+            Ok(())
         }
     }
 }
@@ -217,24 +264,25 @@ fn enhanced_audio(body: &EnhancedAudioBody) -> Result<Vec<ElementaryUnit>, Media
 fn enhanced_video(
     body: &EnhancedVideoBody,
     keyframe: bool,
-) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
+    emit: &mut impl FnMut(ElementaryUnit),
+) -> Result<(), MediaValidationError> {
     match body {
-        EnhancedVideoBody::Command => Ok(Vec::new()),
+        EnhancedVideoBody::Command => Ok(()),
         EnhancedVideoBody::NoMultitrack { four_cc, packet } => {
-            Ok(video_packet(*four_cc, packet, keyframe, None)?
-                .into_iter()
-                .collect())
+            if let Some(unit) = video_packet(*four_cc, packet, keyframe, None)? {
+                emit(unit);
+            }
+            Ok(())
         }
         EnhancedVideoBody::ManyTracks(tracks) => {
-            let mut units = Vec::with_capacity(tracks.len());
             for track in tracks {
                 if let Some(unit) =
                     video_packet(track.four_cc, &track.packet, keyframe, Some(track.track_id))?
                 {
-                    units.push(unit);
+                    emit(unit);
                 }
             }
-            Ok(units)
+            Ok(())
         }
     }
 }

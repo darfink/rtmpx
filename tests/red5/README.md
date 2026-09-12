@@ -54,7 +54,8 @@ rtmpx/
     driver.rs                 # async TCP + handshake + ClientSession driver
   tests/ffmpeg/               # ffmpeg interop suite (see its README)
   tests/red5/
-    main.rs                   # live matrix (rows 1-10 below)
+    main.rs                   # live matrix
+    lifecycle.rs              # publish/delete/play/delete/publish on one connection
     harness.rs                # Red5 endpoint (RED5_* env) + objectEncoding reader
     fixtures.rs               # legacy AVC/AAC, Enhanced hvc1/av01, AMF3 probe body
   .github/workflows/ci.yml  # CI: default + live Red5 + live ffmpeg jobs
@@ -80,6 +81,17 @@ subscribed, so every `R` test subscribes the player first.
 | 9 | P | AMF0 + AMF3 | caps advertisement | `connect_forwards_enhanced_capabilities_amf0/_amf3` | connect carrying full E-RTMP advertisement (`fourCcList`, `capsEx`, `videoFourCcInfoMap`, `audioFourCcInfoMap`, `videoFunction`) is accepted and publish proceeds |
 | 10 | R | AMF3 | type-15 script data | `amf3_script_data_survives_red5` | `@setDataFrame`/`onMetaData` body with `rtmpxRed5Probe` marker relayed to player; connection stays usable afterwards |
 
+The `one_connection_stream_lifecycle_amf0` and `one_connection_stream_lifecycle_amf3` tests exercise three phases on one connection:
+
+1. Publish, with a second client verifying the relayed bytes
+2. Delete that stream and play a new stream from the second client
+3. Delete playback and publish again, with the second client verifying delivery
+
+Each phase sends sequence headers and six audio/video frame pairs, paced at 40 ms intervals.
+The tests assert exact media bytes, event handles, one connect acceptance, and an unchanged TCP endpoint.
+They use the public pull API and vectored packet writes directly. No historical session adapter is involved.
+Red5 2.0.40 reuses deleted wire IDs during this sequence. Distinct local handles prevent stale application operations.
+
 Rows 5-8 are characterization, not assertion: Red5 has no Enhanced media
 path, so there is no correct relay behaviour to pin. They prove the
 connection survives Enhanced bytes and record what Red5 did, so a future
@@ -94,7 +106,7 @@ The live suite above is `required-features = ["red5-live"]` and never builds by 
 | --- | --- | --- |
 | `tests/amf3_loopback.rs` | our AMF3 client publishes into our `ServerSession`: server mirrors framing, so AMF3 `connect` is answered as AMF0 `_result` with `objectEncoding 3`, no early type-15/17 | No third-party encoder publishes AMF3 (ffmpeg/OBS are AMF0-only, Red5 never publishes *to* us), so this is the only AMF3-ingest coverage |
 | `tests/enhanced_loopback.rs` | `hvc1` (AMF0) + `av01` (AMF3) publish and two-session relay byte-exact, legacy untouched | Red5 has no Enhanced media path (rows 5-8 are characterization); ffmpeg Enhanced ingest proves decode, but only this proves the relay contract |
-| `tests/obs_ingest.rs` | OBS `connect -> releaseStream -> FCPublish -> createStream -> publish -> onMetaData -> A/V -> FCUnpublish -> deleteStream` ingests; quirks surface as `UnhandleableAmf0Command`, ingest unaffected | ffmpeg proves spec compliance; OBS proves quirk tolerance. AMF0-only, so no AMF3 signal |
+| `tests/obs_ingest.rs` | OBS `connect -> releaseStream -> FCPublish -> createStream -> publish -> onMetaData -> A/V -> FCUnpublish -> deleteStream` ingests; quirks surface as `UnhandledCommand`, ingest unaffected | ffmpeg proves spec compliance; OBS proves quirk tolerance. AMF0-only, so no AMF3 signal |
 | `tests/session_quirks.rs` | extended timestamps survive ingest + relay past 0xFFFFFF; GStreamer string `deleteStream` finishes the publish (garbage ignored); connect refusals are `_error` while publish/play refusals are `onStatus` errors, framed per-exchange (AMF0 mirror and genuine type 17) | no live leg runs 4.6h to cross the timestamp boundary, sends string stream ids, or asserts refusal shapes; also caught a real bug where a refused connect omitted the protocol preamble and was undecodable |
 
 ## Manual OBS probe (not CI)

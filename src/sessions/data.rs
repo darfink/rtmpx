@@ -1,9 +1,8 @@
 use crate::{
     amf0::{Amf0Object, Amf0Value},
-    messages::{MessageDeserializationError, MessagePayload, RtmpMessage},
+    messages::MessageDeserializationError,
     time::RtmpTimestamp,
 };
-use bytes::Bytes;
 
 /// RTMP script-data wire type, independent of negotiated object encoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,14 +35,14 @@ impl DataMessageType {
 /// This type preserves even unknown or malformed script data. Parsing is optional
 /// and never changes the wire type, timestamp, or original bytes.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DataMessage {
+pub struct DataMessage<D = crate::Payload> {
     wire_type: DataMessageType,
     timestamp: RtmpTimestamp,
-    payload: Bytes,
+    payload: D,
 }
 
-impl DataMessage {
-    pub fn new(wire_type: DataMessageType, timestamp: RtmpTimestamp, payload: Bytes) -> Self {
+impl<D> DataMessage<D> {
+    pub fn new(wire_type: DataMessageType, timestamp: RtmpTimestamp, payload: D) -> Self {
         Self {
             wire_type,
             timestamp,
@@ -56,21 +55,58 @@ impl DataMessage {
     pub fn timestamp(&self) -> RtmpTimestamp {
         self.timestamp
     }
-    pub fn payload(&self) -> &Bytes {
+    pub fn payload(&self) -> &D {
         &self.payload
     }
-    pub fn into_payload(self) -> Bytes {
+    pub fn into_payload(self) -> D {
         self.payload
     }
 
-    /// Decode `onMetaData`, with or without `@setDataFrame`.
-    /// Returns `None` for other script events or metadata without an object.
-    /// AMF3 values are projected into the lossless AMF0 value model.
+    pub fn map_payload<T>(self, map: impl FnOnce(D) -> T) -> DataMessage<T> {
+        DataMessage {
+            wire_type: self.wire_type,
+            timestamp: self.timestamp,
+            payload: map(self.payload),
+        }
+    }
+}
+impl<D: crate::Segments> DataMessage<D> {
+    /// Decode metadata directly from contiguous or segmented storage.
+    /// AMF values allocate, but the encoded payload is not coalesced.
     pub fn metadata(&self) -> Result<Option<Amf0Object>, MessageDeserializationError> {
-        let values = match self.to_message_payload(0).to_rtmp_message()? {
-            RtmpMessage::Amf0Data { values } => values,
-            RtmpMessage::Amf3Data { values, .. } => values.iter().map(|v| v.to_amf0()).collect(),
-            _ => unreachable!("data wire types only"),
+        use std::io::Read;
+        let reader = || crate::payload::PayloadReader::new(&self.payload);
+        let values = match self.wire_type {
+            DataMessageType::Amf0 => match crate::amf0::deserialize(&mut reader()) {
+                Ok(values) => values,
+                Err(first) => match crate::amf3::deserialize(&mut reader()) {
+                    Ok(values) => values.iter().map(|v| v.to_amf0()).collect(),
+                    Err(_) => return Err(first.into()),
+                },
+            },
+            DataMessageType::Amf3 => {
+                let mut reader = reader();
+                let mut selector = [0];
+                reader
+                    .read_exact(&mut selector)
+                    .map_err(|_| MessageDeserializationError::InvalidMessageFormat)?;
+                match selector[0] {
+                    0 => crate::amf0::deserialize(&mut reader)?
+                        .iter()
+                        .map(|v| v.to_amf3().to_amf0())
+                        .collect(),
+                    3 => crate::amf3::deserialize(&mut reader)?
+                        .iter()
+                        .map(|v| v.to_amf0())
+                        .collect(),
+                    other => {
+                        return Err(crate::amf3::Amf3DeserializationError::BadFormatSelector(
+                            other,
+                        )
+                        .into());
+                    }
+                }
+            }
         };
         let mut values = values.into_iter();
         let mut name = values.next();
@@ -81,14 +117,5 @@ impl DataMessage {
             return Ok(None);
         }
         Ok(values.next().and_then(|v| v.get_object_properties()))
-    }
-
-    pub(crate) fn to_message_payload(&self, stream_id: u32) -> MessagePayload {
-        MessagePayload {
-            timestamp: self.timestamp,
-            type_id: self.wire_type.type_id(),
-            message_stream_id: stream_id,
-            data: self.payload.clone(),
-        }
     }
 }

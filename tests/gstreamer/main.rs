@@ -13,6 +13,8 @@
 //! A green run proves our server accepts an independent encoder, not just
 //! ffmpeg's exact byte patterns.
 
+#[path = "../support/api.rs"]
+mod api;
 #[path = "../common/mod.rs"]
 #[allow(dead_code)]
 mod common;
@@ -20,12 +22,12 @@ mod common;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use common::{Result, run, stream_key};
-use rtmpx::amf::AmfEncoding;
-use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rtmpx::sessions::{
+use crate::api::amf::AmfEncoding;
+use crate::api::handshake::{Handshake, HandshakeProgress, HandshakeRole};
+use crate::api::sessions::{
     ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
 };
+use common::{Result, run, stream_key};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -63,13 +65,13 @@ async fn write_server_results(
 ) -> Result<()> {
     for result in results {
         match result {
-            ServerSessionResult::OutboundResponse(packet) => {
+            ServerSessionResult::Packet(packet) => {
                 stream
-                    .write_all(&packet.bytes)
+                    .write_all(&packet.to_vec())
                     .await
                     .map_err(|e| format!("write to gstreamer failed: {e}"))?;
             }
-            ServerSessionResult::RaisedEvent(event) => match event {
+            ServerSessionResult::Event(event) => match event {
                 ServerSessionEvent::ConnectionRequested {
                     request_id,
                     app_name,
@@ -92,7 +94,8 @@ async fn write_server_results(
                         .map_err(|e| format!("accepting gstreamer publish failed: {e:?}"))?;
                     Box::pin(write_server_results(stream, follow, session, collected)).await?;
                 }
-                ServerSessionEvent::StreamMetadataChanged { metadata, .. } => {
+                ServerSessionEvent::StreamDataReceived { message, .. } => {
+                    let metadata = crate::api::sessions::metadata(&message);
                     collected.metadata_events += 1;
                     collected
                         .encoders
@@ -112,7 +115,7 @@ async fn write_server_results(
                     eprintln!("gstreamer harness: ignoring gstreamer event: {other:?}");
                 }
             },
-            ServerSessionResult::UnhandleableMessageReceived(_) => {}
+            ServerSessionResult::UnhandledMessage(_) => {}
             #[allow(unreachable_patterns)]
             _ => panic!("unexpected future protocol variant"),
         }
@@ -125,7 +128,7 @@ async fn write_server_results(
 }
 
 async fn server_handshake(stream: &mut TcpStream, read_buf: &mut [u8]) -> Result<Vec<u8>> {
-    let mut handshake = Handshake::new(PeerType::Server);
+    let mut handshake = Handshake::new(HandshakeRole::Server);
     loop {
         let n = stream
             .read(read_buf)
@@ -138,7 +141,7 @@ async fn server_handshake(stream: &mut TcpStream, read_buf: &mut [u8]) -> Result
             .process_bytes(&read_buf[..n])
             .map_err(|e| format!("server handshake failed: {e:?}"))?
         {
-            HandshakeProcessResult::InProgress { response_bytes } => {
+            HandshakeProgress::InProgress { response_bytes } => {
                 if !response_bytes.is_empty() {
                     stream
                         .write_all(&response_bytes)
@@ -150,7 +153,7 @@ async fn server_handshake(stream: &mut TcpStream, read_buf: &mut [u8]) -> Result
                         .map_err(|e| format!("server handshake flush failed: {e}"))?;
                 }
             }
-            HandshakeProcessResult::Completed {
+            HandshakeProgress::Completed {
                 response_bytes,
                 remaining_bytes,
             } => {

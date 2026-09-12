@@ -2,17 +2,17 @@
 This module contains all the RTMP message types as well as functionality for serializing
 and deserializing these messages into payloads.
 
-`MessagePayload`s have auxiliary data about an RTMP message, such as what message stream it is
+`RawMessage`s have auxiliary data about an RTMP message, such as what message stream it is
 meant for, the timestamp for the message and what type of message it is.
 */
 
 mod deserialization_errors;
-mod message_payload;
+mod raw_message;
 mod serialization_errors;
 mod types;
 
 pub use self::deserialization_errors::MessageDeserializationError;
-pub use self::message_payload::MessagePayload;
+pub use self::raw_message::RawMessage;
 pub use self::serialization_errors::MessageSerializationError;
 use crate::amf::AmfEncoding;
 use crate::amf0::Amf0Value;
@@ -166,12 +166,12 @@ pub enum RtmpMessage {
 }
 
 impl RtmpMessage {
-    pub fn into_message_payload(
+    pub fn into_raw_message(
         self,
         timestamp: RtmpTimestamp,
         message_stream_id: u32,
-    ) -> Result<MessagePayload, MessageSerializationError> {
-        MessagePayload::from_rtmp_message(self, timestamp, message_stream_id)
+    ) -> Result<RawMessage, MessageSerializationError> {
+        RawMessage::from_rtmp_message(self, timestamp, message_stream_id)
     }
 
     pub fn get_message_type_id(&self) -> u8 {

@@ -1,6 +1,8 @@
-use rtmpx::amf0::Amf0Object;
-use rtmpx::amf0::{self, Amf0DeserializationError, Amf0SerializationError, Amf0Value};
-use rtmpx::amf3::Amf3Value;
+#[path = "support/api.rs"]
+mod api;
+use crate::api::amf0::Amf0Object;
+use crate::api::amf0::{self, Amf0DeserializationError, Amf0SerializationError, Amf0Value};
+use crate::api::amf3::Amf3Value;
 use std::io::Cursor;
 
 fn round_trip(value: &Amf0Value) -> Amf0Value {
@@ -281,8 +283,8 @@ fn date_xml_and_typed_objects_round_trip() {
 /// panic the session; it must be a typed error.
 #[test]
 fn short_amf0_command_is_an_error_not_a_panic() {
-    use rtmpx::messages::{MessagePayload, RtmpMessage};
-    use rtmpx::time::RtmpTimestamp;
+    use crate::api::messages::{RawMessage, RtmpMessage};
+    use crate::api::time::RtmpTimestamp;
 
     for values in [
         vec![],
@@ -293,7 +295,7 @@ fn short_amf0_command_is_an_error_not_a_panic() {
         ],
     ] {
         let data = amf0::serialize(&values).expect("must encode");
-        let payload = MessagePayload {
+        let payload = RawMessage {
             timestamp: RtmpTimestamp::new(0),
             type_id: 20,
             message_stream_id: 0,
@@ -313,7 +315,7 @@ fn short_amf0_command_is_an_error_not_a_panic() {
         Amf0Value::Null,
     ];
     let data = amf0::serialize(&values).unwrap();
-    let payload = MessagePayload {
+    let payload = RawMessage {
         timestamp: RtmpTimestamp::new(0),
         type_id: 20,
         message_stream_id: 0,

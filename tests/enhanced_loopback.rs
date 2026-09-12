@@ -9,14 +9,15 @@
 //! planes. Media packets are encoding-agnostic, so the same bytes must
 //! survive regardless of the negotiated `objectEncoding`.
 
-use bytes::Bytes;
-use rtmpx::amf::AmfEncoding;
-use rtmpx::sessions::{
-    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult,
-    PublishRequestType, ServerSession, ServerSessionConfig, ServerSessionEvent,
-    ServerSessionResult,
+#[path = "support/api.rs"]
+mod api;
+use crate::api::amf::AmfEncoding;
+use crate::api::sessions::{
+    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishMode,
+    ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
 };
-use rtmpx::time::RtmpTimestamp;
+use crate::api::time::RtmpTimestamp;
+use bytes::Bytes;
 
 /// Two sessions wired back to back. Every outbound packet from one side is
 /// fed straight into the other until neither side has anything left to say.
@@ -48,11 +49,11 @@ impl Pump {
         let mut bytes = Vec::new();
         for result in results {
             match result {
-                ClientSessionResult::OutboundResponse(packet) => {
-                    bytes.extend_from_slice(&packet.bytes);
+                ClientSessionResult::Packet(packet) => {
+                    bytes.extend_from_slice(&packet.to_vec());
                 }
-                ClientSessionResult::RaisedEvent(event) => self.client_events.push(event),
-                ClientSessionResult::UnhandleableMessageReceived(_) => {}
+                ClientSessionResult::Event(event) => self.client_events.push(event),
+                ClientSessionResult::UnhandledMessage(_) => {}
                 #[allow(unreachable_patterns)]
                 _ => panic!("unexpected future protocol variant"),
             }
@@ -71,11 +72,11 @@ impl Pump {
         let mut bytes = Vec::new();
         for result in results {
             match result {
-                ServerSessionResult::OutboundResponse(packet) => {
-                    bytes.extend_from_slice(&packet.bytes);
+                ServerSessionResult::Packet(packet) => {
+                    bytes.extend_from_slice(&packet.to_vec());
                 }
-                ServerSessionResult::RaisedEvent(event) => self.server_events.push(event),
-                ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                ServerSessionResult::Event(event) => self.server_events.push(event),
+                ServerSessionResult::UnhandledMessage(_) => {}
                 #[allow(unreachable_patterns)]
                 _ => panic!("unexpected future protocol variant"),
             }
@@ -136,7 +137,7 @@ fn connect(pump: &mut Pump, app: &str) {
 fn publish(pump: &mut Pump, stream_key: &str) {
     let out = pump
         .client
-        .request_publishing(stream_key.to_string(), PublishRequestType::Live)
+        .request_publishing(stream_key.to_string(), PublishMode::Live)
         .expect("publish must build");
     pump.push_client(vec![out]);
     let request_id = pump
@@ -163,7 +164,7 @@ fn publish(pump: &mut Pump, stream_key: &str) {
 /// Drive a second pump to Playing so we can push relayed media through
 /// `ServerSession::send_video_data` and observe it on the player.
 /// Returns the server-side stream id to send on.
-fn play(pump: &mut Pump, stream_key: &str) -> rtmpx::sessions::StreamId {
+fn play(pump: &mut Pump, stream_key: &str) -> crate::api::sessions::StreamId {
     let out = pump
         .client
         .request_playback(stream_key.to_string())
@@ -336,7 +337,7 @@ fn enhanced_relay_is_byte_exact_between_two_sessions() {
                 false,
             )
             .expect("relay send must build");
-        playout.push_server(vec![ServerSessionResult::OutboundResponse(packet)]);
+        playout.push_server(vec![ServerSessionResult::Packet(packet)]);
     }
     let played: Vec<Bytes> = playout
         .take_client_events()

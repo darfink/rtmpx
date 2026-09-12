@@ -3,7 +3,7 @@
 //! server, ...).
 //!
 //! Same sans-I/O glue a proxy uses for its upstream leg
-//! (handshake as client, then handle_input in / OutboundResponse out).
+//! (handshake as client, then handle_input in / Packet out).
 //! Every failure says how to fix it.
 
 // Each live suite uses a different slice of this driver (play/collect only in
@@ -13,15 +13,15 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
-use rtmpx::amf::AmfEncoding;
-use rtmpx::amf0::Amf0Object;
-use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rtmpx::sessions::{
-    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult,
-    PublishRequestType, StreamMetadata,
+use crate::api::amf::AmfEncoding;
+use crate::api::amf0::Amf0Object;
+use crate::api::handshake::{Handshake, HandshakeProgress, HandshakeRole};
+use crate::api::sessions::{
+    ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishMode,
+    StreamMetadata,
 };
-use rtmpx::time::RtmpTimestamp;
+use crate::api::time::RtmpTimestamp;
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -64,7 +64,7 @@ pub struct Peer {
 pub struct PlayedMedia {
     pub video: Vec<Vec<u8>>,
     pub audio: Vec<Vec<u8>>,
-    /// Number of StreamMetadataReceived events.
+    /// Number of StreamDataReceived events.
     pub meta: usize,
 }
 
@@ -76,14 +76,14 @@ impl Peer {
     ) -> Result<()> {
         for result in results {
             match result {
-                ClientSessionResult::OutboundResponse(packet) => {
+                ClientSessionResult::Packet(packet) => {
                     self.stream
-                        .write_all(&packet.bytes)
+                        .write_all(&packet.to_vec())
                         .await
                         .map_err(|e| format!("write to server failed (peer went away?): {e}"))?;
                 }
-                ClientSessionResult::RaisedEvent(event) => events.push(event),
-                ClientSessionResult::UnhandleableMessageReceived(_) => {}
+                ClientSessionResult::Event(event) => events.push(event),
+                ClientSessionResult::UnhandledMessage(_) => {}
                 #[allow(unreachable_patterns)]
                 _ => panic!("unexpected future protocol variant"),
             }
@@ -113,7 +113,7 @@ impl Peer {
     }
 
     async fn handshake(&mut self) -> Result<()> {
-        let mut handshake = Handshake::new(PeerType::Client);
+        let mut handshake = Handshake::new(HandshakeRole::Client);
         let c0c1 = handshake
             .generate_outbound_p0_and_p1()
             .map_err(|e| format!("handshake init failed: {e:?}"))?;
@@ -138,7 +138,7 @@ impl Peer {
                 .process_bytes(&self.read_buf[..n])
                 .map_err(|e| format!("handshake failed: {e:?}"))?
             {
-                HandshakeProcessResult::InProgress { response_bytes } => {
+                HandshakeProgress::InProgress { response_bytes } => {
                     if !response_bytes.is_empty() {
                         self.stream
                             .write_all(&response_bytes)
@@ -150,7 +150,7 @@ impl Peer {
                             .map_err(|e| format!("handshake response flush failed: {e}"))?;
                     }
                 }
-                HandshakeProcessResult::Completed {
+                HandshakeProgress::Completed {
                     response_bytes,
                     remaining_bytes,
                 } => {
@@ -257,7 +257,7 @@ impl Peer {
     pub async fn publish(&mut self, stream_key: &str) -> Result<()> {
         let request = self
             .session
-            .request_publishing(stream_key.to_string(), PublishRequestType::Live)
+            .request_publishing(stream_key.to_string(), PublishMode::Live)
             .map_err(|e| format!("building publish failed: {e:?}"))?;
         self.write_results(vec![request], &mut Vec::new()).await?;
         timeout(self.op_timeout, async {
@@ -324,8 +324,8 @@ impl Peer {
     pub async fn send_raw_amf3_data(&mut self, body: Bytes, timestamp: u32) -> Result<()> {
         let result = self
             .session
-            .publish_data(rtmpx::sessions::DataMessage::new(
-                rtmpx::sessions::DataMessageType::Amf3,
+            .publish_data(crate::api::sessions::DataMessage::new(
+                crate::api::sessions::DataMessageType::Amf3,
                 RtmpTimestamp::new(timestamp),
                 body,
             ))
@@ -355,7 +355,7 @@ impl Peer {
                         ClientSessionEvent::AudioDataReceived { data, .. } => {
                             got.audio.push(data.to_vec());
                         }
-                        ClientSessionEvent::StreamMetadataReceived { .. } => {
+                        ClientSessionEvent::StreamDataReceived { .. } => {
 
                             got.meta += 1;
                         }

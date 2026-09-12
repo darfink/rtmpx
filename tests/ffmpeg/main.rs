@@ -7,14 +7,16 @@
 //! ffmpeg/ffprobe binaries are on PATH, and need no Red5 server. Default
 //! cargo test never touches the network or external binaries.
 
+#[path = "../support/api.rs"]
+mod api;
 #[path = "../common/mod.rs"]
 mod common;
 mod server_harness;
 
 use std::time::Duration;
 
+use crate::api::amf::AmfEncoding;
 use common::{Result, legacy_metadata, run, stream_key};
-use rtmpx::amf::AmfEncoding;
 
 // --- Independent encoder leg: ffmpeg -> our ServerSession ---------------------
 

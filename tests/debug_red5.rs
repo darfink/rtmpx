@@ -1,9 +1,11 @@
 #![cfg(feature = "red5-live")]
-use rtmpx::amf::AmfEncoding;
-use rtmpx::amf0::Amf0Object;
-use rtmpx::chunk_io::ChunkDeserializer;
-use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rtmpx::sessions::{ClientSession, ClientSessionConfig, ClientSessionResult};
+#[path = "support/api.rs"]
+mod api;
+use crate::api::amf::AmfEncoding;
+use crate::api::amf0::Amf0Object;
+use crate::api::chunk_io::ContiguousDecoder;
+use crate::api::handshake::{Handshake, HandshakeProgress, HandshakeRole};
+use crate::api::sessions::{ClientSession, ClientSessionConfig, ClientSessionResult};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -16,7 +18,7 @@ async fn run_debug(encoding: AmfEncoding, tag: &str) {
     eprintln!("[{tag}] connecting to {addr} with {encoding:?}");
     let mut stream = TcpStream::connect(&addr).await.unwrap();
     stream.set_nodelay(true).unwrap();
-    let mut hs = Handshake::new(PeerType::Client);
+    let mut hs = Handshake::new(HandshakeRole::Client);
     let c0c1 = hs.generate_outbound_p0_and_p1().unwrap();
     stream.write_all(&c0c1).await.unwrap();
     let mut buf = vec![0u8; 65536];
@@ -24,10 +26,10 @@ async fn run_debug(encoding: AmfEncoding, tag: &str) {
     loop {
         let n = stream.read(&mut buf).await.unwrap();
         match hs.process_bytes(&buf[..n]).unwrap() {
-            HandshakeProcessResult::InProgress { response_bytes } => {
+            HandshakeProgress::InProgress { response_bytes } => {
                 stream.write_all(&response_bytes).await.unwrap();
             }
-            HandshakeProcessResult::Completed {
+            HandshakeProgress::Completed {
                 response_bytes,
                 remaining_bytes,
             } => {
@@ -48,15 +50,15 @@ async fn run_debug(encoding: AmfEncoding, tag: &str) {
     let req = session
         .request_connection_with_properties("live".into(), Amf0Object::new())
         .unwrap();
-    if let ClientSessionResult::OutboundResponse(p) = req {
-        stream.write_all(&p.bytes).await.unwrap();
+    if let ClientSessionResult::Packet(p) = req {
+        stream.write_all(&p.to_vec()).await.unwrap();
     }
     // Raw sniffer in parallel so we can see what kills the session.
-    let mut de = ChunkDeserializer::new();
-    // NOTE: ChunkDeserializer buffers internally: feed each flight once, then
+    let mut de = ContiguousDecoder::new();
+    // NOTE: ContiguousDecoder buffers internally: feed each flight once, then
     // drain with empty slices (re-feeding the same bytes corrupts the stream).
     let feed =
-        |label: &str, bytes: &[u8], session: &mut ClientSession, de: &mut ChunkDeserializer| {
+        |label: &str, bytes: &[u8], session: &mut ClientSession, de: &mut ContiguousDecoder| {
             eprintln!("[{tag}] {label}: {} bytes", bytes.len());
             let mut pending: Option<&[u8]> = Some(bytes);
             loop {
@@ -104,14 +106,14 @@ async fn run_debug(encoding: AmfEncoding, tag: &str) {
                 Ok(results) => {
                     for r in &results {
                         match r {
-                            ClientSessionResult::RaisedEvent(ev) => eprintln!(
+                            ClientSessionResult::Event(ev) => eprintln!(
                                 "[{tag}]   session event: {:?}",
                                 format!("{ev:?}").chars().take(400).collect::<String>()
                             ),
-                            ClientSessionResult::OutboundResponse(p) => {
-                                eprintln!("[{tag}]   session replies {} bytes", p.bytes.len())
+                            ClientSessionResult::Packet(p) => {
+                                eprintln!("[{tag}]   session replies {} bytes", p.to_vec().len())
                             }
-                            ClientSessionResult::UnhandleableMessageReceived(m) => {
+                            ClientSessionResult::UnhandledMessage(m) => {
                                 eprintln!("[{tag}]   unhandleable: {m:?}")
                             }
                             #[allow(unreachable_patterns)]
@@ -159,7 +161,7 @@ async fn pump_flight(
     label: String,
     bytes: Vec<u8>,
     session: &mut ClientSession,
-    de: &mut ChunkDeserializer,
+    de: &mut ContiguousDecoder,
     stream: &mut TcpStream,
 ) {
     eprintln!("[{tag}] {label}: {} bytes", bytes.len());
@@ -204,15 +206,15 @@ async fn pump_flight(
         Ok(results) => {
             for r in &results {
                 match r {
-                    ClientSessionResult::RaisedEvent(ev) => eprintln!(
+                    ClientSessionResult::Event(ev) => eprintln!(
                         "[{tag}]   session event: {:?}",
                         format!("{ev:?}").chars().take(400).collect::<String>()
                     ),
-                    ClientSessionResult::OutboundResponse(p) => {
-                        eprintln!("[{tag}]   session replies {} bytes", p.bytes.len());
-                        stream.write_all(&p.bytes).await.unwrap();
+                    ClientSessionResult::Packet(p) => {
+                        eprintln!("[{tag}]   session replies {} bytes", p.to_vec().len());
+                        stream.write_all(&p.to_vec()).await.unwrap();
                     }
-                    ClientSessionResult::UnhandleableMessageReceived(m) => {
+                    ClientSessionResult::UnhandledMessage(m) => {
                         eprintln!("[{tag}]   unhandleable: {m:?}")
                     }
                     #[allow(unreachable_patterns)]
@@ -228,7 +230,7 @@ async fn pump_flight(
 /// Reproduces the InvalidMessageFormat the suite hits past connect.
 #[tokio::test]
 async fn debug_amf3_publish_flow() {
-    use rtmpx::sessions::PublishRequestType;
+    use crate::api::sessions::PublishMode;
     let addr = format!(
         "{}:{}",
         std::env::var("RED5_HOST").unwrap_or("127.0.0.1".into()),
@@ -236,7 +238,7 @@ async fn debug_amf3_publish_flow() {
     );
     let mut stream = TcpStream::connect(&addr).await.unwrap();
     stream.set_nodelay(true).unwrap();
-    let mut hs = Handshake::new(PeerType::Client);
+    let mut hs = Handshake::new(HandshakeRole::Client);
     let c0c1 = hs.generate_outbound_p0_and_p1().unwrap();
     stream.write_all(&c0c1).await.unwrap();
     let mut buf = vec![0u8; 65536];
@@ -244,10 +246,10 @@ async fn debug_amf3_publish_flow() {
     loop {
         let n = stream.read(&mut buf).await.unwrap();
         match hs.process_bytes(&buf[..n]).unwrap() {
-            HandshakeProcessResult::InProgress { response_bytes } => {
+            HandshakeProgress::InProgress { response_bytes } => {
                 stream.write_all(&response_bytes).await.unwrap();
             }
-            HandshakeProcessResult::Completed {
+            HandshakeProgress::Completed {
                 response_bytes,
                 remaining_bytes,
             } => {
@@ -265,12 +267,12 @@ async fn debug_amf3_publish_flow() {
     config.object_encoding = AmfEncoding::Amf3;
     config.tc_url = Some(format!("rtmp://{}/live", addr));
     let (mut session, _) = ClientSession::new(config).unwrap();
-    let mut de = ChunkDeserializer::new();
+    let mut de = ContiguousDecoder::new();
     let req = session
         .request_connection_with_properties("live".into(), Amf0Object::new())
         .unwrap();
-    if let ClientSessionResult::OutboundResponse(p) = req {
-        stream.write_all(&p.bytes).await.unwrap();
+    if let ClientSessionResult::Packet(p) = req {
+        stream.write_all(&p.to_vec()).await.unwrap();
     }
     if !carry.is_empty() {
         let c = carry.clone();
@@ -310,10 +312,10 @@ async fn debug_amf3_publish_flow() {
     );
     let key = format!("dbg-pub3-{}", std::process::id());
     let req = session
-        .request_publishing(key.clone(), PublishRequestType::Live)
+        .request_publishing(key.clone(), PublishMode::Live)
         .unwrap();
-    if let ClientSessionResult::OutboundResponse(p) = req {
-        stream.write_all(&p.bytes).await.unwrap();
+    if let ClientSessionResult::Packet(p) = req {
+        stream.write_all(&p.to_vec()).await.unwrap();
     }
     for round in 0..8 {
         let n = tokio::time::timeout(std::time::Duration::from_secs(8), stream.read(&mut buf))

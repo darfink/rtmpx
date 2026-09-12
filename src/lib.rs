@@ -4,7 +4,7 @@
 //! emit bytes out; the caller moves them over TCP, a pipe, or plain memory,
 //! so the crate fits any async runtime or proxy without mandating one.
 //! The runnable client and server in `examples/` show the TCP glue. The
-//! first sample below shows the protocol core with no network at all.
+//! first sample shows the protocol core with no network at all.
 //!
 //! Chunk framing lives in [`chunk_io`], the handshake in [`handshake`],
 //! messages in [`messages`], client and server sessions in [`sessions`],
@@ -19,120 +19,30 @@
 //! Original bytes stay authoritative for forwarding. An elementary-media
 //! view of the same tags serves ingest that does not wrap FLV.
 //!
-//! # Example: publish into a server with no network
+//! # Session input and output
 //!
-//! Each session result is either bytes for the peer or a raised event.
-//! Moving the bytes across until both sides go quiet connects, publishes,
-//! and accepts a stream entirely in memory:
+//! Create a session after the handshake. Control actions queue outputs; `receive`
+//! returns one packet or event at a time. The caller keeps unread input and can
+//! await backpressure between outputs. Media sends return a packet directly.
 //!
 //! ```
-//! # #![allow(unreachable_patterns)]
-//! use rtmpx::sessions::{
-//!     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult,
-//!     PublishRequestType, ServerSession, ServerSessionConfig, ServerSessionEvent,
-//!     ServerSessionResult,
+//! use bytes::Bytes;
+//! use rtmpx::sessions::{ClientSession, ClientSessionConfig, ClientOutput};
+//!
+//! let mut client = ClientSession::new(ClientSessionConfig::default())?;
+//! client.connect("live")?;
+//! let mut input = Bytes::new();
+//! let Some(ClientOutput::Packet(packet)) = client.receive(&mut input)? else {
+//!     panic!("connect must produce a packet");
 //! };
-//!
-//! fn from_client(
-//!     out: Vec<ClientSessionResult>,
-//!     client: &mut ClientSession,
-//!     server: &mut ServerSession,
-//!     client_events: &mut Vec<ClientSessionEvent>,
-//!     server_events: &mut Vec<ServerSessionEvent>,
-//! ) {
-//!     let mut bytes = Vec::new();
-//!     for result in out {
-//!         match result {
-//!             ClientSessionResult::OutboundResponse(packet) => {
-//!                 bytes.extend_from_slice(&packet.bytes);
-//!             }
-//!             ClientSessionResult::RaisedEvent(event) => client_events.push(event),
-//!             ClientSessionResult::UnhandleableMessageReceived(_) => {}
-//!             // Result enums stay non-exhaustive so new variants cannot
-//!             // break callers: unreachable today, but required to compile.
-//!             _ => unreachable!("new client session result"),
-//!         }
-//!     }
-//!     if bytes.is_empty() {
-//!         return;
-//!     }
-//!     let back = server
-//!         .handle_input(&bytes)
-//!         .expect("server reads client bytes");
-//!     from_server(back, client, server, client_events, server_events);
-//! }
-//!
-//! fn from_server(
-//!     out: Vec<ServerSessionResult>,
-//!     client: &mut ClientSession,
-//!     server: &mut ServerSession,
-//!     client_events: &mut Vec<ClientSessionEvent>,
-//!     server_events: &mut Vec<ServerSessionEvent>,
-//! ) {
-//!     let mut bytes = Vec::new();
-//!     for result in out {
-//!         match result {
-//!             ServerSessionResult::OutboundResponse(packet) => {
-//!                 bytes.extend_from_slice(&packet.bytes);
-//!             }
-//!             ServerSessionResult::RaisedEvent(event) => server_events.push(event),
-//!             ServerSessionResult::UnhandleableMessageReceived(_) => {}
-//!             _ => unreachable!("new server session result"),
-//!         }
-//!     }
-//!     if bytes.is_empty() {
-//!         return;
-//!     }
-//!     let back = client
-//!         .handle_input(&bytes)
-//!         .expect("client reads server bytes");
-//!     from_client(back, client, server, client_events, server_events);
-//! }
-//!
-//! let (mut client, out) =
-//!     ClientSession::new(ClientSessionConfig::new()).expect("client starts");
-//! let (mut server, out2) =
-//!     ServerSession::new(ServerSessionConfig::new()).expect("server starts");
-//! let (mut client_events, mut server_events) = (Vec::new(), Vec::new());
-//! from_client(out, &mut client, &mut server, &mut client_events, &mut server_events);
-//! from_server(out2, &mut client, &mut server, &mut client_events, &mut server_events);
-//!
-//! let out = client
-//!     .request_connection("live".to_string())
-//!     .expect("connect builds");
-//! from_client(vec![out], &mut client, &mut server, &mut client_events, &mut server_events);
-//! let request = server_events
-//!     .iter()
-//!     .find_map(|event| match event {
-//!         ServerSessionEvent::ConnectionRequested { request_id, .. } => Some(*request_id),
-//!         _ => None,
-//!     })
-//!     .expect("connect raises a request");
-//! let out = server.accept_request(request).expect("accept builds");
-//! from_server(out, &mut client, &mut server, &mut client_events, &mut server_events);
-//! assert!(client_events.iter().any(|event| matches!(
-//!     event,
-//!     ClientSessionEvent::ConnectionRequestAccepted { .. }
-//! )));
-//!
-//! let out = client
-//!     .request_publishing("demo".to_string(), PublishRequestType::Live)
-//!     .expect("publish builds");
-//! from_client(vec![out], &mut client, &mut server, &mut client_events, &mut server_events);
-//! let request = server_events
-//!     .iter()
-//!     .find_map(|event| match event {
-//!         ServerSessionEvent::PublishStreamRequested { request_id, .. } => Some(*request_id),
-//!         _ => None,
-//!     })
-//!     .expect("publish raises a request");
-//! let out = server.accept_request(request).expect("accept builds");
-//! from_server(out, &mut client, &mut server, &mut client_events, &mut server_events);
-//! assert!(client_events.iter().any(|event| matches!(
-//!     event,
-//!     ClientSessionEvent::PublishRequestAccepted { .. }
-//! )));
+//! // A transport writes packet.io_slices(...), then advances by the written count.
+//! // Packet owns its payload and progress, so it can move between tasks.
+//! assert!(packet.remaining() > 0);
+//! # Ok::<(), rtmpx::sessions::ClientSessionError>(())
 //! ```
+//!
+//! See [`zero_copy_guide`] for the complete receive loop, pooling, and allocation
+//! contracts. `examples/serve.rs` and `examples/publish.rs` contain runnable TCP adapters.
 //!
 //! # Example: inspect one Enhanced RTMP video tag
 //!
@@ -178,6 +88,8 @@ mod test_utils {
     pub mod assert_vec_contains_macro;
 }
 
+pub mod payload;
+pub use payload::{Payload, PayloadPool, PayloadPoolConfig, PayloadView, Segments};
 pub mod amf;
 #[allow(clippy::all)]
 pub mod chunk_io;
@@ -195,7 +107,9 @@ pub mod sessions;
 #[allow(clippy::all)]
 pub mod time;
 
-pub use amf::{AmfEncoding, AmfProperties, AmfRead, AmfValue};
+pub use amf::amf0::Amf0Document;
+pub use amf::amf3::Amf3Document;
+pub use amf::{AmfEncoding, AmfProperties, AmfRead, AmfValue, ObjectId, TreeError, TreeLimits};
 // The AMF codecs live under `amf`. Their modules stay re-exported here so
 // existing `rtmpx::amf0` and `rtmpx::amf3` paths keep working.
 pub use amf::amf0::{Amf0DeserializationError, Amf0Object, Amf0SerializationError, Amf0Value};
@@ -204,28 +118,22 @@ pub use amf::{amf0, amf3};
 pub use elementary::{ElementaryCodec, ElementaryUnit};
 pub use enhanced::{EnhancedCapabilities, EnhancedValidationMode};
 pub use media::{
-    MediaClassification, MediaInterpretation, ParsedAudio, ParsedVideo, ValidatedMedia,
+    MediaClassification, MediaInterpretation, MediaValidationError, ParsedAudio, ParsedVideo,
+    ValidatedMedia,
 };
 pub use metadata::{
     EncoderSummary, MAX_ENCODER_LEN, MetadataCodec, ParsedMetadata, TrackMetadata,
     ValidatedMetadata, normalize_encoder_vendor,
 };
 
-/// Socket-operation timeouts used by async adapters built around the sans-I/O
-/// session API. `None` disables the corresponding timeout.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ServerSessionTimeouts {
-    pub handshake_read: Option<std::time::Duration>,
-    pub session_read: Option<std::time::Duration>,
-    pub write: Option<std::time::Duration>,
-}
+/// Ownership and allocation examples.
+#[doc = include_str!("../docs/zero-copy.md")]
+pub mod zero_copy_guide {}
 
-impl Default for ServerSessionTimeouts {
-    fn default() -> Self {
-        Self {
-            handshake_read: Some(std::time::Duration::from_secs(2)),
-            session_read: Some(std::time::Duration::from_millis(2_500)),
-            write: Some(std::time::Duration::from_secs(2)),
-        }
-    }
-}
+pub use chunk_io::{DropPolicy, EncodeOptions, HeaderMode, Packet};
+
+#[cfg(test)]
+extern crate self as rtmpx;
+#[cfg(test)]
+#[path = "../tests/support/api.rs"]
+mod api;

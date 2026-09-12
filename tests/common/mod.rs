@@ -6,7 +6,7 @@ pub mod driver;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use rtmpx::sessions::StreamMetadata;
+use crate::api::sessions::StreamMetadata;
 
 pub type Result<T> = std::result::Result<T, String>;
 
