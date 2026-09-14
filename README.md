@@ -7,7 +7,6 @@
 [![GitHub CI Status][github-shield]][github]
 [![crates.io version][crate-shield]][crate]
 [![Documentation][docs-shield]][docs]
-[![License][license-shield]][license]
 
 </div>
 
@@ -15,10 +14,9 @@ RTMPX provides client and server sessions, chunk framing, handshakes, AMF codecs
 Applications own sockets, TLS, scheduling, backpressure, and media delivery policy.
 The library works with any runtime and can also run entirely in memory.
 
-Version 3 redesigns the public API around explicit payload ownership and independent stream lifecycles.
-It replaces the version 2 API without a compatibility layer.
-Use `rtmpx = "3.0"` to depend on this release from crates.io.
-See the [migration notes](CHANGELOG.md) and [API and ownership guide](docs/zero-copy.md).
+RTMPX is in production use today, for both publisher ingest and player delivery.
+It covers AMF0 and AMF3 script data, the Enhanced RTMP multitrack and multichannel audio extensions, and segmented payloads that relay media without copying or re-encoding bytes.
+Descriptor pools and preallocated transport storage absorb the upfront cost during warm-up; after that, media paths can run with zero allocations.
 
 ## What the API provides
 
@@ -173,6 +171,3 @@ MIT. See [LICENSE](LICENSE), including the upstream RML copyright.
 [crate]: https://crates.io/crates/rtmpx
 [docs-shield]: https://img.shields.io/badge/docs-crates-green.svg?style=for-the-badge
 [docs]: https://docs.rs/rtmpx/
-[license-shield]: https://img.shields.io/crates/l/rtmpx.svg?style=for-the-badge
-[license]: https://github.com/darfink/rtmpx
-
