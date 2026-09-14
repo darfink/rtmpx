@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.0.1 — 2026-09-14
+
+- Refresh the readme introduction around production readiness and allocation behavior.
+- Drop the license badge from the readme header.
+
 ## 3.0.0 — 2026-09-12
 
 Migrate callers before upgrading. Version 3 replaces the version 2 public API.
