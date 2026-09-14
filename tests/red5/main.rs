@@ -19,6 +19,8 @@ mod fixtures;
 mod harness;
 mod lifecycle;
 
+use std::time::Duration;
+
 use crate::api::amf::AmfEncoding;
 use crate::api::amf0::{Amf0Object, Amf0Value};
 use crate::api::sessions::ClientSessionEvent;
@@ -85,6 +87,40 @@ fn expected_audio() -> Vec<Vec<u8>> {
         a.push(aac_raw_frame(0x30 + i).to_vec());
     }
     a
+}
+
+/// Read player events until `done` holds or the timeout expires, accumulating
+/// every media packet seen. Later phases assert over the full history, so a
+/// cached pre-join replay never masks a missing post-join packet.
+async fn drain_until(
+    play: &mut Peer,
+    videos: &mut Vec<Vec<u8>>,
+    audios: &mut Vec<Vec<u8>>,
+    timeout: &Duration,
+    done: impl Fn(&[Vec<u8>], &[Vec<u8>]) -> bool,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + *timeout;
+    while !done(videos, audios) {
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "timed out waiting for relayed media (saw {} video / {} audio packets)",
+                videos.len(),
+                audios.len()
+            ));
+        }
+        for event in play.next_events().await? {
+            match event {
+                ClientSessionEvent::VideoDataReceived { data, .. } => {
+                    videos.push(data.to_vec());
+                }
+                ClientSessionEvent::AudioDataReceived { data, .. } => {
+                    audios.push(data.to_vec());
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 // --- Row 1: publish, AMF0, legacy -------------------------------------------
@@ -277,44 +313,62 @@ async fn enhanced_media_body(
     let key = stream_key(tag);
     let (mut publ, _, _) = Peer::connect(&red5, encoding, enhanced_connect_props()).await?;
     publ.publish(&key).await?;
-    // Send Enhanced bytes Red5 cannot understand, then prove the connection
-    // is still usable by round-tripping legacy media behind it.
-    publ.send_video(enhanced.clone(), 0).await?;
+    // Subscribe BEFORE publishing: live relays only what arrives after play,
+    // so headers sent pre-play would be a cross-connection race (the player
+    // may subscribe before Red5 processes them and miss them entirely).
     let (mut play, _, _) = Peer::connect(&red5, AmfEncoding::Amf0, Amf0Object::new()).await?;
     play.play(&key).await?;
-    publ.send_video(avc_sequence_header(), 40).await?;
-    publ.send_audio(aac_sequence_header(), 40).await?;
-
-    // Red5 may replay the pre-join Enhanced packet as a cached sequence
-    // header, so the first relayed video frame is not always the legacy
-    // header. Wait until the legacy header arrives instead of asserting on
-    // the first packet.
-    let deadline = std::time::Instant::now() + red5.op_timeout;
+    // Establish legitimate legacy codec state FIRST. Red5 locks a live
+    // stream's video codec from the first video packet it processes: our
+    // Enhanced bytes start with 0x12, which Red5 misreads as legacy Sorenson
+    // H.263 (codec id 2), poisoning the stream - later AVC is fed to the
+    // Sorenson codec and rejected, starving the player. AVC/AAC headers
+    // first make the stream deterministically AVC.
+    publ.send_video(avc_sequence_header(), 0).await?;
+    publ.send_audio(aac_sequence_header(), 0).await?;
+    // Synchronize with Red5: only inject Enhanced once the player has seen
+    // the AVC header, proving Red5 processed legacy first and the stream
+    // codec is AVC.
     let mut videos: Vec<Vec<u8>> = Vec::new();
     let mut audios: Vec<Vec<u8>> = Vec::new();
-    while !videos.contains(&avc_sequence_header().to_vec()) || audios.is_empty() {
-        if std::time::Instant::now() > deadline {
-            break;
-        }
-        for event in play.next_events().await? {
-            match event {
-                ClientSessionEvent::VideoDataReceived { data, .. } => {
-                    videos.push(data.to_vec());
-                }
-                ClientSessionEvent::AudioDataReceived { data, .. } => {
-                    audios.push(data.to_vec());
-                }
-                _ => {}
-            }
-        }
-    }
+    drain_until(
+        &mut play,
+        &mut videos,
+        &mut audios,
+        &red5.op_timeout,
+        |videos, _| videos.contains(&avc_sequence_header().to_vec()),
+    )
+    .await?;
+    // Inject Enhanced bytes Red5 cannot understand mid-stream, then prove
+    // the stream stays usable by relaying fresh legacy media behind it.
+    // Probe frames use distinct payloads so the assert below only passes on
+    // post-Enhanced arrival, not on the cached pre-Enhanced replay.
+    publ.send_video(enhanced.clone(), 40).await?;
+    let probe_video = avc_coded_frame(0x71);
+    let probe_audio = aac_raw_frame(0x31);
+    publ.send_video(probe_video.clone(), 80).await?;
+    publ.send_audio(probe_audio.clone(), 80).await?;
+    drain_until(
+        &mut play,
+        &mut videos,
+        &mut audios,
+        &red5.op_timeout,
+        |videos, audios| {
+            videos.contains(&probe_video.to_vec()) && audios.contains(&probe_audio.to_vec())
+        },
+    )
+    .await?;
     assert!(
-        videos.contains(&avc_sequence_header().to_vec()),
-        "legacy video must still flow after Enhanced input"
+        videos.contains(&probe_video.to_vec()),
+        "legacy video must still flow after Enhanced input, saw {} video / {} audio packets",
+        videos.len(),
+        audios.len(),
     );
     assert!(
-        !audios.is_empty(),
-        "legacy audio must still flow after Enhanced input"
+        audios.contains(&probe_audio.to_vec()),
+        "legacy audio must still flow after Enhanced input, saw {} video / {} audio packets",
+        videos.len(),
+        audios.len(),
     );
     eprintln!(
         "red5 characterization [{tag}]: publish accepted; player saw {} video / {} audio packets (Enhanced relayed: {})",
