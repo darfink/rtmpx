@@ -82,7 +82,8 @@ See the [allocation contract](docs/zero-copy.md#allocation-contract) for measure
 | Frame owned or borrowed messages | `ChunkEncoder`, `Packet` |
 | Inspect media without rewriting its body | `ValidatedMedia`, `PayloadView` |
 | Inspect encoded script data explicitly | `DataMessage`, `ValidatedMetadata` |
-| Extract contiguous codec samples and configuration | `ElementaryUnit`, `visit_elementary_units` |
+| Extract contiguous codec samples and configuration | `ElementaryUnit`, `visit_elementary_units` (AVC, HEVC, AV1, VP8, VP9, VVC, AAC, Opus, FLAC, AC-3, E-AC-3, MP3) |
+| Observe sequence ends and skipped controls | `ElementaryEvent`, `visit_elementary_events` |
 | Preserve AMF object identity and cycles | `Amf0Document`, `Amf3Document` |
 
 Sessions apply chunk-size changes, aborts, and flow-control messages automatically.
@@ -171,3 +172,16 @@ MIT. See [LICENSE](LICENSE), including the upstream RML copyright.
 [crate]: https://crates.io/crates/rtmpx
 [docs-shield]: https://img.shields.io/badge/docs-crates-green.svg?style=for-the-badge
 [docs]: https://docs.rs/rtmpx/
+
+### Elementary media events
+
+`elementary_units` and `visit_elementary_units` emit only configurations and samples.
+`elementary_events` and `visit_elementary_events` also report sequence ends and skipped messages in wire track order.
+Skipped events distinguish unsupported codecs, unknown packet types, metadata, video commands, channel configuration, and MPEG-TS configuration.
+Malformed or opaque input remains an error.
+
+Payloads retain slices of the input bytes. RTMPX validates transport structure, not codec decodability.
+A coded payload can contain multiple codec frames. Consumers must parse frame boundaries and decoded durations where necessary.
+Video keyframe flags describe publisher signaling; they do not prove a decoder restart point.
+VVC, AVC, and HEVC retain signed composition offsets. Other supported Enhanced video codecs use zero offsets.
+Legacy MP3 supports both standard MP3 and the 8 kHz format identifier.

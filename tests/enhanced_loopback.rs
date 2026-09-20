@@ -353,3 +353,100 @@ fn enhanced_relay_is_byte_exact_between_two_sessions() {
         "relay must forward Enhanced + legacy bytes verbatim"
     );
 }
+
+#[test]
+fn added_elementary_codecs_survive_sessions() -> Result<(), Box<dyn std::error::Error>> {
+    use rtmpx::{
+        ElementaryCodec as C, ElementaryEvent as E, ElementaryUnit as U,
+        EnhancedValidationMode as M, ValidatedMedia,
+    };
+    for encoding in [AmfEncoding::Amf0, AmfEncoding::Amf3] {
+        let mut pump = Pump::new(client_config_for(encoding), ServerSessionConfig::new());
+        connect(&mut pump, "live");
+        publish(&mut pump, "added-codecs");
+        for (four_cc, codec) in [
+            (*b"fLaC", C::Flac),
+            (*b"ac-3", C::Ac3),
+            (*b"ec-3", C::Eac3),
+            (*b".mp3", C::Mp3),
+            (*b"vp08", C::Vp8),
+            (*b"vp09", C::Vp9),
+            (*b"vvc1", C::Vvc),
+        ] {
+            for packet_type in 0..=2 {
+                let mut raw = vec![0x90 | packet_type];
+                raw.extend_from_slice(&four_cc);
+                if packet_type != 2 {
+                    if codec == C::Vvc && packet_type == 1 {
+                        raw.extend_from_slice(&[0xff, 0xff, 0xfb]);
+                    }
+                    raw.extend_from_slice(b"opaque-codec-payload");
+                }
+                let raw = Bytes::from(raw);
+                let output = if codec.is_audio() {
+                    pump.client
+                        .publish_audio_data(raw.clone(), RtmpTimestamp::new(40), false)?
+                } else {
+                    pump.client
+                        .publish_video_data(raw.clone(), RtmpTimestamp::new(40), false)?
+                };
+                pump.push_client(vec![output]);
+                let received = pump
+                    .take_server_events()
+                    .into_iter()
+                    .find_map(|event| match event {
+                        ServerSessionEvent::AudioDataReceived { data, .. }
+                        | ServerSessionEvent::VideoDataReceived { data, .. } => Some(data),
+                        _ => None,
+                    })
+                    .expect("received media");
+                assert_eq!(received, raw);
+                let events = if codec.is_audio() {
+                    ValidatedMedia::parse_audio(received, M::Strict)?.elementary_events()?
+                } else {
+                    ValidatedMedia::parse_video(received, M::Strict)?.elementary_events()?
+                };
+                assert_eq!(events.len(), 1);
+                match (&events[0], packet_type) {
+                    (
+                        E::Unit(U::Configuration {
+                            codec: got,
+                            extradata,
+                            ..
+                        }),
+                        0,
+                    ) => {
+                        assert_eq!(*got, codec);
+                        assert_eq!(extradata.as_ref(), b"opaque-codec-payload");
+                    }
+                    (
+                        E::Unit(U::Sample {
+                            codec: got,
+                            payload,
+                            composition_time_offset,
+                            ..
+                        }),
+                        1,
+                    ) => {
+                        assert_eq!(*got, codec);
+                        assert_eq!(payload.as_ref(), b"opaque-codec-payload");
+                        assert_eq!(
+                            *composition_time_offset,
+                            if codec == C::Vvc { -5 } else { 0 }
+                        );
+                    }
+                    (
+                        E::SequenceEnd {
+                            codec: got,
+                            track_id: None,
+                            ..
+                        },
+                        2,
+                    ) => assert_eq!(*got, codec),
+                    event => panic!("unexpected event: {event:?}"),
+                }
+            }
+        }
+    }
+    Ok(())
+}

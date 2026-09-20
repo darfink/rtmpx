@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.1.0 — 2026-09-20
+
+- Add elementary mappings for FLAC, AC-3, E-AC-3, MP3, VP8, VP9, and VVC.
+- Map legacy MP3, including the 8 kHz format identifier.
+- Add ordered elementary events for sequence ends and typed skipped-message reasons.
+- Preserve signed VVC composition offsets and reject undersized multitrack offset fields.
+- Add codec mapping, control-event, multitrack, and AMF0/AMF3 session regression tests.
+
+These mappings preserve opaque codec payloads. They do not add codec decoding or HLS packaging.
+
 ## 3.0.1 — 2026-09-14
 
 - Refresh the readme introduction around production readiness and allocation behavior.

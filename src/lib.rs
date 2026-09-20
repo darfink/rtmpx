@@ -137,7 +137,9 @@ pub use amf::{AmfEncoding, AmfProperties, AmfRead, AmfValue, ObjectId, TreeError
 pub use amf::amf0::{Amf0DeserializationError, Amf0Object, Amf0SerializationError, Amf0Value};
 pub use amf::amf3::{Amf3DeserializationError, Amf3SerializationError, Amf3Value};
 pub use amf::{amf0, amf3};
-pub use elementary::{ElementaryCodec, ElementaryUnit};
+pub use elementary::{
+    ElementaryCodec, ElementaryCodecId, ElementaryEvent, ElementarySkipReason, ElementaryUnit,
+};
 pub use enhanced::{EnhancedCapabilities, EnhancedValidationMode};
 pub use media::{
     MediaClassification, MediaInterpretation, MediaValidationError, ParsedAudio, ParsedVideo,

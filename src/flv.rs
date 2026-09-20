@@ -810,10 +810,12 @@ fn video_packet<P: MediaData>(
             sized_payload(cursor, size)?,
         )),
         VIDEO_PACKET_CODED_FRAMES => {
-            if four_cc.0 == *b"avc1" || four_cc.0 == *b"hvc1" {
+            if matches!(&four_cc.0, b"avc1" | b"hvc1" | b"vvc1") {
                 let composition_time_offset = cursor.read_i24()?;
                 let data = match size {
-                    Some(len) => cursor.take(len.saturating_sub(3))?,
+                    Some(len) => cursor.take(len.checked_sub(3).ok_or_else(|| {
+                        FlvError("coded frame size is shorter than composition offset".into())
+                    })?)?,
                     None => cursor.take_rest(),
                 };
                 Ok(VideoPacket::CodedFrames {
