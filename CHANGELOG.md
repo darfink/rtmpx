@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.1.1 — 2026-10-02
 
 - Accept GStreamer's little-endian FourCC codec ids in `onMetaData`. `eflvmux` writes `avc1` as `1cva`, so strict validation rejected every GStreamer multitrack publication.
 - Limit numeric `onMetaData` codec labels to known FourCCs, as string labels already were.
