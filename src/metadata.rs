@@ -184,7 +184,10 @@ fn codec_label(value: f64, kind: TrackKind) -> Option<String> {
     let id = value as u32;
     let bytes = id.to_be_bytes();
     if bytes.iter().all(u8::is_ascii_graphic) {
-        return Some(String::from_utf8_lossy(&bytes).into_owned());
+        // Only a known FourCC becomes a label: the value is publisher-controlled
+        // and ends up as a Prometheus label, like the string form above.
+        return canonical_fourcc(bytes, kind)
+            .map(|fourcc| String::from_utf8_lossy(&fourcc).into_owned());
     }
     let label = match kind {
         TrackKind::Video => match id {
@@ -404,6 +407,21 @@ fn known_fourcc(value: [u8; 4], kind: TrackKind) -> bool {
     }
 }
 
+/// Resolve a numeric `onMetaData` codec id to a known FourCC.
+///
+/// Enhanced RTMP defines the id as the FourCC read big-endian. GStreamer's
+/// `eflvmux` (at least through 1.28) writes it little-endian, so `avc1`
+/// arrives as `1cva`. The media tags themselves carry the FourCC in the
+/// right order, so only this advisory field needs the reversed fallback. No
+/// known FourCC is the reverse of another, so the fallback cannot misread one.
+fn canonical_fourcc(bytes: [u8; 4], kind: TrackKind) -> Option<[u8; 4]> {
+    let mut reversed = bytes;
+    reversed.reverse();
+    [bytes, reversed]
+        .into_iter()
+        .find(|candidate| known_fourcc(*candidate, kind))
+}
+
 fn parse_metadata(properties: Amf0Object) -> Result<ParsedMetadata, String> {
     let audio_tracks = parse_track_map(
         properties.get("audioTrackIdInfoMap"),
@@ -481,13 +499,14 @@ fn parse_codec(
     if !bytes.iter().all(u8::is_ascii_graphic) {
         return Ok(MetadataCodec::Legacy(*value));
     }
-    if !known_fourcc(bytes, kind) {
-        return Err(format!(
-            "{field}[{track_id}] has unknown FourCC {:?}",
-            String::from_utf8_lossy(&bytes)
-        ));
-    }
-    Ok(MetadataCodec::FourCc(bytes))
+    canonical_fourcc(bytes, kind)
+        .map(MetadataCodec::FourCc)
+        .ok_or_else(|| {
+            format!(
+                "{field}[{track_id}] has unknown FourCC {:?}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
 }
 
 #[cfg(test)]
@@ -553,6 +572,63 @@ mod tests {
             metadata.video_tracks[&1].properties.get("vendorHint"),
             Some(&Amf0Value::Boolean(true))
         );
+    }
+
+    #[test]
+    fn accepts_gstreamer_little_endian_fourcc_ids() {
+        // Captured from GStreamer 1.28 eflvmux with multitrack pads: every
+        // numeric codec id is the FourCC read little-endian.
+        let reversed = |value: &[u8; 4]| Amf0Value::Number(f64::from(u32::from_le_bytes(*value)));
+        let properties = Amf0Object::from([
+            ("videocodecid".into(), reversed(b"avc1")),
+            ("audiocodecid".into(), reversed(b"mp4a")),
+            (
+                "videoTrackIdInfoMap".into(),
+                Amf0Value::Object(Amf0Object::from([(
+                    "1".into(),
+                    Amf0Value::Object(Amf0Object::from([(
+                        "videocodecid".into(),
+                        reversed(b"hvc1"),
+                    )])),
+                )])),
+            ),
+            (
+                "audioTrackIdInfoMap".into(),
+                Amf0Value::Object(Amf0Object::from([(
+                    "1".into(),
+                    Amf0Value::Object(Amf0Object::from([(
+                        "audiocodecid".into(),
+                        reversed(b"mp4a"),
+                    )])),
+                )])),
+            ),
+        ]);
+        let metadata = parse_metadata(properties).expect("GStreamer metadata parses");
+        assert_eq!(
+            metadata.video_tracks[&1].codec,
+            Some(MetadataCodec::FourCc(*b"hvc1"))
+        );
+        assert_eq!(
+            metadata.audio_tracks[&1].codec,
+            Some(MetadataCodec::FourCc(*b"mp4a"))
+        );
+        let summary = metadata.encoder_summary();
+        assert_eq!(summary.video_codec.as_deref(), Some("avc1"));
+        assert_eq!(summary.audio_codec.as_deref(), Some("mp4a"));
+    }
+
+    #[test]
+    fn numeric_codec_labels_are_bounded_to_known_fourccs() {
+        let metadata = ParsedMetadata {
+            properties: Amf0Object::from([
+                ("videocodecid".into(), four_cc(b"zzzz")),
+                ("audiocodecid".into(), four_cc(b"mp4a")),
+            ]),
+            ..Default::default()
+        };
+        let summary = metadata.encoder_summary();
+        assert_eq!(summary.video_codec, None);
+        assert_eq!(summary.audio_codec.as_deref(), Some("mp4a"));
     }
 
     #[test]
