@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.1.2 — 2026-11-19
+
+- Reorganize the README and polish crate documentation, the ownership guide, and the Enhanced RTMP compliance matrix.
+- Fix broken test-suite references and align CI documentation with the active jobs.
+
 ## 3.1.1 — 2026-10-02
 
 - Accept GStreamer's little-endian FourCC codec ids in `onMetaData`. `eflvmux` writes `avc1` as `1cva`, so strict validation rejected every GStreamer multitrack publication.
