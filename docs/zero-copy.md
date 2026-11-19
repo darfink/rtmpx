@@ -1,27 +1,24 @@
 # RTMPX API and ownership guide
 
-RTMPX performs no network I/O. Sessions own protocol state. Applications own transports and scheduling.
-The default session payload is `Payload`, which retains receive segments without copying their bytes.
+RTMPX performs no network I/O. Sessions manage protocol state, while your application owns transports, TLS, timeouts, and scheduling.
+The default session payload type is `Payload`, which keeps slices of your receive buffers without copying their bytes.
 
-## Start with sessions
+## Starting with sessions
 
-`ClientSession::new(config)` and `ServerSession::new(config)` return one session. Create them after the RTMP handshake.
-Connection and request-decision actions return `Result<()>` and queue their outputs:
+Create `ClientSession::new(config)` or `ServerSession::new(config)` once the RTMP handshake completes.
+Control and request-decision methods return `Result<()>` and queue their outbound packets inside the session:
 
-- Client: `connect`, `connect_with_properties`, `delete_stream`
-- Server: `accept_request`, `accept_request_with_properties`, `reject_request`
+- **Client:** `connect`, `connect_with_properties`, `delete_stream`
+- **Server:** `accept_request`, `accept_request_with_properties`, `reject_request`
 
-Both sessions expose `receive(&mut Bytes) -> Result<Option<Output>, Error>`.
-The concrete output types are `ClientOutput` and `ServerOutput`:
+Both sessions drive progress through a single pull method, `receive(&mut Bytes) -> Result<Option<Output>, Error>`, yielding `ClientOutput` or `ServerOutput`:
 
-- `Packet(packet)` contains outbound wire data
-- `Event(event)` contains a `ClientEvent` or `ServerEvent`
-- `UnhandledMessage(message)` preserves an unhandled message and its segmented body
+- `Packet(packet)`: outbound framed wire data ready for your transport writer
+- `Event(event)`: a `ClientEvent` or `ServerEvent`
+- `UnhandledMessage(message)`: an unhandled RTMP message with its segmented body intact
 
-Each call returns at most one output. Unread input stays with the caller.
-The output does not borrow the session or input variable. It can move into an asynchronous queue.
-`None` means that pending outputs are drained and more input is required.
-Even when input is empty, call `receive`. Control actions and received commands can queue several outputs.
+Each `receive` call returns at most one item and leaves any unread input in your buffer. Because the returned value does not borrow the session or input buffer, you can move it straight into an async channel or await backpressure before calling `receive` again.
+Keep calling `receive` until it returns `Ok(None)`—even when your input buffer is empty—because a single control action or incoming command can queue several outputs.
 
 ```rust
 use bytes::Bytes;
@@ -49,31 +46,21 @@ while let Some(output) = session.receive(&mut input)? {
 # Ok::<(), rtmpx::sessions::ServerSessionError>(())
 ```
 
-The callback and batch-ingestion APIs are removed. No temporary event vector is required.
-Acknowledgements count consumed wire bytes. Draining outputs does not count unread input again.
-If input fails, close the transport and discard the session and unsent packets.
-Earlier returned outputs remain observable. A failed session rejects later operations.
+Acknowledgements count only consumed wire bytes, so draining outputs never double-counts unread input.
+If `receive` returns an error, close the transport and discard the session and any unsent packets; a failed session rejects further calls (earlier returned outputs stay valid).
 
 ## Connections and streams
 
-`state()` reports `ConnectionState`. It stays `Connected` while individual streams start, run, or end.
-The connection owns negotiation, acknowledgements, ping, and framing. Message stream ID 0 is implicit in those operations.
-`StreamId::CONTROL` names that wire channel for low-level code. RTMP chunk streams are a separate framing concept.
+`state()` returns `ConnectionState`, which stays `Connected` as individual streams start, run, and end.
+Connection-level messages (negotiation, acknowledgements, ping, chunk framing) implicitly use message stream ID `0` (`StreamId::CONTROL` in low-level APIs), which is separate from RTMP chunk stream IDs.
 
-`play(key)` and `publish(key, PublishMode)` return `Result<StreamHandle>` immediately and queue `createStream`.
-Each operation has an independent lifecycle. Multiple playback and publishing streams can share one session.
-Acceptance and rejection events carry the original handle, even when responses arrive out of order.
-Media and script-data events also identify their stream.
+On the client, `play(key)` and `publish(key, PublishMode)` return `Result<StreamHandle>` immediately and queue `createStream`.
+Multiple playback and publishing streams can run independently over one connection: acceptance, rejection, media, and script-data events all carry the original `StreamHandle`, even if server responses arrive out of order.
 
-`StreamHandle` is a 16-byte local value. It exists before the server assigns a wire ID.
-Handles are scoped to one session. A handle from another session is rejected.
-`stream_id(handle)` returns the optional wire `StreamId`. `stream_state(handle)` reports its current state.
-Client states use `ClientStreamState`. Server states use `ServerStreamState`. `streams()` iterates live handles without allocating.
-Server request events provide server-local handles. Those handles differ from the handles held by the client.
+`StreamHandle` is a 16-byte session-local value assigned before the server picks a wire ID (handles from another session are rejected).
+Use `stream_id(handle)` for the optional wire `StreamId`, `stream_state(handle)` for `ClientStreamState` / `ServerStreamState`, and `streams()` to iterate live handles without allocating. Server request events use server-local handles independent of the client's handles.
 
-`delete_stream(handle)` invalidates a client handle immediately. It queues deletion for an established wire stream.
-If creation is pending, its eventual response is deleted without starting the cancelled operation.
-No deletion acknowledgement is required. A replacement operation can start immediately:
+Calling `delete_stream(handle)` on a client invalidates the handle immediately and queues deletion for an established stream (if `createStream` is still pending, its eventual response is deleted automatically without starting the cancelled operation). You do not need to wait for a deletion acknowledgement before starting a replacement stream:
 
 ```rust
 use rtmpx::sessions::{ClientSession, ClientSessionError, PublishMode, StreamHandle};
@@ -87,64 +74,43 @@ fn replace_playback(
 }
 ```
 
-Drain the queued packets through `receive`. Wait for `PublishRequestAccepted` before sending media on the returned handle.
-Deletion preserves other streams and the connection. Reused storage slots and wire IDs do not revive deleted handles.
-A late status for an unknown wire stream produces `StatusReceived { stream: None, .. }`.
+Drain the queued packets through `receive()`, and wait for `PublishRequestAccepted` before sending media on the new handle.
+Deleting a stream leaves other streams and the connection untouched; reused slots and wire IDs never revive deleted handles, and a late status for an unknown wire stream surfaces as `StatusReceived { stream: None, .. }`.
 
-The server uses `complete_playback(handle)` to report playback completion. This differs from deleting the client's stream.
-RTMPX clients delete the completed stream automatically. The server retains it until deletion arrives from the peer.
-Request rejection or playback/publishing completion releases the affected client handle. The corresponding event retains its identity.
+On the server, call `complete_playback(handle)` to signal playback completion. RTMPX clients automatically delete a completed stream, while the server keeps it until the peer sends `deleteStream`. Request rejection or stream completion releases the affected client handle while preserving its identity on the final event.
 
-Stream storage grows during creation and reuses vacant slots. Wire-ID lookup uses a hash index.
-Neither handle validation nor media routing allocates per frame. Connection setup and AMF commands can still allocate.
+Stream storage reuses vacant slots and indexes wire IDs in a hash table, so neither handle validation nor media routing allocates per frame.
 
-## Bound session state
+## Bounding session state
 
-Both configurations expose `session_limits: SessionLimits`, independently of `decoder_limits`.
-The defaults allow 128 live streams and 128 pending requests per connection.
-`max_streams` includes client streams awaiting creation. `max_pending_requests` bounds unanswered client transactions and server requests awaiting an application decision.
-Cancelled client creations count until the peer answers. This prevents repeated cancellation from bypassing the pending-request bound.
-Deleting streams and resolving requests release their capacity.
+Both session configs expose `session_limits: SessionLimits` alongside `decoder_limits`.
+By default, each connection allows up to 128 live streams (`max_streams`, including pending client creations) and 128 pending requests (`max_pending_requests`, covering unanswered client transactions and server requests awaiting a decision).
+Cancelled client creations remain counted until the peer responds, preventing repeated cancellation from bypassing the cap; deleting streams and resolving requests free capacity.
 
-Client actions return `ClientSessionError::LimitExceeded` without terminating the session. They can be retried after capacity becomes available.
-If inbound requests exceed server limits, `receive` returns `ServerSessionError::LimitExceeded` and terminates the session.
-`SessionLimitError` distinguishes stream limits from pending-request limits. Zero disables the corresponding operation.
-These limits bound protocol state. The application still bounds transport buffers, outgoing queues, and retained payloads.
+- On the client, exceeding a limit returns `ClientSessionError::LimitExceeded` without killing the session, so you can retry once capacity frees up.
+- On the server, exceeding a limit on inbound requests returns `ServerSessionError::LimitExceeded` and terminates the session.
+- `SessionLimitError` distinguishes stream limits from pending-request limits; setting a limit to `0` disables that operation.
 
-## Send and resume packets
+These limits cap protocol state only—your application still owns bounds on socket buffers, outbound queues, and retained payloads.
 
-Both sessions expose `send_audio`, `send_video`, and `send_data`.
-Audio and video accept owned `Bytes`, `Vec<u8>`, or `Payload`, plus a timestamp and `DropPolicy`.
-Both client and server sends require a `StreamHandle`.
-Clients send on publishing streams. Servers send on playback streams.
-`send_data` accepts `DataMessage` and preserves its timestamp, wire type, and encoded body.
-`send_metadata` encodes typed metadata. Sending encoded data does not decode it.
+## Sending and resuming packets
 
-All sends and control outputs use `Packet<Payload>`. There is no separate prepared-packet type.
-Packet owns both its payload and write progress. Store it directly in a task or queue.
+Both sessions provide `send_audio`, `send_video`, and `send_data`, each taking a `StreamHandle` (clients send on publish streams; servers send on playback streams).
+Audio and video sends accept owned `Bytes`, `Vec<u8>`, or `Payload`, along with a timestamp and `DropPolicy`.
+`send_data` sends a `DataMessage` preserving its timestamp, wire type, and encoded body without decoding it; `send_metadata` encodes typed metadata.
 
-For each transport write:
+Both media sends and control outputs return `Packet<Payload>`, which owns its payload, inline chunk headers, and partial-write cursor so it can live directly in a task or queue. To write a packet to a transport:
 
-1. Fill a stack array with `packet.io_slices(&mut slices)`
-2. Write those slices
-3. Advance the packet by the number of bytes successfully written
-4. Retain the packet until `packet.is_complete()` is true
+1. Fill a stack slice array with `packet.io_slices(&mut slices)`.
+2. Perform a vectored write.
+3. Advance the packet by the bytes actually written.
+4. Keep writing until `packet.is_complete()` is true.
 
-`Packet` also implements `bytes::Buf`. `remaining()` excludes bytes already advanced.
-`wire_len()` reports the original total wire length. Headers use inline storage.
-`to_vec()` explicitly copies the remaining wire bytes. `copy_to(&mut Vec<u8>)` reuses the destination capacity.
-Neither copying helper advances the packet.
+`Packet` also implements `bytes::Buf`: `remaining()` tracks unwritten bytes, while `wire_len()` reports the original total length. `to_vec()` and `copy_to(&mut Vec<u8>)` copy remaining wire bytes without advancing the cursor.
 
-Server sends require an accepted connection.
-Drain pending session outputs before calling a send method. Otherwise, the method returns `PendingOutput` without encoding a new packet.
-Send packets in production order. The caller must preserve that order across its own queues.
-`DropPolicy::Never` forbids omission. `DropPolicy::Allowed` permits omission only before transmission starts.
-`packet.can_drop()` becomes false after the first advance. A partially transmitted packet must finish.
+Drain all pending session outputs via `receive()` before calling a send method, or the send returns `PendingOutput` without encoding a packet. Always write packets in the order produced. `DropPolicy::Never` forbids dropping a packet; `DropPolicy::Allowed` allows dropping only before any byte is written (`packet.can_drop()` becomes `false` after the first advance, so partially written packets must finish).
 
-TCP and TLS writers have separate capabilities and buffering costs.
-The examples use asynchronous vectored writes and handle short writes without a borrowed cursor object.
-
-## Validate media and inspect metadata
+## Validating media and inspecting metadata
 
 ```rust
 use bytes::Bytes;
@@ -159,20 +125,14 @@ assert!(media.classification().coded);
 # Ok::<(), rtmpx::MediaValidationError>(())
 ```
 
-`parse_audio` accepts the same storage types. Both parsers also accept contiguous `Bytes`.
-Header fields can cross segment boundaries. Parsed media ranges borrow the original payload without copying bytes or descriptors.
-Release borrowed interpretations before moving their payloads. Classification is a small owned value.
+`ValidatedMedia::parse_video` and `parse_audio` accept both segmented `PayloadView` and contiguous `Bytes`.
+Headers can span segment boundaries, and parsed views borrow directly from the original payload without copying bytes or descriptors—just drop borrowed views before moving the payload. `classification()` returns a small owned value.
 
-Single-track validation does not allocate for valid segmented media. Multitrack parsing allocates its typed track vector.
-Error and opaque-result strings can allocate. Elementary extraction from contiguous media offers `visit_elementary_units` without a result vector.
+Single-track validation does not allocate for valid segmented media; multitrack parsing allocates its track vector, and error/opaque strings can allocate. When extracting elementary units from contiguous bytes, `visit_elementary_units` avoids allocating a temporary result vector.
 
-Every script-data message produces `StreamDataReceived`, including metadata. There are no separate automatic metadata events.
-Call `message.metadata()` for properties, or `ValidatedMetadata::parse(message, mode)` for Enhanced RTMP metadata validation.
-Both inspect segmented storage directly. AMF values allocate, but encoded input is not coalesced.
-Use `metadata()` to distinguish metadata from other script data before calling the strict validator.
-The strict metadata validator rejects non-metadata messages.
+Every script-data message arrives as `StreamDataReceived` (including `onMetaData`). Call `message.metadata()` to read properties, or `ValidatedMetadata::parse(message, mode)` for Enhanced RTMP metadata validation. Both read segmented storage directly without coalescing the payload (though decoded AMF values allocate). Check `metadata()` first before calling the strict metadata validator, which rejects non-metadata script messages.
 
-## Recycle descriptors
+## Recycling descriptors
 
 ```rust
 use rtmpx::{PayloadPool, PayloadPoolConfig, sessions::{ServerSession, ServerSessionConfig}};
@@ -187,79 +147,54 @@ let session = ServerSession::new(config)?;
 # Ok::<(), rtmpx::sessions::ServerSessionError>(())
 ```
 
-`PayloadPool::default()` uses those limits. Clones share the cache.
-Both session configurations accept `payload_pool`. Sessions and `MessageDecoder` also expose `set_payload_pool` for later changes.
+`PayloadPool::default()` uses these same limits, and cloning a pool shares the underlying cache. Pass it in `ClientSessionConfig` / `ServerSessionConfig`, or attach it later with `set_payload_pool` on sessions and `MessageDecoder`.
 
-The first segment stays inline. Additional segments use a descriptor vector.
-Dropping a pooled payload releases its receive buffers, then returns the empty vector to the pool.
-This works across relay tasks and threads. A mutex protects cache checkout and return, not parsing or writing.
-The descriptor-capacity limit excludes the inline segment. Oversized vectors and vectors returned to a full cache are freed.
+Because a `Payload` stores its first segment inline, only multi-segment payloads need a descriptor vector. When a pooled payload drops, it releases its receive buffers and returns the cleared vector to the pool—even from another thread or relay task (a mutex guards checkout/return only, never parsing or writing). Vectors larger than `max_descriptors_per_payload` (excluding the inline segment) or returned to a full cache are freed normally.
 
-Cache limits do not restrict live messages. Bound relay queues and configure `decoder_limits` separately.
-Warmup must cover concurrent messages and their fragment counts. New peaks can require more descriptor storage.
-Move payloads through queues. Cloning a fragmented payload can allocate another descriptor vector.
+Pool limits control cache size, not live message count—bound relay queues and `decoder_limits` separately. Move payloads rather than cloning fragmented ones (cloning can allocate a fresh descriptor vector), and keep source receive buffers reasonably sized so a small slice does not pin a large allocation.
 
-A small segment can retain a large receive allocation. Use bounded source buffers and release consumed messages promptly.
-Transport buffer allocation, reuse, and ownership metadata remain the application's responsibility.
+## Core types
 
-## Public names and layers
+- `Payload`: segmented message body retaining slices of receive buffers.
+- `RawMessage`: adds RTMP message type, timestamp, and message stream ID.
+- `RtmpMessage`: decoded protocol message (`into_raw_message` encodes it back).
+- `Packet`: adds chunk framing and tracks outbound write progress.
+- `PublishMode`: shared across client publish requests and server events.
+- `DropPolicy`: marks whether a packet may be skipped before transmission starts.
+- `UnhandledCommand`: preserves commands sessions do not interpret, including AMF3-framed commands.
+- `HandshakeRole` / `HandshakeProgress`: drive the RTMP handshake independently of session state.
 
-`Payload` stores message-body segments. `RawMessage` adds the RTMP type, timestamp, and message stream ID.
-`RtmpMessage` represents interpreted protocol messages. `RtmpMessage::into_raw_message` encodes their bodies.
-`Packet` adds chunk framing and owns outbound write progress.
-
-`PublishMode` is shared by client requests and server events. `DropPolicy` controls omission, without promising transport delivery.
-`UnhandledCommand` preserves commands that sessions cannot interpret, including commands received with AMF3 framing.
-`HandshakeRole` specifies the local client/server role. `HandshakeProgress` describes the result of processing handshake input.
-Socket timeouts belong to the transport adapter. The unused `ServerSessionTimeouts` export is removed.
-
-## Advanced chunk APIs
+## Low-level chunk APIs
 
 | Need | API |
-|---|---|
-| Own protocol-free message assembly | `MessageDecoder::decode(&mut Bytes)` |
-| Process borrowed fragments immediately | `ChunkParser::consume(&[u8])` |
-| Assemble borrowed input contiguously | `MessageDecoder::decode_slice(&mut &[u8])` |
-| Retain unread borrowed input internally | `ContiguousDecoder::get_next_message(&[u8])` |
-| Encode owned or borrowed message storage | `ChunkEncoder::encode(message, EncodeOptions)` |
-| Change outbound chunk size | `ChunkEncoder::set_chunk_size(size, timestamp)` |
+| --- | --- |
+| Protocol-free segmented message assembly | `MessageDecoder::decode(&mut Bytes)` |
+| Immediate borrowed chunk fragments | `ChunkParser::consume(&[u8])` |
+| Contiguous assembly from a borrowed slice | `MessageDecoder::decode_slice(&mut &[u8])` |
+| Contiguous assembly retaining unread bytes internally | `ContiguousDecoder::get_next_message(&[u8])` |
+| Encoding owned or borrowed messages | `ChunkEncoder::encode(message, EncodeOptions)` |
+| Changing outbound chunk size | `ChunkEncoder::set_chunk_size(size, timestamp)` |
 
-`RawMessage::as_ref()` borrows its body for low-level encoding. Its `map_data` method changes storage while preserving message identity.
-`EncodeOptions` names the drop policy and header mode. Sessions manage header compression automatically.
-A chunk-size change returns a control packet encoded with the old size. Send it before subsequent packets.
+`RawMessage::as_ref()` borrows its body for encoding, and `map_data` transforms payload storage while keeping header metadata. `EncodeOptions` sets the drop policy and header compression mode (sessions manage compression automatically). Changing outbound chunk size returns a control packet framed with the old chunk size—send it before any subsequent packets.
 
-Apply decoded SetChunkSize and Abort messages before decoding the next message. Sessions do this automatically.
-`DecoderLimits` bounds message size, chunk size, tracked streams, partial messages, retained bytes, and fragment descriptors.
-Borrowed assembly also charges reserved message capacity against the byte limit.
-The byte limit does not measure complete backing allocations retained by external `Bytes` owners.
+When using `MessageDecoder`, `ChunkParser`, or `ContiguousDecoder` directly, apply decoded `SetChunkSize` and `Abort` messages before feeding more input. `DecoderLimits` caps message size, chunk size, tracked streams, partial messages, retained bytes, and fragment descriptors (borrowed assembly also counts reserved capacity against the byte limit, though it cannot see the full backing allocation of external `Bytes` slices).
 
-`Payload::into_bytes()` returns existing contiguous storage or explicitly coalesces fragmented storage.
-`Payload::reader()` reads AMF across segments. `PayloadView` provides borrowed ranges with constant-time segment access.
+Use `Payload::into_bytes()` to return an already-contiguous buffer or coalesce fragments once, `Payload::reader()` to read AMF across segments, and `PayloadView` for O(1) borrowed segment access.
 
 ## Allocation contract
 
-`tests/allocations.rs` measures server ingestion, segmented validation, client sending, and partial-write traversal.
-It also measures client media routing across concurrent playback streams.
-After warmup, this path makes zero allocations and reallocations with a descriptor pool and preallocated transport storage.
-Coverage includes 256-byte audio, 16 KiB video, and 256 KiB video, with 128-byte and 4 KiB inbound chunks.
-The emitted wire is also decoded through a receiving session to validate the relayed bytes.
+`tests/allocations.rs` measures server ingestion, segmented validation, client sending, partial-write traversal, and concurrent client playback routing across 256-byte audio, 16 KiB video, and 256 KiB video (with 128-byte and 4 KiB inbound chunks), decoding the relayed wire bytes to confirm correctness.
 
-The explicit contiguous decoder needs one allocation for a 256 KiB message, with no reallocations across 16 KiB reads.
+After warmup with a `PayloadPool` and preallocated transport buffers, that media path performs **zero allocations and zero reallocations**.
+The explicit `ContiguousDecoder` performs one allocation for a 256 KiB message with zero reallocations across 16 KiB reads.
 These counts exclude transport buffer creation, connection setup, AMF commands, acknowledgements, and application metrics.
 
 ## Application boundaries
 
-A forwarding proxy can move each event payload through a bounded queue and into a send call.
-Borrowed validation must finish before that move. The outbound packet retains the original receive segments until writing finishes.
-Transport reads and writes remain outside the protocol core.
+- **Forwarding relays** can validate payloads via borrowed views, drop the view, move the `Payload` through a bounded queue, and send it—retaining the original receive buffers all the way until socket write completes.
+- **Ingest pipelines** (such as HLS packagers) that need contiguous codec input can call `Payload::into_bytes()` once at their boundary (a no-op when already contiguous, a single copy when fragmented) and extract samples via `visit_elementary_units` without allocating a temporary vector.
 
-A codec or container pipeline can require contiguous input.
-An HLS ingest pipeline can use `Payload::into_bytes()` at this boundary before extracting elementary units.
-A contiguous payload reuses its storage; a fragmented payload is copied once.
-`visit_elementary_units` avoids a temporary result vector while preserving multitrack siblings.
-This boundary is an application storage requirement, not a prerequisite for RTMP forwarding.
-
-## Use AMF graphs
+## AMF graphs
 
 ```rust
 use rtmpx::{Amf3Document, amf3::Amf3Value};
@@ -274,27 +209,13 @@ let encoded = document.serialize()?;
 # Ok::<(), rtmpx::amf3::Amf3SerializationError>(())
 ```
 
-`Amf0Document` and `Amf3Document` own complex values in an arena.
-References contain document-local `ObjectId` values. Moving a document preserves its IDs.
-`resolve` borrows an inline value or its referenced object.
-Copying an ID into another document does not import its target.
+`Amf0Document` and `Amf3Document` store complex values in an arena referenced by document-local `ObjectId`s (IDs stay valid when a document moves, but copying an ID into another document does not import its target). Call `resolve` to borrow an inline value or its referenced object.
 
-The decoder registers each complex object before its children. This permits shared objects and cycles without reference-counting leaks.
-The serializer emits references by identity. Equal but distinct inline objects remain distinct.
-AMF3 string and trait references remain supported.
+- Decoding registers each complex object before its children, handling shared objects and cycles without `Rc`/`Arc` leaks.
+- Serialization emits references by object identity, so equal but distinct inline objects stay distinct. AMF3 string and trait references are preserved.
+- AMF0 references cover objects, typed objects, and arrays (dates and XML documents do not take reference slots). AMF3 references cover all complex types, including vectors, dictionaries, and registered externalizable classes.
+- `Amf0Document::embed_amf3` imports a single-root AMF3 document and relocates its IDs; `get_amf3` resolves them (each encoded AVM+ value starts a fresh AMF3 reference context).
+- `to_tree(TreeLimits)` expands shared values into a tree, rejecting cycles and checking node, byte, and depth budgets first (note that the byte budget estimates owned value storage, not allocator overhead). The standard `deserialize` helpers use these bounded tree conversions.
+- Unbound references cannot be serialized outside their owning document; convert to a bounded tree before value-level AMF0/AMF3 conversions.
 
-AMF0 references cover objects, typed objects, and arrays. Dates and XML documents do not occupy AMF0 object-reference slots.
-AMF3 supports references for all its complex types, including vectors, dictionaries, and registered externalizable classes.
-
-`Amf0Document::embed_amf3` imports a single-root AMF3 document and relocates its IDs.
-`get_amf3` resolves embedded IDs. Each encoded AVM+ value starts a fresh AMF3 reference context.
-
-`to_tree(TreeLimits)` explicitly expands shared values. It rejects cycles and validates node, byte, and depth budgets before expansion.
-The byte budget estimates owned value storage, not allocator overhead or exact resident memory.
-The existing `deserialize` functions use these bounded tree conversions.
-An unbound reference cannot be serialized without its document.
-Value-level encoding conversions do not import an arena. Convert to a bounded tree before those conversions.
-
-AMF strings and typed values still allocate. This work removes deep copies from object-reference storage, not all AMF allocations.
-`serialize_into` reuses output capacity and restores output length on error.
-`as_str` and `as_object` borrow values for inspection.
+Graph documents eliminate deep copies from shared object references, though AMF strings and typed values still allocate. Use `serialize_into` to reuse an output buffer (restoring its length on error), and `as_str` / `as_object` for borrowed inspection.

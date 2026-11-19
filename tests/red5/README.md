@@ -1,126 +1,91 @@
-# Red5 live-interop harness (`rtmpx`)
+# Red5 live interoperability suite
 
-Optional end-to-end suite of `rtmpx` against a real Red5 server: our client
-against an independent server implementation. For the other direction (our
-server against an independent encoder and player), see `tests/ffmpeg/README.md`.
+An opt-in end-to-end test suite exercising `rtmpx`'s `ClientSession` against a real Red5 server.
+For the reverse direction (`ServerSession` against real encoders and players), see [`tests/ffmpeg/main.rs`](../ffmpeg/main.rs) and [`tests/gstreamer/main.rs`](../gstreamer/main.rs).
 
-## Why Red5
+## Why test against Red5
 
-Unit tests prove self-consistency; they cannot catch a framing rule both sides
-of the same codebase get wrong together. Red5 is an independent Java RTMP
-server (AMF0 + AMF3, plaintext handshake, `live` app relays publisher bytes
-opaquely). This suite covers our **client** against that independent
-**server**; the companion `tests/ffmpeg` suite covers our **server** against
-an independent encoder and player.
+Unit and loopback tests prove self-consistency, but cannot catch a framing bug that both our client and server share. Red5 is an independent Java RTMP server supporting AMF0 and AMF3 over plaintext RTMP whose `live` app relays publisher bytes opaquely—making it a clean independent peer for client framing, `objectEncoding` negotiation, and multi-stream lifecycle behavior.
 
-AMF3 covers the command/data plane only; media packets are unaffected. So the
-AMF3 legs validate exactly the layer the `objectEncoding` work changed.
+## Opt-in gating
 
-## Gating: not run by default
+The `red5` target is gated behind `required-features = ["red5-live"]` in `Cargo.toml`, so plain `cargo test` neither compiles it nor touches the network:
 
-The `red5` integration target is excluded from default runs via Cargo
-`required-features` (no environment-variable gate, no `#[ignore]`):
-
-```toml
-[[test]]
-name = "red5"
-path = "tests/red5/main.rs"
-required-features = ["red5-live"]
-```
-
-- `cargo test` runs only the default suite: the `red5` target is not even
-  built, no network touched.
-- `cargo test --test red5 --features red5-live` builds and runs
-  the live suite. It expects Red5 on `RED5_HOST:RED5_PORT` (see below) and
-  fails with a start hint otherwise.
-
-CI runs the second command against a containerised Red5 (see Workflows).
+- `cargo test` runs only the offline default suite.
+- `cargo test --test red5 --features red5-live` compiles and runs the live Red5 tests against `RED5_HOST:RED5_PORT`.
 
 ## Layout
 
 ```text
 rtmpx/
-  tests/red5/
-    README.md                 # this file
-    red5.dockerfile           # pinned Red5 image (release tarball, no official image)
-    docker-compose.yml        # local + CI entrypoint: `docker compose -f tests/red5/docker-compose.yml up -d --build`
-  examples/obs_ingest_probe.rs # manual OBS probe (not CI): real OBS -> ServerSession logger
-  tests/amf3_loopback.rs      # default suite: our AMF3 client -> our ServerSession
-  tests/enhanced_loopback.rs  # default suite: Enhanced hvc1/av01 relay byte-exact
-  tests/obs_ingest.rs         # default suite: OBS connect/releaseStream/FCPublish sequence
-  tests/red5/
-  tests/common/               # shared by the live suites (not a test target)
-    mod.rs                    # Result, stream_key, run backstop, legacy_metadata
-    driver.rs                 # async TCP + handshake + ClientSession driver
-  tests/ffmpeg/               # ffmpeg interop suite (see its README)
-  tests/red5/
-    main.rs                   # live matrix
-    lifecycle.rs              # publish/delete/play/delete/publish on one connection
-    harness.rs                # Red5 endpoint (RED5_* env) + objectEncoding reader
-    fixtures.rs               # legacy AVC/AAC, Enhanced hvc1/av01, AMF3 probe body
-  .github/workflows/ci.yml  # CI: default + live Red5 + live ffmpeg jobs
+  tests/
+    amf3_loopback.rs          # default: AMF3 ClientSession -> ServerSession
+    enhanced_loopback.rs      # default: Enhanced hvc1/av01 byte-exact relay
+    obs_ingest.rs             # default: OBS connect/releaseStream/FCPublish sequence
+    session_quirks.rs         # default: timestamp rollover, string deleteStream, error shapes
+    common/                   # shared async TCP + handshake + ClientSession driver
+      mod.rs
+      driver.rs
+    ffmpeg/                   # opt-in FFmpeg/ffprobe server interop (`--features ffmpeg-live`)
+    gstreamer/                # opt-in GStreamer server interop (`--features gstreamer-live`)
+    red5/
+      README.md               # this file
+      red5.dockerfile         # pinned Red5 2.0.40 image (built from release tarball)
+      docker-compose.yml      # local and CI entrypoint
+      main.rs                 # live test matrix
+      lifecycle.rs            # publish -> delete -> play -> delete -> publish on one connection
+      harness.rs              # Red5 endpoint config (RED5_*) and objectEncoding checks
+      fixtures.rs             # legacy AVC/AAC, Enhanced hvc1/av01, AMF3 probe payloads
+  examples/
+    obs_ingest_probe.rs       # manual loopback OBS logger (not run in CI)
+  .github/workflows/ci.yml    # CI: default, red5, ffmpeg, and gstreamer jobs
 ```
 
-## Matrix
+## Test matrix
 
-`P` = publish leg (client publishes, Red5 accepts). `R` = round-trip leg
-(second client plays while the first publishes; asserts byte-exact relay).
-Red5's `live` app only relays media published **after** the player
-subscribed, so every `R` test subscribes the player first.
+`P` = publish leg (client publishes, Red5 accepts). `R` = round-trip leg (a second client subscribes first, then the first publishes, asserting byte-exact relay—Red5's `live` app only relays media sent after the player subscribes).
 
-| Row | Direction | AMF | Media | Test | Asserts |
+| Row | Direction | AMF | Media | Test | What it checks |
 | --- | --- | --- | --- | --- | --- |
-| 1 | P | AMF0 | legacy AVC/AAC | `publish_amf0_legacy` | connect negotiates AMF0, `_result` carries `objectEncoding 0`, publish accepted, metadata + seq headers + 3 A/V frames flow |
-| 2 | R | AMF0 | legacy AVC/AAC | `play_amf0_legacy_roundtrip` | 4 video + 4 audio relay byte-exact, metadata observed |
-| 3 | P | AMF3 | legacy AVC/AAC | `publish_amf3_legacy` | connect negotiates AMF3, `_result` carries `objectEncoding 3`, publish accepted |
-| 4 | R | AMF3 | legacy AVC/AAC | `play_amf3_legacy_roundtrip` | same byte-exact relay as row 2, over an AMF3 command plane |
-| 5 | P | AMF0 | Enhanced hvc1 | `enhanced_hvc1_publish_characterization` | **characterization**: publish accepted, legacy media still flows afterwards; logs whether Red5 relayed the Enhanced bytes |
-| 6 | (covered) | AMF0 | Enhanced av01 | (folded into row 5 shape) | same characterization shape; current suite pins hvc1 on AMF0 and av01 on AMF3 |
-| 7 | P | AMF3 | Enhanced av01 | `enhanced_av1_publish_characterization` | **characterization**: same as row 5 over AMF3 |
-| 8 | (covered) | AMF3 | Enhanced hvc1 | (folded into row 7 shape) | same characterization shape |
-| 9 | P | AMF0 + AMF3 | caps advertisement | `connect_forwards_enhanced_capabilities_amf0/_amf3` | connect carrying full E-RTMP advertisement (`fourCcList`, `capsEx`, `videoFourCcInfoMap`, `audioFourCcInfoMap`, `videoFunction`) is accepted and publish proceeds |
-| 10 | R | AMF3 | type-15 script data | `amf3_script_data_survives_red5` | `@setDataFrame`/`onMetaData` body with `rtmpxRed5Probe` marker relayed to player; connection stays usable afterwards |
+| 1 | P | AMF0 | Legacy AVC/AAC | `publish_amf0_legacy` | AMF0 negotiation (`objectEncoding 0`), publish accepted, metadata + sequence headers + 3 A/V frames sent |
+| 2 | R | AMF0 | Legacy AVC/AAC | `play_amf0_legacy_roundtrip` | 4 video + 4 audio frames relayed byte-exact, metadata received |
+| 3 | P | AMF3 | Legacy AVC/AAC | `publish_amf3_legacy` | AMF3 negotiation (`objectEncoding 3`), publish accepted |
+| 4 | R | AMF3 | Legacy AVC/AAC | `play_amf3_legacy_roundtrip` | Same byte-exact relay as row 2 over an AMF3 command plane |
+| 5 | P | AMF0 | Enhanced `hvc1` | `enhanced_hvc1_publish_characterization` | Characterization: publish accepted and legacy media still flows afterward; logs Red5 relay behavior |
+| 6 | P | AMF3 | Enhanced `av01` | `enhanced_av1_publish_characterization` | Characterization: same check for `av01` over AMF3 |
+| 7 | P | AMF0 + AMF3 | Capabilities | `connect_forwards_enhanced_capabilities_amf0/_amf3` | Full Enhanced RTMP connect advertisement (`fourCcList`, `capsEx`, `videoFourCcInfoMap`, `audioFourCcInfoMap`, `videoFunction`) accepted |
+| 8 | R | AMF3 | Type-15 script data | `amf3_script_data_survives_red5` | `@setDataFrame`/`onMetaData` with `rtmpxRed5Probe` marker relayed; connection remains healthy |
 
-The `one_connection_stream_lifecycle_amf0` and `one_connection_stream_lifecycle_amf3` tests exercise three phases on one connection:
+In addition, `one_connection_stream_lifecycle_amf0` and `one_connection_stream_lifecycle_amf3` exercise three sequential phases over one TCP connection (each sending sequence headers and six A/V frame pairs paced at 40 ms):
 
-1. Publish, with a second client verifying the relayed bytes
-2. Delete that stream and play a new stream from the second client
-3. Delete playback and publish again, with the second client verifying delivery
+1. Publish while a second client verifies relayed bytes.
+2. Delete the publish stream and play a new stream from the second client.
+3. Delete playback and publish again while the second client verifies delivery.
 
-Each phase sends sequence headers and six audio/video frame pairs, paced at 40 ms intervals.
-The tests assert exact media bytes, event handles, one connect acceptance, and an unchanged TCP endpoint.
-They use the public pull API and vectored packet writes directly. No historical session adapter is involved.
-Red5 2.0.40 reuses deleted wire IDs during this sequence. Distinct local handles prevent stale application operations.
+Red5 2.0.40 reuses deleted wire stream IDs across these phases, proving that distinct local `StreamHandle`s prevent stale operations from colliding.
 
-Rows 5-8 are characterization, not assertion: Red5 has no Enhanced media
-path, so there is no correct relay behaviour to pin. They prove the
-connection survives Enhanced bytes and record what Red5 did, so a future
-Red5 with Enhanced support (or a switch to another server) turns them into
-real assertions without rewiring.
+Rows 5–6 are characterization checks rather than strict relay assertions because Red5 has no Enhanced media path yet: they verify the connection survives Enhanced bytes and record what Red5 does.
 
-## Default-suite companions (default `cargo test`, no network/binaries)
+## Default offline companions
 
-The live suite above is `required-features = ["red5-live"]` and never builds by default. These files run on every `cargo test` and pin the same contracts without third parties:
+These tests run on every `cargo test` and cover contracts that third-party live peers cannot exercise on their own:
 
-| File | What it proves | Why it exists alongside Red5/ffmpeg |
+| File | What it proves | Why it complements live suites |
 | --- | --- | --- |
-| `tests/amf3_loopback.rs` | our AMF3 client publishes into our `ServerSession`: server mirrors framing, so AMF3 `connect` is answered as AMF0 `_result` with `objectEncoding 3`, no early type-15/17 | No third-party encoder publishes AMF3 (ffmpeg/OBS are AMF0-only, Red5 never publishes *to* us), so this is the only AMF3-ingest coverage |
-| `tests/enhanced_loopback.rs` | `hvc1` (AMF0) + `av01` (AMF3) publish and two-session relay byte-exact, legacy untouched | Red5 has no Enhanced media path (rows 5-8 are characterization); ffmpeg Enhanced ingest proves decode, but only this proves the relay contract |
-| `tests/obs_ingest.rs` | OBS `connect -> releaseStream -> FCPublish -> createStream -> publish -> onMetaData -> A/V -> FCUnpublish -> deleteStream` ingests; quirks surface as `UnhandledCommand`, ingest unaffected | ffmpeg proves spec compliance; OBS proves quirk tolerance. AMF0-only, so no AMF3 signal |
-| `tests/session_quirks.rs` | extended timestamps survive ingest + relay past 0xFFFFFF; GStreamer string `deleteStream` finishes the publish (garbage ignored); connect refusals are `_error` while publish/play refusals are `onStatus` errors, framed per-exchange (AMF0 mirror and genuine type 17) | no live leg runs 4.6h to cross the timestamp boundary, sends string stream ids, or asserts refusal shapes; also caught a real bug where a refused connect omitted the protocol preamble and was undecodable |
+| `tests/amf3_loopback.rs` | AMF3 client publishing to `ServerSession` mirrors framing (`objectEncoding 3` without premature type-15/17) | FFmpeg and OBS are AMF0-only, and Red5 does not publish *to* us |
+| `tests/enhanced_loopback.rs` | Byte-exact two-session relay of `hvc1` (AMF0) and `av01` (AMF3) alongside legacy media | Red5 lacks an Enhanced relay path |
+| `tests/obs_ingest.rs` | OBS `connect -> releaseStream -> FCPublish -> createStream -> publish -> onMetaData -> A/V -> FCUnpublish -> deleteStream` | Verifies OBS-specific command quirks surface cleanly as `UnhandledCommand` |
+| `tests/session_quirks.rs` | Extended timestamps past `0xFFFFFF`, GStreamer string `deleteStream`, and command-specific `_error` / `onStatus` refusal shapes | Avoids 4.6-hour live runs and tests edge-case error framing directly |
 
-## Manual OBS probe (not CI)
+## Manual OBS probe
 
-`examples/obs_ingest_probe.rs` binds a loopback `ServerSession` on `127.0.0.1:19350` and logs what a real OBS build sends (connect props, `releaseStream`/`FCPublish` quirks, metadata shape, A/V flow):
+[`examples/obs_ingest_probe.rs`](../../examples/obs_ingest_probe.rs) listens on `127.0.0.1:19350` and logs everything a real OBS Studio build sends:
 
 ```sh
 cargo run --example obs_ingest_probe
-# OBS -> Settings -> Stream -> Service: Custom
-#   Server: rtmp://127.0.0.1:19350/live
-#   Stream Key: obs-probe
 ```
 
-Use it to eyeball a new OBS version by hand (flashVer, metadata fields, chunking, reconnects). The default-suite `tests/obs_ingest.rs` pins the same sequence in CI; this probe is for what no fake can reproduce. OBS is AMF0-only and heavy (GUI, Xvfb, version pinning), so it stays manual, not per-PR.
+Point OBS (**Settings → Stream → Custom**) at server `rtmp://127.0.0.1:19350/live` with any stream key (for example `obs-probe`) to inspect `flashVer`, metadata, chunking, and reconnect behavior on new OBS releases.
 
 ## Configuration
 
@@ -128,32 +93,25 @@ Use it to eyeball a new OBS version by hand (flashVer, metadata fields, chunking
 | --- | --- | --- |
 | `RED5_HOST` | `127.0.0.1` | Red5 host |
 | `RED5_PORT` | `1935` | Red5 RTMP port |
-| `RED5_APP` | `live` | Red5 app (compose + workflow use stock `live`) |
-| `RED5_TIMEOUT_SECS` | `30` | per-operation timeout; whole-file backstop is 180 s per test |
+| `RED5_APP` | `live` | Red5 application name (stock `live` needs no config) |
+| `RED5_TIMEOUT_SECS` | `30` | Per-operation timeout (whole-test backstop is 180 s) |
 
-Stream keys are unique per test (`rtmpx-<tag>-<pid>-<n>`) so the tests can
-run in parallel against one shared Red5.
+Each test generates a unique stream key (`rtmpx-<tag>-<pid>-<n>`) so tests can run in parallel against one Red5 instance.
 
 ## Running locally
 
 ```sh
 docker compose -f tests/red5/docker-compose.yml up -d --build
-# wait for 1935 (macOS: nc -z 127.0.0.1 1935 in a loop)
+# Wait for port 1935 (e.g. `until nc -z 127.0.0.1 1935; do sleep 1; done`)
 cargo test --test red5 --features red5-live
 docker compose -f tests/red5/docker-compose.yml down
 ```
 
-Red5's stock `live` app needs no config for this suite.
+## CI workflows
 
-## Workflows
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs four jobs on PRs, pushes to `main`, manual dispatch, and a weekly schedule:
 
-`.github/workflows/ci.yml` holds three jobs:
-
-- `default` runs `cargo test --locked` - no Red5, no network.
-- `red5` starts the pinned Red5 container, waits for port 1935, runs
-  `cargo test --test red5 --features red5-live`, then dumps Red5 logs.
-- `ffmpeg` installs ffmpeg (the Ubuntu `ffmpeg` package also provides
-  `ffprobe`) and runs `cargo test --test ffmpeg --features ffmpeg-live` -
-  no server container needed.
-
-The workflow runs on PRs, pushes to main, manual dispatch, and a weekly schedule.
+- `default`: `cargo test --locked` (offline, no external peers)
+- `red5`: starts the pinned containerized Red5 and runs `cargo test --test red5 --features red5-live --locked`
+- `ffmpeg`: installs `ffmpeg`/`ffprobe` and runs `cargo test --test ffmpeg --features ffmpeg-live --locked`
+- `gstreamer`: installs GStreamer plugins and runs `cargo test --test gstreamer --features gstreamer-live --locked`

@@ -10,141 +10,110 @@
 
 </div>
 
-RTMPX provides client and server sessions, chunk framing, handshakes, AMF codecs, and typed media inspection.
-Applications own sockets, TLS, scheduling, backpressure, and media delivery policy.
-The library works with any runtime and can also run entirely in memory.
+RTMPX is a sans-I/O Rust library for RTMP and Enhanced RTMP. It provides client and server sessions, chunk framing, handshakes, AMF0/AMF3 codecs, and typed media inspection—while leaving sockets, TLS, scheduling, backpressure, and media delivery policy to your application. It works with any async or sync runtime, or entirely in memory.
 
-RTMPX is in production use today, for both publisher ingest and player delivery.
-It covers AMF0 and AMF3 script data, the Enhanced RTMP multitrack and multichannel audio extensions, and segmented payloads that relay media without copying or re-encoding bytes.
-Descriptor pools and preallocated transport storage absorb the upfront cost during warm-up; after that, media paths can run with zero allocations.
+RTMPX is used in production for both publisher ingest and player delivery. It handles AMF0 and AMF3 script data, Enhanced RTMP multitrack and multichannel audio, and segmented payloads that relay media without copying or re-encoding bytes. Once descriptor pools and transport buffers are warmed up, hot media paths can run with zero allocations.
 
-## What the API provides
+## What it provides
 
-- **Pull-based sessions:** `receive(&mut Bytes)` returns one owned packet, event, or unhandled message.
-- **Independent streams:** One connection can carry several publishing and playback operations, each identified by a local `StreamHandle`.
-- **Segmented input:** Messages retain receive-buffer slices, including messages split across reads or interleaved chunk streams.
-- **Resumable output:** `Packet` owns payload storage and write progress, and exposes chunk headers and payload slices for vectored writes.
-- **Borrowed inspection:** Media headers can cross segment boundaries without forcing a contiguous message copy.
-- **Bounded reuse:** Descriptor pools reduce repeated allocations; decoder and session limits bound protocol state.
-- **AMF graphs:** AMF0 and AMF3 document APIs preserve shared objects and cycles through document-local references.
-- **Lossless forwarding:** Encoded media and script-data bodies remain authoritative. Inspecting them does not require rewriting them.
+- **Pull-based sessions:** `receive(&mut Bytes)` yields one owned packet, event, or unhandled message at a time, so you can apply backpressure or move outputs across async tasks freely.
+- **Independent streams:** One RTMP connection can run multiple publish and play operations concurrently, each tracked by a local `StreamHandle`.
+- **Segmented input:** Received messages keep slices of your receive buffers—even across short reads or interleaved chunk streams—without forcing a copy.
+- **Resumable output:** `Packet` owns its payload and write cursor, exposing chunk headers and payload slices for vectored (`write_vectored`) I/O across partial writes.
+- **Borrowed media inspection:** Legacy and Enhanced FLV headers can be parsed directly across segment boundaries without coalescing the message.
+- **Bounded reuse and limits:** `PayloadPool` recycles fragment descriptor vectors across threads, while `DecoderLimits` and `SessionLimits` cap protocol state.
+- **AMF0 and AMF3 graphs:** Document APIs preserve shared object identity and cycles through document-local references without reference-counting leaks.
+- **Lossless forwarding:** Raw media and script-data payloads stay authoritative—inspecting them never requires re-encoding them.
 
 ## Connections, streams, and ownership
 
-A session represents one side of one RTMP connection after its handshake.
-Connection state covers negotiation, acknowledgements, ping, and framing.
-Publishing and playback have separate stream state.
+A session manages one side of an RTMP connection after the handshake: negotiation, acknowledgements, ping, and chunk framing live on the connection, while each publishing or playback stream has its own independent lifecycle.
 
-Client `play` and `publish` operations return handles before the server assigns wire stream IDs.
-Events carry those handles through acceptance, rejection, media delivery, and completion.
-Deleting a stream invalidates its handle immediately, including when creation is still pending.
-A client can then start another operation without reconnecting.
+On the client side, `play` and `publish` return a `StreamHandle` immediately—before the server assigns a wire stream ID—and carry that handle through acceptance, rejection, media, and completion. Calling `delete_stream` invalidates the handle at once (even while creation is still in flight), letting you start a new stream on the same connection without reconnecting.
 
-Server request events provide server-local handles.
-Applications accept or reject requests and send media on playback streams.
-`complete_playback` reports completion while other streams continue.
-Local handles, RTMP message stream IDs, and chunk stream IDs are distinct concepts.
+On the server side, incoming requests carry server-local handles. Your application accepts or rejects requests, sends media on playback streams, and calls `complete_playback` to finish one stream while others keep running. Local handles, RTMP message stream IDs, and chunk stream IDs remain distinct concepts.
 
-Control operations queue outputs for `receive`. Media sends return packets directly.
-Applications drain pending outputs and preserve packet order.
-A packet retains progress across short writes and can move into a task or bounded queue.
+Control actions queue outbound packets for `receive()`, while media sends return a `Packet` directly. Drain pending outputs before sending media and preserve packet order across your own queues; each `Packet` tracks partial-write progress and can move safely into a task or bounded queue.
 
 ## Allocation and copy boundaries
 
-The media path can avoid payload copies between owned socket input and outbound packet writes.
-The first payload segment is inline; additional segments use a descriptor vector.
-A bounded `PayloadPool` recycles that vector after payload release, including across threads.
+The media path avoids copying payload bytes between owned socket input and outbound packet writes. A `Payload` stores its first segment inline and keeps any additional segments in a descriptor vector that a bounded `PayloadPool` recycles when the payload drops, including across threads.
 
-The allocation contract has explicit boundaries:
+What allocates and what does not:
 
-- Warmed media paths use pooled descriptors and preallocated transport storage.
-- Borrowed single-track validation does not allocate for valid media.
-- Multitrack validation, AMF values, control messages, and errors can allocate.
-- Socket buffers, TLS, and application queues have their own allocation costs.
-- Cloning fragmented payloads can allocate descriptors and retain source buffers.
-- Explicit conversion to contiguous bytes copies fragmented payloads.
+- **Zero-allocation after warmup:** Warmed media relay and playback paths with pooled descriptors and preallocated transport buffers, plus borrowed single-track media validation for valid input.
+- **Can allocate:** Multitrack validation, AMF values, control commands, errors, cloning fragmented payloads, and explicitly coalescing a fragmented payload into contiguous bytes (`Payload::into_bytes()`).
+- **Application-owned:** Socket buffers, TLS framing, and your own queues.
 
-A forwarding proxy can retain segmented payloads from publisher to upstream.
-An HLS ingest pipeline can coalesce payloads at its contiguous codec-input boundary.
-Elementary-unit visitors remove FLV framing without a temporary result vector.
-RTMPX does not decode codecs, package HLS, cache playback media, or implement reconnect policy.
+A forwarding relay can pass segmented payloads straight from publisher to upstream. An ingest pipeline (such as an HLS packager) can coalesce payloads once at its codec boundary and extract samples with `visit_elementary_units` without allocating a temporary vector. RTMPX does not decode codecs, package HLS, cache playback sequences, or manage reconnect policy.
 
-See the [allocation contract](docs/zero-copy.md#allocation-contract) for measured paths and exclusions.
+See the [API and ownership guide](docs/zero-copy.md#allocation-contract) for the exact measured paths.
 
-## Choose a layer
+## Choosing a layer
 
-| Application need | API |
-|---|---|
-| Handle connections and stream requests | `ClientSession`, `ServerSession` |
-| Assemble owned receive buffers | `MessageDecoder` |
-| Process borrowed chunk fragments immediately | `ChunkParser` |
-| Assemble contiguous messages from borrowed input | `ContiguousDecoder` |
-| Frame owned or borrowed messages | `ChunkEncoder`, `Packet` |
-| Inspect media without rewriting its body | `ValidatedMedia`, `PayloadView` |
-| Inspect encoded script data explicitly | `DataMessage`, `ValidatedMetadata` |
-| Extract contiguous codec samples and configuration | `ElementaryUnit`, `visit_elementary_units` (AVC, HEVC, AV1, VP8, VP9, VVC, AAC, Opus, FLAC, AC-3, E-AC-3, MP3) |
-| Observe sequence ends and skipped controls | `ElementaryEvent`, `visit_elementary_events` |
-| Preserve AMF object identity and cycles | `Amf0Document`, `Amf3Document` |
+| Need | API |
+| --- | --- |
+| Full connections and stream lifecycles | `ClientSession`, `ServerSession` |
+| Owned segmented message assembly | `MessageDecoder` |
+| Immediate borrowed chunk fragments | `ChunkParser` |
+| Contiguous message assembly from slices | `ContiguousDecoder` |
+| Framing owned or borrowed messages | `ChunkEncoder`, `Packet` |
+| Inspecting media without rewriting bytes | `ValidatedMedia`, `PayloadView` |
+| Inspecting script data and metadata | `DataMessage`, `ValidatedMetadata` |
+| Extracting codec samples and configuration | `ElementaryUnit`, `visit_elementary_units` (AVC, HEVC, AV1, VP8, VP9, VVC, AAC, Opus, FLAC, AC-3, E-AC-3, MP3) |
+| Observing sequence ends and skipped messages | `ElementaryEvent`, `visit_elementary_events` |
+| Preserving AMF object identity and cycles | `Amf0Document`, `Amf3Document` |
 
-Sessions apply chunk-size changes, aborts, and flow-control messages automatically.
-Low-level decoder users apply those protocol messages before decoding subsequent input.
-Transport deadlines and bounds on queued or retained application data remain caller responsibilities.
+Sessions handle chunk-size updates, aborts, and flow control automatically. If you use the low-level decoders directly, apply decoded `SetChunkSize` and `Abort` messages before feeding subsequent bytes. Transport timeouts and queue bounds always stay under your application's control.
+
+## Enhanced RTMP and elementary media
+
+The [Enhanced RTMP compliance matrix](docs/enhanced-rtmp.md) tracks coverage against VSO Enhanced RTMP v2 r2 (`v2-2026-01-31-r2`).
+The parser covers legacy FLV, Enhanced packet families, FourCCs, multitrack, multichannel audio, and ModEx. Strict mode rejects malformed or unknown structures; passthrough mode preserves opaque payloads for lossless forwarding. Codec admission and decoding remain up to your application.
+
+For ingest pipelines extracting codec bitstreams:
+
+- `elementary_units` and `visit_elementary_units` emit codec configurations and coded samples.
+- `elementary_events` and `visit_elementary_events` also emit sequence ends and skipped messages in wire track order (distinguishing unsupported codecs, unknown packet types, metadata, video commands, channel configs, and MPEG-TS configs). Malformed or opaque input still returns an error.
+- Extracted payloads borrow slices of the input bytes. RTMPX validates container framing, not codec decodability: a payload can contain multiple codec frames, and video keyframe flags reflect publisher signaling rather than a proven decoder restart point.
+- VVC, AVC, and HEVC preserve signed composition offsets; other supported Enhanced video codecs use zero offsets. Legacy MP3 handles both standard MP3 and the 8 kHz format ID.
 
 ## Changes from RML
 
-RTMPX derives from `rml_rtmp` 0.8.0, upstream commit `953fc41d` dated 2023-05-31.
-Its AMF0 codec derives from `rml_amf0` 0.3.0.
-The MIT license retains that provenance.
+RTMPX is derived from `rml_rtmp` 0.8.0 (commit `953fc41d`, 2023-05-31) and `rml_amf0` 0.3.0 under the MIT license. Beyond protocol fixes and Enhanced RTMP support, it redesigns the core around explicit ownership and bounded state:
 
-The changes extend beyond protocol fixes and Enhanced RTMP support:
-
-| Area | RTMPX changes |
-|---|---|
-| Public API | Owned pull outputs replace input-result batches; storage and write progress are explicit |
+| Area | What changed |
+| --- | --- |
+| Public API | Pull-based owned outputs replace input-result batches; payload storage and write progress are explicit |
 | Stream lifecycle | Concurrent client operations, symmetric server handles, cancellation, deletion, completion, and stale-handle rejection |
 | Chunk input | Streaming parsing, segmented assembly, per-chunk-stream partial state, and explicit contiguous adapters |
-| Chunk output | Inline headers, payload-preserving packet cursors, short-write progress, and explicit drop policy |
-| Resource control | Limits for decoding, fragments, streams, and pending requests; bounded descriptor caches |
+| Chunk output | Inline headers, payload-preserving packet cursors, partial-write progress, and explicit drop policy |
+| Resource limits | Limits for decoding, fragments, streams, and pending requests, plus bounded descriptor pools |
 | AMF | AMF3 support, graph documents, identity-based references, cycles, and bounded graph-to-tree expansion |
-| Media inspection | In-house legacy and Enhanced FLV parsing, borrowed segmented views, and elementary-unit visitors |
-| Script data | Encoded bodies retained; metadata inspection is explicit rather than an automatic event conversion |
-| Interoperability | Configurable connect properties, capability forwarding, complete status properties, and independent-peer tests |
+| Media inspection | In-house legacy and Enhanced FLV parser, borrowed segmented views, and elementary-unit visitors |
+| Script data | Raw encoded bodies stay authoritative; metadata inspection is explicit instead of automatic event conversion |
+| Interoperability | Configurable connect properties, capability forwarding, complete status maps, and live third-party interop suites |
 
-Protocol fixes include cumulative acknowledgements, acknowledgement-window fallback, timestamp rollover, and safe interleaved message assembly.
-Abort messages release partial state, and malformed lengths return errors.
-Request rejection uses command-specific response shapes.
-Interop handling covers explicit playback start values, decimal-string deletion IDs, and case-insensitive publish modes.
-
-AMF tree codecs use depth and collection limits, exact reads, and bounded reference expansion.
-Graph codecs preserve identity without deep-copying referenced objects.
-Value-level AMF0/AMF3 conversions do not import graph arenas or guarantee identical wire representations.
-
-## Enhanced RTMP
-
-The [compliance matrix](docs/enhanced-rtmp.md) documents support against VSO Enhanced RTMP v2 r2, revision `v2-2026-01-31-r2`.
-The parser covers legacy media, Enhanced packet families, FourCCs, multitrack, multichannel audio, and ModEx.
-Strict validation rejects unsupported or malformed structures; passthrough retains opaque payloads for forwarding.
-Codec admission and decoding remain application concerns.
+Protocol hardening includes cumulative acknowledgements, acknowledgement-window fallback, timestamp rollover handling, abort cleanup of partial messages, strict length checks, command-specific rejection shapes, explicit playback start values, decimal-string deletion IDs, and case-insensitive publish modes.
 
 ## Examples
 
-- [Publisher](examples/publish.rs): Connect, publish, and send metadata and placeholder media.
-- [Listener](examples/serve.rs): Handshake, accept requests, and inspect media through borrowed views.
-- [Ownership example](examples/zero_copy.rs): Segmented parsing, packet traversal, descriptor pooling, and AMF graphs.
-- [Transport helpers](examples/support/io.rs): Asynchronous vectored writes with partial-write handling.
-- [OBS probe](examples/obs_ingest_probe.rs): Inspect a real OBS connection and its messages.
+- [`examples/publish.rs`](examples/publish.rs): Connect, publish, and send metadata and placeholder media.
+- [`examples/serve.rs`](examples/serve.rs): Handshake, accept requests, and inspect media through borrowed views.
+- [`examples/zero_copy.rs`](examples/zero_copy.rs): Segmented parsing, packet traversal, descriptor pooling, and AMF graphs.
+- [`examples/support/io.rs`](examples/support/io.rs): Async vectored writes with partial-write handling.
+- [`examples/obs_ingest_probe.rs`](examples/obs_ingest_probe.rs): Inspect a live OBS Studio connection and its messages.
 
-Run the listener, then the publisher:
+Run the listener in one terminal and the publisher in another:
 
 ```sh
 cargo run --example serve
 cargo run --example publish -- 127.0.0.1:1935 live demo
 ```
 
-## Validation
+## Testing
 
-The default tests cover framing, handshakes, AMF trees and graphs, session lifecycles, resource limits, and ownership behavior.
-Allocation tests measure warmed media paths separately from transport and control-plane work.
+The default test suite runs with no network or external binaries and covers framing, handshakes, AMF trees and graphs, session lifecycles, limits, and allocation bounds:
 
 ```sh
 cargo test
@@ -152,18 +121,16 @@ cargo test --release --test allocations
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Optional interoperability suites use independent implementations:
+Opt-in interoperability suites test against independent implementations:
 
-- [Red5](tests/red5/README.md): AMF0/AMF3 publish and playback, including publish/delete/play/delete/publish on one connection.
-- FFmpeg: Legacy AVC/AAC and Enhanced HEVC ingest, plus relay playback verified with ffprobe.
-- GStreamer: Connect properties, chunking, repeated metadata, and publication teardown.
-- OBS: Automated connect-sequence coverage and a manual live probe.
-
-These checks validate specific paths. They do not establish that all application workloads allocate nothing.
+- **[Red5](tests/red5/README.md)** (`--test red5 --features red5-live`): AMF0/AMF3 publish and playback, including publish → delete → play → delete → publish on a single connection.
+- **FFmpeg** (`--test ffmpeg --features ffmpeg-live`): Legacy AVC/AAC and Enhanced HEVC ingest plus relay playback verified with `ffprobe`.
+- **GStreamer** (`--test gstreamer --features gstreamer-live`): Connect properties, chunking, repeated metadata, and teardown.
+- **OBS**: Automated connect-sequence tests plus a manual live probe (`examples/obs_ingest_probe.rs`).
 
 ## License
 
-MIT. See [LICENSE](LICENSE), including the upstream RML copyright.
+MIT. See [LICENSE](LICENSE), which retains the upstream RML copyright.
 
 <!-- Links -->
 [github-shield]: https://img.shields.io/github/actions/workflow/status/darfink/rtmpx/ci.yml?branch=main&label=actions&logo=github&style=for-the-badge
@@ -172,16 +139,3 @@ MIT. See [LICENSE](LICENSE), including the upstream RML copyright.
 [crate]: https://crates.io/crates/rtmpx
 [docs-shield]: https://img.shields.io/badge/docs-crates-green.svg?style=for-the-badge
 [docs]: https://docs.rs/rtmpx/
-
-### Elementary media events
-
-`elementary_units` and `visit_elementary_units` emit only configurations and samples.
-`elementary_events` and `visit_elementary_events` also report sequence ends and skipped messages in wire track order.
-Skipped events distinguish unsupported codecs, unknown packet types, metadata, video commands, channel configuration, and MPEG-TS configuration.
-Malformed or opaque input remains an error.
-
-Payloads retain slices of the input bytes. RTMPX validates transport structure, not codec decodability.
-A coded payload can contain multiple codec frames. Consumers must parse frame boundaries and decoded durations where necessary.
-Video keyframe flags describe publisher signaling; they do not prove a decoder restart point.
-VVC, AVC, and HEVC retain signed composition offsets. Other supported Enhanced video codecs use zero offsets.
-Legacy MP3 supports both standard MP3 and the 8 kHz format identifier.

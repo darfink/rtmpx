@@ -1,51 +1,52 @@
 //! Sans-I/O RTMP and Enhanced RTMP with explicit ownership and stream lifecycles.
 //!
 //! Applications own transports, TLS, deadlines, scheduling, and backpressure.
-//! RTMPX owns protocol state and can run with any runtime or entirely in memory.
-//! Version 3 replaces the version 2 public API.
+//! RTMPX owns protocol state and works with any runtime—or entirely in memory.
 //!
 //! # Architecture
 //!
-//! - [`sessions`] provides owned pull outputs and independent publishing/playback streams.
+//! - [`sessions`] provides pull-based client/server sessions and independent publish/play streams.
 //! - [`chunk_io`] provides streaming parsing, segmented assembly, and resumable packet encoding.
-//! - [`payload`] provides owned segments, borrowed ranges, and bounded descriptor reuse.
-//! - [`handshake`] handles the connection handshake independently of session state.
-//! - [`messages`] separates encoded message bodies from interpreted protocol messages.
+//! - [`payload`] provides owned segments, borrowed views, and bounded descriptor pooling.
+//! - [`handshake`] drives the RTMP handshake independently of session state.
+//! - [`messages`] separates raw encoded message bodies from interpreted protocol messages.
 //! - [`amf`] provides tree values and graph documents for AMF0 and AMF3.
 //! - [`media`], [`flv`], [`enhanced`], and [`metadata`] inspect legacy and Enhanced RTMP.
-//! - [`elementary`] extracts contiguous codec samples and configuration without packaging a container.
+//! - [`elementary`] extracts contiguous codec samples and configuration without container packaging.
 //! - [`time`] models RTMP timestamps and wrapping arithmetic.
 //!
 //! # Streams and allocation boundaries
 //!
-//! A connection can carry independent operations identified by local
-//! [`sessions::StreamHandle`] values. These differ from wire message stream IDs
-//! and chunk stream IDs. Client and server events identify the affected stream.
+//! One connection can carry multiple independent streams, each identified by a
+//! local [`sessions::StreamHandle`] (distinct from wire message stream IDs and
+//! chunk stream IDs). Client and server events identify the affected stream.
 //!
-//! Sessions retain owned receive-buffer slices. Media sends return [`Packet`]
-//! values with inline chunk headers and write progress. Borrowed validation
-//! can inspect segmented media without coalescing it.
-//! [`PayloadPool`] recycles descriptor storage after payload release.
+//! Sessions keep slices of owned receive buffers, and media sends return
+//! [`Packet`] values with inline chunk headers and write progress. Borrowed
+//! validation inspects segmented media without coalescing it, while
+//! [`PayloadPool`] recycles fragment descriptors after payload release.
 //!
-//! Warmed media paths can avoid allocations with pooled descriptors and
-//! preallocated transport storage. AMF, control messages, multitrack parsing,
-//! errors, and application transport buffers can still allocate.
-//! Explicit coalescing copies fragmented payloads at contiguous codec-input boundaries.
-//! See [`zero_copy_guide`] for measured contracts.
+//! Warmed media paths can run with zero allocations when using pooled
+//! descriptors and preallocated transport buffers. AMF values, control
+//! messages, multitrack parsing, errors, and application transport buffers can
+//! still allocate, and explicit coalescing copies fragmented payloads at
+//! contiguous codec-input boundaries. See [`zero_copy_guide`] for measured
+//! contracts.
 //!
 //! # Provenance
 //!
-//! RTMPX derives from RML RTMP and AMF0 under the MIT license.
-//! It replaces the original ownership and session interfaces and adds streaming
-//! chunks, independent stream lifecycles, AMF3 graphs, and Enhanced media inspection.
-//! Protocol hardening includes cumulative acknowledgements, timestamp rollover,
-//! interleaved partial messages, and resource limits.
+//! RTMPX derives from `rml_rtmp` and `rml_amf0` under the MIT license,
+//! redesigning ownership and session lifecycles while adding streaming chunks,
+//! independent stream handles, AMF3 graphs, Enhanced RTMP inspection, and
+//! protocol hardening (cumulative acknowledgements, timestamp rollover,
+//! interleaved partial messages, and resource limits).
 //!
 //! # Session input and output
 //!
-//! Create a session after the handshake. Control actions queue outputs; `receive`
-//! returns one packet or event at a time. The caller keeps unread input and can
-//! await backpressure between outputs. Media sends return a packet directly.
+//! Create a session after the handshake. Control actions queue outbound packets;
+//! `receive` yields one packet or event at a time, leaving unread input with
+//! the caller so you can apply backpressure between outputs. Media sends return
+//! a packet directly.
 //!
 //! ```
 //! use bytes::Bytes;

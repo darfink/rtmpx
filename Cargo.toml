@@ -26,8 +26,8 @@ bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
 
 [features]
-# Opt-in live interop suites, one per third party (see tests/red5/README.md
-# and tests/ffmpeg/README.md).
+# Opt-in live interop suites, one per external peer (see tests/red5/README.md,
+# tests/ffmpeg/main.rs, and tests/gstreamer/main.rs).
 # Each live integration target is excluded from default runs via
 # required-features, so plain cargo test runs only the default suite.
 #   cargo test --test red5 --features red5-live
