@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (4.0.0)
+## 4.0.0 — 2026-11-23
 
 Once `connect` is accepted, the server session now answers every command it does not implement when the command has a finite, nonzero transaction id, as RTMP 1.0 section 7.2 requires. Previously these commands got no answer, so a client that waited for one stalled. Commands the session implements keep their own contracts: `createStream` gets `_result`, `publish` and `play` get `onStatus`, and `deleteStream` and `closeStream` get no answer.
 
