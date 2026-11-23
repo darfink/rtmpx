@@ -116,6 +116,16 @@ impl ObsConfig {
                  FPSCommon=30\n\n[Audio]\nSampleRate=44100\nChannelSetup=Stereo\n"
             ),
         )?;
+        // A scene collection must exist: OBS handles `--startstreaming` at
+        // the end of loading one, and when there is no file it creates a
+        // default scene and returns before that point, so it never streams.
+        // One empty scene is enough; its black frames still encode.
+        write(
+            obs.join("basic/scenes").join(format!("{PROFILE}.json")),
+            format!(
+                r#"{{"name":"{PROFILE}","current_scene":"Scene","current_program_scene":"Scene","scene_order":[{{"name":"Scene"}}],"sources":[{{"id":"scene","versioned_id":"scene","name":"Scene","settings":{{"items":[],"id_counter":0,"custom_size":false}}}}],"groups":[],"transitions":[],"current_transition":"Fade","transition_duration":300}}"#
+            ),
+        )?;
         write(
             profile.join("service.json"),
             format!(
