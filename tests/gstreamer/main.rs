@@ -12,6 +12,11 @@
 //! down via `FCUnpublish` - the same tolerate-don't-choke paths OBS exercises.
 //! A green run proves our server accepts an independent encoder, not just
 //! ffmpeg's exact byte patterns.
+//!
+//! Two GStreamer sinks are covered, because they are separate RTMP
+//! implementations: `rtmpsink` wraps librtmp, the library OBS forked, and
+//! `rtmp2sink` is GStreamer's own. Each must publish without the session
+//! refusing a single command it sends.
 
 #[path = "../support/api.rs"]
 mod api;
@@ -43,6 +48,21 @@ pub struct IngestedMedia {
     pub audio: Vec<Vec<u8>>,
     pub video: Vec<Vec<u8>>,
     pub negotiated: AmfEncoding,
+    /// Commands the session answered for itself, in arrival order.
+    pub setup_commands: Vec<String>,
+    /// Commands the session refused with `_error`. An encoder that works must
+    /// never need one refused.
+    pub refused: Vec<String>,
+}
+
+pub fn gst_element_available(element: &str) -> bool {
+    Command::new("gst-inspect-1.0")
+        .arg(element)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 pub fn gst_available() -> bool {
@@ -107,8 +127,14 @@ async fn write_server_results(
                 ServerSessionEvent::VideoDataReceived { data, .. } => {
                     collected.video.push(data.to_vec());
                 }
+                ServerSessionEvent::UnhandledCommand { command_name, .. } => {
+                    // `releaseStream`/`FCPublish`, and `FCUnpublish` on clean EOS.
+                    collected.setup_commands.push(command_name);
+                }
+                ServerSessionEvent::CommandRefused { command_name, .. } => {
+                    collected.refused.push(command_name);
+                }
                 other => {
-                    // `FCUnpublish` on clean EOS lands here: tolerated, like OBS.
                     eprintln!("gstreamer harness: ignoring gstreamer event: {other:?}");
                 }
             },
@@ -173,9 +199,13 @@ async fn server_handshake(stream: &mut TcpStream, read_buf: &mut [u8]) -> Result
 }
 
 /// Bind a one-shot RTMP server on loopback, have `gst-launch-1.0` publish
-/// synthetic audio+video to it via `rtmpsink`, and return what our
-/// `ServerSession` observed.
-pub async fn ingest_from_gst(stream_key: &str, wall_clock: Duration) -> Result<IngestedMedia> {
+/// synthetic audio+video to it via `sink` (`rtmpsink` or `rtmp2sink`), and
+/// return what our `ServerSession` observed.
+pub async fn ingest_from_gst(
+    sink: &str,
+    stream_key: &str,
+    wall_clock: Duration,
+) -> Result<IngestedMedia> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| format!("loopback bind failed: {e}"))?;
@@ -203,7 +233,7 @@ pub async fn ingest_from_gst(stream_key: &str, wall_clock: Duration) -> Result<I
             "flvmux",
             "name=mux",
             "!",
-            "rtmpsink",
+            sink,
             &format!("location={url}"),
             "audiotestsrc",
             "num-buffers=80",
@@ -249,6 +279,8 @@ pub async fn ingest_from_gst(stream_key: &str, wall_clock: Duration) -> Result<I
             audio: Vec::new(),
             video: Vec::new(),
             negotiated: AmfEncoding::Amf0,
+            setup_commands: Vec::new(),
+            refused: Vec::new(),
         };
         if !carry.is_empty() {
             let results = session
@@ -301,15 +333,18 @@ pub async fn ingest_from_gst(stream_key: &str, wall_clock: Duration) -> Result<I
     }
 }
 
-async fn gstreamer_ingest_body() -> Result<()> {
-    if !gst_available() {
-        eprintln!(
-            "gstreamer harness: SKIP gstreamer_publishes_to_our_server (no gst-launch-1.0 on PATH)"
-        );
+async fn gstreamer_ingest_body(sink: &str) -> Result<()> {
+    if !gst_available() || !gst_element_available(sink) {
+        eprintln!("gstreamer harness: SKIP {sink} publish (no gst-launch-1.0 or no {sink})");
         return Ok(());
     }
     let key = stream_key("gstreamer");
-    let got = ingest_from_gst(&key, Duration::from_secs(60)).await?;
+    let got = ingest_from_gst(sink, &key, Duration::from_secs(60)).await?;
+    assert!(
+        got.refused.is_empty(),
+        "{sink} must not need any command refused, refused {:?}",
+        got.refused
+    );
     assert_eq!(got.app, "live", "gstreamer must land on the live app");
     assert_eq!(got.stream_key, key, "stream key must survive ingest");
     assert!(
@@ -354,16 +389,25 @@ async fn gstreamer_ingest_body() -> Result<()> {
         got.audio[0][0]
     );
     eprintln!(
-        "gstreamer harness: {} onMetaData / {} audio / {} video, encoders={:?}",
+        "gstreamer harness: {sink}: {} onMetaData / {} audio / {} video, encoders={:?}, setup commands={:?}",
         got.metadata_events,
         got.audio.len(),
         got.video.len(),
-        got.encoders.iter().take(2).collect::<Vec<_>>()
+        got.encoders.iter().take(2).collect::<Vec<_>>(),
+        got.setup_commands
     );
     Ok(())
 }
 
+/// `rtmpsink`: librtmp, the RTMP client OBS forked.
 #[tokio::test]
 async fn gstreamer_publishes_to_our_server() {
-    run(gstreamer_ingest_body()).await;
+    run(gstreamer_ingest_body("rtmpsink")).await;
+}
+
+/// `rtmp2sink`: GStreamer's own RTMP client, a third implementation beside
+/// FFmpeg's and librtmp.
+#[tokio::test]
+async fn gstreamer_rtmp2sink_publishes_to_our_server() {
+    run(gstreamer_ingest_body("rtmp2sink")).await;
 }
