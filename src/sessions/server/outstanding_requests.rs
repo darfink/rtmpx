@@ -2,6 +2,7 @@ use super::PublishMode;
 use crate::amf::AmfEncoding;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub enum OutstandingRequest {
     ConnectionRequest {
         app_name: Arc<str>,
@@ -19,6 +20,13 @@ pub enum OutstandingRequest {
 
     PlayRequested {
         stream_key: Arc<str>,
+        stream_id: u32,
+        encoding: AmfEncoding,
+    },
+
+    /// A delegated command, answered with `_result` or `_error`.
+    CommandRequested {
+        transaction_id: f64,
         stream_id: u32,
         encoding: AmfEncoding,
     },

@@ -1,5 +1,5 @@
 use crate::sessions::streams::Streams;
-use crate::sessions::{ConnectionState, ServerStreamState, StreamHandle};
+use crate::sessions::{CallId, ConnectionState, ServerStreamState, StreamHandle};
 mod active_stream;
 mod config;
 mod errors;
@@ -17,7 +17,7 @@ use self::outstanding_requests::OutstandingRequest;
 use self::session_state::SessionState;
 use crate::amf::{self, AmfEncoding};
 use crate::amf0::{Amf0Object, Amf0Value};
-use crate::chunk_io::{ChunkEncoder, DecodeError, MessageDecoder, Packet};
+use crate::chunk_io::{ChunkEncoder, DecodeError, EncodeError, MessageDecoder, Packet};
 use crate::messages::RawMessage;
 use crate::messages::{PeerBandwidthLimitType, RtmpMessage, UserControlEventType};
 use crate::sessions::{
@@ -26,7 +26,6 @@ use crate::sessions::{
 use crate::time::RtmpTimestamp;
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::mem;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -95,10 +94,21 @@ pub struct ServerSession {
     self_window_ack_size: Option<u32>,
     bytes_received: u64,
     bytes_received_since_last_ack: u32,
-    // Protocol control is emitted only after the peer's `connect` request is
-    // accepted. Sending it from `new` causes pre-connect writes and diverges
-    // from RTMP server behaviour in FFmpeg, OBS, and FMS.
-    pending_connection_control: Vec<ServerSessionResult>,
+    // Protocol control is emitted only once the peer's `connect` request is
+    // answered. Sending it from `new` causes pre-connect writes and diverges
+    // from RTMP server behaviour in FFmpeg, OBS, and FMS. It is serialized
+    // then too; see `take_connection_preamble`.
+    connection_preamble: Option<ConnectionPreamble>,
+    /// Send `onBWDone` after the connect `_result`. It is serialized there,
+    /// not with the control preamble, because chunk headers are compressed
+    /// against the previous message: packets must leave in the order they
+    /// were serialized.
+    send_on_bw_done: bool,
+    /// Commands the application answers; see [`ServerSession::delegate_command`].
+    delegated_commands: Vec<String>,
+    /// Calls made with [`ServerSession::call`] that the client has not answered.
+    outstanding_calls: std::collections::HashSet<u32>,
+    next_call_id: u32,
 }
 
 impl ServerSession {
@@ -178,7 +188,7 @@ impl ServerSession {
             }
             .into());
         }
-        let mut session = ServerSession {
+        let session = ServerSession {
             failed: false,
             start_time: Instant::now(),
             serializer: ChunkEncoder::new(),
@@ -207,61 +217,63 @@ impl ServerSession {
             self_window_ack_size: Some(config.window_ack_size),
             bytes_received: 0,
             bytes_received_since_last_ack: 0,
-            pending_connection_control: Vec::new(),
+            connection_preamble: Some(ConnectionPreamble {
+                chunk_size: config.chunk_size,
+                window_ack_size: config.window_ack_size,
+                peer_bandwidth: config.peer_bandwidth,
+            }),
+            send_on_bw_done: config.send_on_bw_done_message_on_start,
+            delegated_commands: Vec::new(),
+            outstanding_calls: std::collections::HashSet::new(),
+            next_call_id: 1,
         };
 
+        Ok(session)
+    }
+
+    /// The control messages that precede the answer to `connect`, serialized
+    /// now and only once.
+    ///
+    /// They are serialized when the answer is, not when the session is
+    /// created: each chunk header is compressed against the previous message
+    /// on its chunk stream, and a new chunk size applies from the moment it
+    /// is serialized. Anything sent before `connect` is answered, such as an
+    /// acknowledgement or a ping response, must not be encoded against
+    /// preamble packets the peer has not received.
+    fn take_connection_preamble(&mut self) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+        let Some(preamble) = self.connection_preamble.take() else {
+            return Ok(Vec::new());
+        };
         let mut results = Vec::with_capacity(4);
 
-        let chunk_size_packet = session
+        let chunk_size_packet = self
             .serializer
-            .set_chunk_size(config.chunk_size, RtmpTimestamp::new(0))?;
+            .set_chunk_size(preamble.chunk_size, RtmpTimestamp::new(0))?;
         results.push(ServerSessionResult::Packet(chunk_size_packet));
 
-        let window_ack_message = RtmpMessage::WindowAcknowledgement {
-            size: config.window_ack_size,
-        };
-        let window_ack_payload = session.to_payload(window_ack_message, 0)?;
-        let window_ack_packet = session
-            .serializer
-            .serialize(&window_ack_payload, true, false)?;
-        results.push(ServerSessionResult::Packet(window_ack_packet));
-
-        let begin_message = RtmpMessage::UserControl {
-            event_type: UserControlEventType::StreamBegin,
-            stream_id: Some(0),
-            timestamp: None,
-            buffer_length: None,
-        };
-
-        let begin_payload = session.to_payload(begin_message, 0)?;
-        let begin_packet = session.serializer.serialize(&begin_payload, true, false)?;
-        results.push(ServerSessionResult::Packet(begin_packet));
-
-        let peer_message = RtmpMessage::SetPeerBandwidth {
-            size: config.peer_bandwidth,
-            limit_type: PeerBandwidthLimitType::Dynamic,
-        };
-        let peer_payload = session.to_payload(peer_message, 0)?;
-        let peer_packet = session.serializer.serialize(&peer_payload, true, false)?;
-        results.push(ServerSessionResult::Packet(peer_packet));
-
-        if config.send_on_bw_done_message_on_start {
-            let bw_done_message = RtmpMessage::Amf0Command {
-                command_name: "onBWDone".to_string(),
-                transaction_id: 0.0,
-                command_object: Amf0Value::Null,
-                additional_arguments: vec![Amf0Value::Number(8192_f64)],
-            };
-
-            let bw_done_payload = session.to_payload(bw_done_message, 0)?;
-            let bw_done_packet = session
-                .serializer
-                .serialize(&bw_done_payload, true, false)?;
-            results.push(ServerSessionResult::Packet(bw_done_packet));
+        // RTMP 1.0 section 7.2.1.1 orders the connect flow as Window
+        // Acknowledgement Size, Set Peer Bandwidth, StreamBegin, `_result`.
+        let messages = [
+            RtmpMessage::WindowAcknowledgement {
+                size: preamble.window_ack_size,
+            },
+            RtmpMessage::SetPeerBandwidth {
+                size: preamble.peer_bandwidth,
+                limit_type: PeerBandwidthLimitType::Dynamic,
+            },
+            RtmpMessage::UserControl {
+                event_type: UserControlEventType::StreamBegin,
+                stream_id: Some(0),
+                timestamp: None,
+                buffer_length: None,
+            },
+        ];
+        for message in messages {
+            let payload = self.to_payload(message, 0)?;
+            let packet = self.serializer.serialize(&payload, true, false)?;
+            results.push(ServerSessionResult::Packet(packet));
         }
-
-        session.pending_connection_control = results;
-        Ok(session)
+        Ok(results)
     }
 
     /// Recycle payload descriptors after consumers release their messages.
@@ -504,13 +516,20 @@ impl ServerSession {
         response_properties: Amf0Object,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
         self.ensure_active()?;
+        if self.is_command_request(request_id) {
+            // RTMP 1.0 section 7.2.1.2: the answer carries a Response value;
+            // `undefined` is the void one, as the no-op commands send.
+            return self.answer_command(request_id, vec![Amf0Value::Undefined], None);
+        }
         let request_id = request_id.get();
-        let request = match self.outstanding_requests.remove(&request_id) {
-            Some(x) => x,
+        // Look, don't take: if the answer cannot be built, the request stays
+        // outstanding and the application can still answer it another way.
+        let request = match self.outstanding_requests.get(&request_id) {
+            Some(x) => x.clone(),
             None => return Err(ServerSessionError::InvalidRequestId),
         };
 
-        match request {
+        let results = match request {
             OutstandingRequest::ConnectionRequest {
                 app_name,
                 transaction_id,
@@ -538,7 +557,56 @@ impl ServerSession {
                 self.response_encoding = encoding;
                 self.accept_play_request(stream_id, stream_key)
             }
-        }
+
+            // Answered by `answer_command` above.
+            OutstandingRequest::CommandRequested { .. } => {
+                Err(ServerSessionError::InvalidOutstandingRequest(request_id))
+            }
+        }?;
+        self.outstanding_requests.remove(&request_id);
+        Ok(results)
+    }
+
+    /// Answer a delegated command with `_result(null, values...)`, or with
+    /// `_error` when `refusal` is given.
+    ///
+    /// The request is only given up once its answer is built: if `values`
+    /// cannot be encoded, the request stays outstanding and the application
+    /// can still answer it another way.
+    fn answer_command(
+        &mut self,
+        request_id: RequestId,
+        values: Vec<Amf0Value>,
+        refusal: Option<(&str, &str)>,
+    ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+        self.ensure_active()?;
+        let Some(OutstandingRequest::CommandRequested {
+            transaction_id,
+            stream_id,
+            encoding,
+        }) = self.outstanding_requests.get(&request_id.get())
+        else {
+            return Err(ServerSessionError::InvalidRequestId);
+        };
+        let (transaction_id, stream_id, encoding) = (*transaction_id, *stream_id, *encoding);
+        self.response_encoding = encoding;
+        let packet = match refusal {
+            None => {
+                self.create_success_response(transaction_id, Amf0Value::Null, values, stream_id)?
+            }
+            Some((code, description)) => {
+                self.create_error_packet(code, description, transaction_id, stream_id)?
+            }
+        };
+        self.outstanding_requests.remove(&request_id.get());
+        Ok(vec![ServerSessionResult::Packet(packet)])
+    }
+
+    fn is_command_request(&self, request_id: RequestId) -> bool {
+        matches!(
+            self.outstanding_requests.get(&request_id.get()),
+            Some(OutstandingRequest::CommandRequested { .. })
+        )
     }
 
     /// The AMF encoding agreed with the peer during `connect`.
@@ -634,9 +702,13 @@ impl ServerSession {
         description: &str,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
         self.ensure_active()?;
+        if self.is_command_request(request_id) {
+            return self.answer_command(request_id, Vec::new(), Some((code, description)));
+        }
         let request_id = request_id.get();
-        let request = match self.outstanding_requests.remove(&request_id) {
-            Some(x) => x,
+        // Look, don't take; see `accept_request_with_properties_inner`.
+        let request = match self.outstanding_requests.get(&request_id) {
+            Some(x) => x.clone(),
             None => return Err(ServerSessionError::InvalidRequestId),
         };
 
@@ -665,6 +737,10 @@ impl ServerSession {
                 self.response_encoding = encoding;
                 (0.0, stream_id)
             }
+            // Answered by `answer_command` before the request is removed.
+            OutstandingRequest::CommandRequested { .. } => {
+                return Err(ServerSessionError::InvalidOutstandingRequest(request_id));
+            }
         };
 
         // NetConnection and NetStream rejections use different
@@ -681,30 +757,31 @@ impl ServerSession {
         // the rejection entirely and fall back to a generic connection error.
         //
         // A refused connect is the first thing the peer hears from us, so it needs
-        // the same protocol preamble (chunk size, window acknowledgement,
-        // onBWDone, ...) the accept path prepends. Without it the _error reuses
-        // the preamble's chunk stream as a continuation the peer never saw and
-        // cannot decode, and the client observes a bare drop instead of the
-        // rejection.
-        let mut results = if matches!(request, OutstandingRequest::ConnectionRequest { .. }) {
-            mem::replace(&mut self.pending_connection_control, Vec::new())
+        // the same protocol preamble (chunk size, window acknowledgement, ...)
+        // the accept path prepends. The `_error` is chunked at the chunk size
+        // that preamble announces; without it the peer decodes with the
+        // default of 128, cannot read the refusal, and observes a bare drop.
+        // `onBWDone` is not part of the preamble: it follows only an accepted
+        // connect.
+        // Build the answer before anything is serialized: that is the step
+        // that can fail, and nothing may change if it does.
+        let is_connect = matches!(request, OutstandingRequest::ConnectionRequest { .. });
+        let payload = if is_connect {
+            self.error_payload(code, description, transaction_id, stream_id)?
+        } else {
+            let status = amf::status_object::<Amf0Value>("error", code, description);
+            let message = self.command_message("onStatus", 0.0, Amf0Value::Null, vec![status]);
+            self.to_payload(message, stream_id)?
+        };
+        check_lengths(std::slice::from_ref(&payload))?;
+
+        let mut results = if is_connect {
+            self.take_connection_preamble()?
         } else {
             Vec::new()
         };
-        let packet = match request {
-            OutstandingRequest::ConnectionRequest { .. } => {
-                self.create_error_packet(code, description, transaction_id, stream_id)?
-            }
-            OutstandingRequest::PublishRequested { .. }
-            | OutstandingRequest::PlayRequested { .. } => {
-                let status = amf::status_object::<Amf0Value>("error", code, description);
-                let message = self.command_message("onStatus", 0.0, Amf0Value::Null, vec![status]);
-                let payload = self.to_payload(message, stream_id)?;
-                self.serializer.serialize(&payload, false, false)?
-            }
-        };
-
-        results.push(ServerSessionResult::Packet(packet));
+        results.extend(self.serialize_all(vec![payload])?);
+        self.outstanding_requests.remove(&request_id);
         Ok(results)
     }
 
@@ -882,16 +959,13 @@ impl ServerSession {
             "deleteStream" => self.handle_command_delete_stream(additional_args)?,
             "play" => self.handle_command_play(stream_id, transaction_id, additional_args)?,
             "publish" => self.handle_command_publish(stream_id, transaction_id, additional_args)?,
-
-            _ => vec![ServerSessionResult::Event(
-                ServerSessionEvent::UnhandledCommand {
-                    stream_id: StreamId::new(stream_id),
-                    command_name: name,
-                    additional_values: additional_args,
-                    transaction_id,
-                    command_object,
-                },
-            )],
+            _ => self.handle_unimplemented_command(
+                stream_id,
+                name,
+                transaction_id,
+                command_object,
+                additional_args,
+            )?,
         };
 
         Ok(results)
@@ -944,11 +1018,7 @@ impl ServerSession {
             encoding: self.response_encoding,
         };
 
-        let request_number = self.next_request_number;
-        self.next_request_number = self.next_request_number.wrapping_add(1);
-        self.session_limits
-            .check_requests(self.outstanding_requests.len())?;
-        self.outstanding_requests.insert(request_number, request);
+        let request_number = self.register_request(request)?;
 
         let event = ServerSessionEvent::ConnectionRequested {
             app_name: app_name,
@@ -959,6 +1029,133 @@ impl ServerSession {
         };
 
         Ok(vec![ServerSessionResult::Event(event)])
+    }
+
+    /// Answer a command this session does not implement.
+    ///
+    /// RTMP 1.0 section 7.2: the receiver answers a command with `_result`
+    /// or `_error` carrying the same transaction id, and a transaction id of 0
+    /// means no answer is expected. A command left unanswered leaves a client
+    /// that waits for it stalled with nothing on the wire to say why.
+    ///
+    /// In order:
+    /// - `_result`/`_error` answering a [`ServerSession::call`] raise
+    ///   [`ServerSessionEvent::CallAnswered`].
+    /// - A delegated command that expects an answer raises
+    ///   [`ServerSessionEvent::CommandRequested`] for the application.
+    /// - [`ServerSession::NO_OP_COMMANDS`] are accepted with `_result`.
+    /// - Any other command that expects an answer is refused with `_error`
+    ///   (`NetConnection.Call.Failed`) and raises
+    ///   [`ServerSessionEvent::CommandRefused`].
+    ///
+    /// Before `connect` is accepted nothing is answered: the connection does
+    /// not exist yet, and its control preamble has not been sent. Whatever is
+    /// not answered surfaces as [`ServerSessionEvent::UnhandledCommand`].
+    fn handle_unimplemented_command(
+        &mut self,
+        stream_id: u32,
+        name: String,
+        transaction_id: f64,
+        command_object: Amf0Value,
+        additional_args: Vec<Amf0Value>,
+    ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+        // `_result` and `_error` answer this side's calls; they are never
+        // requests themselves.
+        if name == "_result" || name == "_error" {
+            // Calls are made on the NetConnection, so only an answer on
+            // message stream 0 can belong to one.
+            if stream_id == 0
+                && let Some(call_id) = call_id_of(transaction_id)
+                && self.outstanding_calls.remove(&call_id)
+            {
+                let event = ServerSessionEvent::CallAnswered {
+                    call_id: CallId(call_id),
+                    accepted: name == "_result",
+                    command_object,
+                    additional_values: additional_args,
+                };
+                return Ok(vec![ServerSessionResult::Event(event)]);
+            }
+            return Ok(vec![unhandled(
+                stream_id,
+                name,
+                transaction_id,
+                command_object,
+                additional_args,
+            )]);
+        }
+
+        // A non-finite id cannot be echoed meaningfully, so it is treated like
+        // 0: no answer expected.
+        let expects_answer = self.current_state == SessionState::Connected
+            && transaction_id.is_finite()
+            && transaction_id != 0.0;
+        if !expects_answer {
+            return Ok(vec![unhandled(
+                stream_id,
+                name,
+                transaction_id,
+                command_object,
+                additional_args,
+            )]);
+        }
+
+        if self
+            .delegated_commands
+            .iter()
+            .any(|delegated| *delegated == name)
+        {
+            let request_number = self.register_request(OutstandingRequest::CommandRequested {
+                transaction_id,
+                stream_id,
+                encoding: self.response_encoding,
+            })?;
+            let event = ServerSessionEvent::CommandRequested {
+                request_id: RequestId(request_number),
+                stream_id: StreamId::new(stream_id),
+                command_name: name,
+                command_object,
+                additional_values: additional_args,
+            };
+            return Ok(vec![ServerSessionResult::Event(event)]);
+        }
+
+        if Self::NO_OP_COMMANDS.contains(&name.as_str()) {
+            let packet = self.create_success_response(
+                transaction_id,
+                Amf0Value::Null,
+                vec![Amf0Value::Undefined],
+                stream_id,
+            )?;
+            return Ok(vec![
+                ServerSessionResult::Packet(packet),
+                unhandled(
+                    stream_id,
+                    name,
+                    transaction_id,
+                    command_object,
+                    additional_args,
+                ),
+            ]);
+        }
+
+        // The name is the peer's own; bound how much of it is echoed.
+        let shown: String = name.chars().take(MAX_ECHOED_COMMAND_NAME).collect();
+        let packet = self.create_error_packet(
+            "NetConnection.Call.Failed",
+            &format!("Method not found ({shown})."),
+            transaction_id,
+            stream_id,
+        )?;
+        let event = ServerSessionEvent::CommandRefused {
+            stream_id: StreamId::new(stream_id),
+            command_name: name,
+            transaction_id,
+        };
+        Ok(vec![
+            ServerSessionResult::Packet(packet),
+            ServerSessionResult::Event(event),
+        ])
     }
 
     fn handle_command_close_stream(
@@ -1095,7 +1292,8 @@ impl ServerSession {
         self.outstanding_requests
             .retain(|_, request| match request {
                 OutstandingRequest::PlayRequested { stream_id: id, .. }
-                | OutstandingRequest::PublishRequested { stream_id: id, .. } => *id != stream_id,
+                | OutstandingRequest::PublishRequested { stream_id: id, .. }
+                | OutstandingRequest::CommandRequested { stream_id: id, .. } => *id != stream_id,
                 _ => true,
             });
         let result = match stream.current_state {
@@ -1234,11 +1432,7 @@ impl ServerSession {
             encoding: self.response_encoding,
         };
 
-        let request_number = self.next_request_number;
-        self.next_request_number = self.next_request_number.wrapping_add(1);
-        self.session_limits
-            .check_requests(self.outstanding_requests.len())?;
-        self.outstanding_requests.insert(request_number, request);
+        let request_number = self.register_request(request)?;
 
         let event = ServerSessionEvent::PublishStreamRequested {
             stream: self.stream_handles.find(stream_id).expect("known stream"),
@@ -1365,11 +1559,7 @@ impl ServerSession {
             encoding: self.response_encoding,
         };
 
-        let request_number = self.next_request_number;
-        self.next_request_number = self.next_request_number.wrapping_add(1);
-        self.session_limits
-            .check_requests(self.outstanding_requests.len())?;
-        self.outstanding_requests.insert(request_number, request);
+        let request_number = self.register_request(request)?;
 
         let event = ServerSessionEvent::PlayStreamRequested {
             stream: self.stream_handles.find(stream_id).expect("known stream"),
@@ -1538,9 +1728,6 @@ impl ServerSession {
         transaction_id: f64,
         response_properties: Amf0Object,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
-        self.connected_app_name = Some(app_name.clone());
-        self.current_state = SessionState::Connected;
-
         let mut command_object_properties = Amf0Object::new();
         command_object_properties.insert(
             "fmsVer".to_string(),
@@ -1567,11 +1754,33 @@ impl ServerSession {
             additional_arguments: vec![Amf0Value::Object(additional_properties)],
         };
 
-        let payload = self.to_payload(message, 0)?;
-        let packet = self.serializer.serialize(&payload, false, false)?;
+        // Build every payload first. The application's properties may not
+        // encode, and if they don't, nothing has changed yet.
+        let mut payloads = vec![self.to_payload(message, 0)?];
+        // `onBWDone` is a call on the client's NetConnection, which exists
+        // only once the connect `_result` has been sent.
+        if self.send_on_bw_done {
+            // AMF0 regardless of the connect's framing, as it was when this
+            // was part of the preamble.
+            payloads.push(
+                RtmpMessage::Amf0Command {
+                    command_name: "onBWDone".to_string(),
+                    transaction_id: 0.0,
+                    command_object: Amf0Value::Null,
+                    additional_arguments: vec![Amf0Value::Number(8192_f64)],
+                }
+                .into_raw_message(self.get_epoch(), 0)?,
+            );
+        }
+        check_lengths(&payloads)?;
 
-        let mut results = mem::replace(&mut self.pending_connection_control, Vec::new());
-        results.push(ServerSessionResult::Packet(packet));
+        // Nothing below can fail.
+        self.connected_app_name = Some(app_name);
+        self.current_state = SessionState::Connected;
+        // The preamble goes first on the wire, so it is serialized first: the
+        // result is chunked at the chunk size the preamble announces.
+        let mut results = self.take_connection_preamble()?;
+        results.extend(self.serialize_all(payloads)?);
         Ok(results)
     }
 
@@ -1581,21 +1790,12 @@ impl ServerSession {
         stream_key: Arc<str>,
         mode: PublishMode,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
-        match self.active_streams.get_mut(&stream_id) {
-            Some(active_stream) => {
-                active_stream.current_state = StreamState::Publishing {
-                    stream_key: stream_key.clone(),
-                    mode,
-                };
-            }
-
-            None => {
-                return Err(ServerSessionError::ActionAttemptedOnInactiveStream {
-                    action: "publish".to_string(),
-                    stream_id,
-                });
-            }
-        };
+        if !self.active_streams.contains_key(&stream_id) {
+            return Err(ServerSessionError::ActionAttemptedOnInactiveStream {
+                action: "publish".to_string(),
+                stream_id,
+            });
+        }
 
         let description = format!(
             "Successfully started publishing on stream key {}",
@@ -1609,10 +1809,9 @@ impl ServerSession {
             timestamp: None,
         };
 
-        let stream_begin_payload = self.to_payload(stream_begin_message, stream_id)?;
-        let stream_begin_packet = self
-            .serializer
-            .serialize(&stream_begin_payload, false, false)?;
+        // RTMP 1.0 section 6.2: User Control messages use message stream 0;
+        // the stream they concern is in the event data.
+        let stream_begin_payload = self.to_payload(stream_begin_message, 0)?;
 
         let status_object =
             create_status_object("status", "NetStream.Publish.Start", description.as_ref());
@@ -1624,14 +1823,14 @@ impl ServerSession {
         };
 
         let publish_start_payload = self.to_payload(publish_start_message, stream_id)?;
-        let publish_packet = self
-            .serializer
-            .serialize(&publish_start_payload, false, false)?;
+        let payloads = vec![stream_begin_payload, publish_start_payload];
+        check_lengths(&payloads)?;
 
-        Ok(vec![
-            ServerSessionResult::Packet(stream_begin_packet),
-            ServerSessionResult::Packet(publish_packet),
-        ])
+        // Nothing below can fail.
+        if let Some(active_stream) = self.active_streams.get_mut(&stream_id) {
+            active_stream.current_state = StreamState::Publishing { stream_key, mode };
+        }
+        self.serialize_all(payloads)
     }
 
     fn accept_play_request(
@@ -1639,19 +1838,11 @@ impl ServerSession {
         stream_id: u32,
         stream_key: Arc<str>,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
-        match self.active_streams.get_mut(&stream_id) {
-            Some(active_stream) => {
-                active_stream.current_state = StreamState::Playing {
-                    stream_key: stream_key.clone(),
-                };
-            }
-
-            None => {
-                return Err(ServerSessionError::ActionAttemptedOnInactiveStream {
-                    action: "play".to_string(),
-                    stream_id,
-                });
-            }
+        if !self.active_streams.contains_key(&stream_id) {
+            return Err(ServerSessionError::ActionAttemptedOnInactiveStream {
+                action: "play".to_string(),
+                stream_id,
+            });
         }
 
         let reset_status_object =
@@ -1701,30 +1892,44 @@ impl ServerSession {
             ],
         };
 
-        let stream_begin_payload = self.to_payload(stream_begin_message, stream_id)?;
-        let stream_begin_packet = self
-            .serializer
-            .serialize(&stream_begin_payload, false, false)?;
+        // Built in the order the packets are sent, and serialized in that
+        // order: each chunk header is compressed against the previous message
+        // on its chunk stream.
+        let payloads = vec![
+            self.to_payload(reset_message, stream_id)?,
+            // RTMP 1.0 section 6.2: User Control messages use message stream
+            // 0; the stream they concern is in the event data.
+            self.to_payload(stream_begin_message, 0)?,
+            self.to_payload(start_message, stream_id)?,
+            self.to_payload(data1_message, stream_id)?,
+            self.to_payload(data2_message, stream_id)?,
+        ];
+        check_lengths(&payloads)?;
 
-        let start_payload = self.to_payload(start_message, stream_id)?;
-        let start_packet = self.serializer.serialize(&start_payload, false, false)?;
+        // Nothing below can fail.
+        if let Some(active_stream) = self.active_streams.get_mut(&stream_id) {
+            active_stream.current_state = StreamState::Playing { stream_key };
+        }
+        self.serialize_all(payloads)
+    }
 
-        let data1_payload = self.to_payload(data1_message, stream_id)?;
-        let data1_packet = self.serializer.serialize(&data1_payload, false, false)?;
-
-        let data2_payload = self.to_payload(data2_message, stream_id)?;
-        let data2_packet = self.serializer.serialize(&data2_payload, false, false)?;
-
-        let reset_payload = self.to_payload(reset_message, stream_id)?;
-        let reset_packet = self.serializer.serialize(&reset_payload, false, false)?;
-
-        Ok(vec![
-            ServerSessionResult::Packet(reset_packet),
-            ServerSessionResult::Packet(stream_begin_packet),
-            ServerSessionResult::Packet(start_packet),
-            ServerSessionResult::Packet(data1_packet),
-            ServerSessionResult::Packet(data2_packet),
-        ])
+    /// Serialize messages that were all built beforehand, in order.
+    ///
+    /// Serializing can only fail for a message over the RTMP length limit,
+    /// which [`check_lengths`] rules out first. So a caller that builds every
+    /// payload before changing session state either sends all of it or
+    /// changes nothing.
+    fn serialize_all(
+        &mut self,
+        payloads: Vec<RawMessage>,
+    ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+        check_lengths(&payloads)?;
+        let mut results = Vec::with_capacity(payloads.len());
+        for payload in &payloads {
+            let packet = self.serializer.serialize(payload, false, false)?;
+            results.push(ServerSessionResult::Packet(packet));
+        }
+        Ok(results)
     }
 
     fn create_success_response(
@@ -1769,6 +1974,26 @@ impl ServerSession {
         RtmpTimestamp::new(self.start_time.elapsed().as_millis() as u32)
     }
 
+    /// An `_error` answer, built but not yet serialized.
+    fn error_payload(
+        &self,
+        code: &str,
+        description: &str,
+        transaction_id: f64,
+        stream_id: u32,
+    ) -> Result<RawMessage, ServerSessionError> {
+        // RTMP 1.0 allows "warning", "status" or "error" as the level;
+        // `_error` is the command name, not a level.
+        let status_object = create_status_object("error", code, description);
+        let message = RtmpMessage::Amf0Command {
+            command_name: "_error".to_string(),
+            transaction_id,
+            command_object: Amf0Value::Null,
+            additional_arguments: vec![Amf0Value::Object(status_object)],
+        };
+        self.to_payload(message, stream_id)
+    }
+
     fn create_error_packet(
         &mut self,
         code: &str,
@@ -1776,15 +2001,76 @@ impl ServerSession {
         transaction_id: f64,
         stream_id: u32,
     ) -> Result<Packet, ServerSessionError> {
-        let status_object = create_status_object("_error", code, description);
-        let packet = self.create_error_response(
-            transaction_id,
-            Amf0Value::Null,
-            vec![Amf0Value::Object(status_object)],
-            stream_id,
-        )?;
-        Ok(packet)
+        let payload = self.error_payload(code, description, transaction_id, stream_id)?;
+        Ok(self.serializer.serialize(&payload, false, false)?)
     }
+}
+
+/// The RTMP message length field is 24 bits.
+const MAX_MESSAGE_LENGTH: usize = 0xff_ffff;
+
+/// Fail before anything is serialized if a message is too long to send.
+fn check_lengths(payloads: &[RawMessage]) -> Result<(), ServerSessionError> {
+    match payloads
+        .iter()
+        .find(|payload| payload.data.len() > MAX_MESSAGE_LENGTH)
+    {
+        Some(payload) => Err(EncodeError::MessageTooLong {
+            size: payload.data.len().min(u32::MAX as usize) as u32,
+        }
+        .into()),
+        None => Ok(()),
+    }
+}
+
+/// Values for the control messages sent before the answer to `connect`.
+struct ConnectionPreamble {
+    chunk_size: u32,
+    window_ack_size: u32,
+    peer_bandwidth: u32,
+}
+
+/// How much of an unknown command's name an `_error` description repeats.
+const MAX_ECHOED_COMMAND_NAME: usize = 64;
+
+/// The [`CallId`] a client's `_result`/`_error` transaction id refers to,
+/// if it can be one: calls are numbered with positive integers.
+fn call_id_of(transaction_id: f64) -> Option<u32> {
+    (transaction_id.fract() == 0.0 && transaction_id >= 1.0 && transaction_id <= u32::MAX as f64)
+        .then(|| transaction_id as u32)
+}
+
+fn unhandled(
+    stream_id: u32,
+    name: String,
+    transaction_id: f64,
+    command_object: Amf0Value,
+    additional_values: Vec<Amf0Value>,
+) -> ServerSessionResult {
+    ServerSessionResult::Event(ServerSessionEvent::UnhandledCommand {
+        stream_id: StreamId::new(stream_id),
+        command_name: name,
+        transaction_id,
+        command_object,
+        additional_values,
+    })
+}
+
+impl ServerSession {
+    /// Legacy setup commands that this session answers with `_result` and
+    /// otherwise ignores.
+    ///
+    /// They are not part of RTMP 1.0. Flash Media Live Encoder introduced
+    /// them, and OBS, FFmpeg, librtmp and most hardware encoders send them
+    /// before `createStream`, and `FCUnpublish` before `deleteStream`. This
+    /// session keeps no state for them, so a successful no-op is the honest
+    /// answer. `releaseStream` asks the server to free a stream name a
+    /// previous connection may still hold, which only the application can do;
+    /// one that tracks stream names can take it over with
+    /// [`delegate_command`](Self::delegate_command). Every other command the
+    /// session does not implement is refused with `_error`.
+    pub const NO_OP_COMMANDS: &'static [&'static str] =
+        &["releaseStream", "FCPublish", "FCUnpublish"];
 }
 
 fn create_status_object(level: &str, code: &str, description: &str) -> Amf0Object {
@@ -1932,7 +2218,150 @@ impl ServerSession {
     }
 }
 
+/// Answering commands in the application.
+///
+/// None of this is needed for an ordinary server: the session answers every
+/// command itself. It is for applications that implement a command the
+/// session does not, such as a bandwidth check (`_checkbw`), or that want
+/// their own behaviour for one it answers as a no-op, such as `FCPublish`.
 impl ServerSession {
+    /// Let the application answer the client's `name` command.
+    ///
+    /// From now on, a `name` call that expects an answer raises
+    /// [`ServerEvent::CommandRequested`] instead of being answered by the
+    /// session. Answer it with [`accept_command`](Self::accept_command),
+    /// [`accept_request`](Self::accept_request) (an empty `_result`) or
+    /// [`reject_request`](Self::reject_request) (an `_error`); the client
+    /// waits until you do. A call with transaction id 0 expects no answer and
+    /// still raises [`ServerEvent::UnhandledCommand`].
+    ///
+    /// Commands the session implements, such as `connect`, `createStream`,
+    /// `publish` and `play`, cannot be delegated, and neither can `_result`
+    /// and `_error`, which answer calls rather than make them; naming one has
+    /// no effect.
+    pub fn delegate_command(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        if !self.delegated_commands.contains(&name) {
+            self.delegated_commands.push(name);
+        }
+    }
+
+    /// Answer a [`ServerEvent::CommandRequested`] with
+    /// `_result(null, values...)`. Drain the output through `receive`.
+    ///
+    /// Fails with [`ServerSessionError::InvalidRequestId`] when `request_id`
+    /// is not an outstanding command request. If `values` cannot be encoded,
+    /// the request stays outstanding and can still be answered.
+    pub fn accept_command(
+        &mut self,
+        request_id: RequestId,
+        values: Vec<Amf0Value>,
+    ) -> Result<(), ServerSessionError> {
+        let outputs = self.answer_command(request_id, values, None)?;
+        self.pending.extend(
+            outputs
+                .into_iter()
+                .map(|output| output.map_payload(crate::Payload::from)),
+        );
+        Ok(())
+    }
+
+    /// Call `name` on the client and expect an answer. Drain the output
+    /// through `receive`.
+    ///
+    /// The client's `_result` or `_error` raises [`ServerEvent::CallAnswered`]
+    /// with the returned [`CallId`]. An unanswered call holds a place in
+    /// [`SessionLimits::max_pending_requests`](crate::sessions::SessionLimits::max_pending_requests),
+    /// shared with requests awaiting the application, until it is answered or
+    /// [forgotten](Self::forget_call). RTMP has no way to cancel a call.
+    pub fn call(
+        &mut self,
+        name: &str,
+        arguments: Vec<Amf0Value>,
+    ) -> Result<CallId, ServerSessionError> {
+        self.ensure_client_callable()?;
+        self.session_limits
+            .check_requests(self.pending_requests())?;
+        // Ids stay positive so they never read as "no answer expected", and
+        // skip any still awaiting an answer.
+        let mut call_id = self.next_call_id;
+        while call_id == 0 || self.outstanding_calls.contains(&call_id) {
+            call_id = call_id.wrapping_add(1);
+        }
+        let packet = self.command_to_client(name, f64::from(call_id), arguments)?;
+        self.pending.push_back(ServerOutput::Packet(packet));
+        self.next_call_id = call_id.wrapping_add(1);
+        self.outstanding_calls.insert(call_id);
+        Ok(CallId(call_id))
+    }
+
+    /// Stop waiting for the answer to `call_id`, for example after the
+    /// application's own timeout, and free its place in
+    /// [`SessionLimits::max_pending_requests`](crate::sessions::SessionLimits::max_pending_requests).
+    /// A late answer then raises [`ServerEvent::UnhandledCommand`]. Returns
+    /// whether the call was still awaiting an answer.
+    pub fn forget_call(&mut self, call_id: CallId) -> bool {
+        self.outstanding_calls.remove(&call_id.0)
+    }
+
+    /// Call `name` on the client without expecting an answer (transaction id
+    /// 0), for example `onBWDone` or `onFCPublish`. Drain the output through
+    /// `receive`.
+    pub fn notify(
+        &mut self,
+        name: &str,
+        arguments: Vec<Amf0Value>,
+    ) -> Result<(), ServerSessionError> {
+        self.ensure_client_callable()?;
+        let packet = self.command_to_client(name, 0.0, arguments)?;
+        self.pending.push_back(ServerOutput::Packet(packet));
+        Ok(())
+    }
+
+    fn ensure_client_callable(&self) -> Result<(), ServerSessionError> {
+        self.ensure_active()?;
+        if self.current_state == SessionState::Connected {
+            Ok(())
+        } else {
+            Err(ServerSessionError::NotConnected)
+        }
+    }
+
+    /// A command to the client's NetConnection (message stream 0).
+    fn command_to_client(
+        &mut self,
+        name: &str,
+        transaction_id: f64,
+        arguments: Vec<Amf0Value>,
+    ) -> Result<Packet, ServerSessionError> {
+        self.response_encoding = self.server_initiated_encoding();
+        let message = self.command_message(name, transaction_id, Amf0Value::Null, arguments);
+        let payload = message.into_raw_message(self.get_epoch(), 0)?;
+        Ok(self.serializer.serialize(&payload, false, false)?)
+    }
+}
+
+impl ServerSession {
+    /// Requests and calls awaiting an answer, in either direction. They share
+    /// [`SessionLimits::max_pending_requests`](crate::sessions::SessionLimits::max_pending_requests).
+    fn pending_requests(&self) -> usize {
+        self.outstanding_requests.len() + self.outstanding_calls.len()
+    }
+
+    /// Record a request awaiting the application's decision. Numbers still in
+    /// use are skipped, so a long-lived request is never overwritten.
+    fn register_request(&mut self, request: OutstandingRequest) -> Result<u32, ServerSessionError> {
+        self.session_limits
+            .check_requests(self.pending_requests())?;
+        let mut request_number = self.next_request_number;
+        while self.outstanding_requests.contains_key(&request_number) {
+            request_number = request_number.wrapping_add(1);
+        }
+        self.next_request_number = request_number.wrapping_add(1);
+        self.outstanding_requests.insert(request_number, request);
+        Ok(request_number)
+    }
+
     fn ensure_output_drained(&self) -> Result<(), ServerSessionError> {
         self.ensure_active()?;
         if !self.pending.is_empty() {

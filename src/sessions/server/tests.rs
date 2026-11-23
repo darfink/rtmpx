@@ -23,18 +23,1105 @@ fn new_session_writes_nothing_before_connect() {
 fn on_bw_done_not_sent_when_config_disables_it() {
     let mut config = get_basic_config();
     config.send_on_bw_done_message_on_start = false;
+    let (mut deserializer, mut serializer, mut session) = common_setup(&config);
 
-    let mut deserializer = ContiguousDecoder::new();
-    let (_, results) = ServerSession::new(config).unwrap();
+    let responses = connect_and_resolve(&mut session, &mut serializer, &mut deserializer, true);
+    assert!(
+        !responses.iter().any(|(_, m)| is_command(m, "onBWDone")),
+        "onBWDone sent although disabled: {responses:?}"
+    );
+    assert!(
+        is_command(&responses[responses.len() - 1].1, "_result"),
+        "the connect result must be last: {responses:?}"
+    );
+}
 
+#[test]
+fn rejected_connection_does_not_send_on_bw_done() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+
+    let responses = connect_and_resolve(&mut session, &mut serializer, &mut deserializer, false);
+    assert!(
+        !responses.iter().any(|(_, m)| is_command(m, "onBWDone")),
+        "onBWDone sent after a refused connect: {responses:?}"
+    );
+    let refusal = &responses[responses.len() - 1].1;
+    assert!(
+        is_command(refusal, "_error"),
+        "the refusal must be last: {responses:?}"
+    );
+    // RTMP 1.0 levels are "warning", "status" or "error".
+    assert_eq!(
+        info_of(refusal).get("level"),
+        Some(&Amf0Value::Utf8String("error".to_string()))
+    );
+}
+
+#[test]
+fn connect_flow_follows_the_spec_order() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+
+    let responses = connect_and_resolve(&mut session, &mut serializer, &mut deserializer, true);
+    let kinds: Vec<&str> = responses
+        .iter()
+        .map(|(_, message)| match message {
+            RtmpMessage::SetChunkSize { .. } => "SetChunkSize",
+            RtmpMessage::WindowAcknowledgement { .. } => "WindowAcknowledgement",
+            RtmpMessage::SetPeerBandwidth { .. } => "SetPeerBandwidth",
+            RtmpMessage::UserControl {
+                event_type: UserControlEventType::StreamBegin,
+                ..
+            } => "StreamBegin",
+            RtmpMessage::Amf0Command { command_name, .. } => command_name.as_str(),
+            _ => "other",
+        })
+        .collect();
+    // RTMP 1.0 section 7.2.1.1, then `onBWDone` once the connection exists.
+    assert_eq!(
+        kinds,
+        [
+            "SetChunkSize",
+            "WindowAcknowledgement",
+            "SetPeerBandwidth",
+            "StreamBegin",
+            "_result",
+            "onBWDone"
+        ]
+    );
+}
+
+#[test]
+fn no_op_commands_are_answered_with_result() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+
+    for (name, transaction_id) in [
+        ("releaseStream", 2.0),
+        ("FCPublish", 3.0),
+        ("FCUnpublish", 6.0),
+    ] {
+        let (responses, events) = send_command(
+            name,
+            transaction_id,
+            &mut session,
+            &mut serializer,
+            &mut deserializer,
+        );
+        assert_eq!(
+            responses.len(),
+            1,
+            "{name} needs exactly one reply: {responses:?}"
+        );
+        let (raw, message) = &responses[0];
+        assert_eq!(
+            raw.message_stream_id, 0,
+            "{name} is answered on the stream it arrived on"
+        );
+        match message {
+            RtmpMessage::Amf0Command {
+                command_name,
+                transaction_id: replied,
+                command_object: Amf0Value::Null,
+                additional_arguments,
+            } if command_name == "_result" => {
+                assert_eq!(
+                    *replied, transaction_id,
+                    "{name} reply must echo its transaction"
+                );
+                assert_eq!(additional_arguments, &vec![Amf0Value::Undefined]);
+            }
+            other => panic!("{name} must be answered with _result, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                events.as_slice(),
+                [ServerSessionEvent::UnhandledCommand { command_name, .. }] if command_name == name
+            ),
+            "{name} must still surface to the caller: {events:?}"
+        );
+    }
+}
+
+#[test]
+fn unknown_command_is_refused_with_error() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+
+    let (responses, events) = send_command(
+        "_checkbw",
+        7.0,
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    assert_eq!(responses.len(), 1, "exactly one reply: {responses:?}");
+    let (raw, message) = &responses[0];
+    assert_eq!(raw.message_stream_id, 0);
+    match message {
+        RtmpMessage::Amf0Command {
+            command_name,
+            transaction_id,
+            command_object: Amf0Value::Null,
+            ..
+        } if command_name == "_error" => assert_eq!(*transaction_id, 7.0),
+        other => panic!("an unknown call must be refused with _error, got {other:?}"),
+    }
+    let info = info_of(message);
+    assert_eq!(
+        info.get("level"),
+        Some(&Amf0Value::Utf8String("error".to_string()))
+    );
+    assert_eq!(
+        info.get("code"),
+        Some(&Amf0Value::Utf8String(
+            "NetConnection.Call.Failed".to_string()
+        ))
+    );
+    assert_eq!(
+        info.get("description"),
+        Some(&Amf0Value::Utf8String(
+            "Method not found (_checkbw).".to_string()
+        ))
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [ServerSessionEvent::CommandRefused { command_name, transaction_id, .. }]
+                if command_name == "_checkbw" && *transaction_id == 7.0
+        ),
+        "the refusal must be reported: {events:?}"
+    );
+}
+
+#[test]
+fn non_finite_transaction_ids_get_no_answer() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+
+    for transaction_id in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let (responses, events) = send_command(
+            "_checkbw",
+            transaction_id,
+            &mut session,
+            &mut serializer,
+            &mut deserializer,
+        );
+        assert!(
+            responses.is_empty(),
+            "{transaction_id} cannot be echoed: {responses:?}"
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [ServerSessionEvent::UnhandledCommand { .. }]
+        ));
+    }
+}
+
+#[test]
+fn nothing_is_answered_while_connect_awaits_acceptance() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    let connect_payload = create_connect_message(TEST_APP_NAME.to_string(), 15, 0, 0.0);
+    let connect_packet = serializer.serialize(&connect_payload, true, false).unwrap();
+    consume_results(
+        &mut deserializer,
+        session.handle_input(&connect_packet.to_vec()[..]).unwrap(),
+    );
+
+    let (responses, _) = send_command(
+        "_checkbw",
+        2.0,
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    assert!(
+        responses.is_empty(),
+        "the connection does not exist until connect is accepted: {responses:?}"
+    );
+}
+
+#[test]
+fn command_on_a_media_stream_is_answered_on_that_stream() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+    let stream_id = create_active_stream(&mut session, &mut serializer, &mut deserializer);
+
+    for (name, answer) in [("FCUnpublish", "_result"), ("_checkbw", "_error")] {
+        let message = RtmpMessage::Amf0Command {
+            command_name: name.to_string(),
+            transaction_id: 8.0,
+            command_object: Amf0Value::Null,
+            additional_arguments: vec![],
+        };
+        let payload = message
+            .into_raw_message(RtmpTimestamp::new(0), stream_id)
+            .unwrap();
+        let packet = serializer.serialize(&payload, false, false).unwrap();
+        let (responses, _) = split_results(
+            &mut deserializer,
+            session.handle_input(&packet.to_vec()[..]).unwrap(),
+        );
+        assert_eq!(responses.len(), 1, "{name}: {responses:?}");
+        assert_eq!(responses[0].0.message_stream_id, stream_id, "{name}");
+        assert!(is_command(&responses[0].1, answer), "{name}: {responses:?}");
+    }
+}
+
+#[test]
+fn refusal_mirrors_amf3_framing() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    // objectEncoding 3 negotiates AMF3.
+    let connect_payload = create_connect_message(TEST_APP_NAME.to_string(), 15, 0, 3.0);
+    let connect_packet = serializer.serialize(&connect_payload, true, false).unwrap();
+    let (_, events) = split_results(
+        &mut deserializer,
+        session.handle_input(&connect_packet.to_vec()[..]).unwrap(),
+    );
+    let [ServerSessionEvent::ConnectionRequested { request_id, .. }] = events.as_slice() else {
+        panic!("connect must be requested: {events:?}");
+    };
+    consume_results(
+        &mut deserializer,
+        session.accept_request(*request_id).unwrap(),
+    );
+
+    let message = RtmpMessage::Amf3Command {
+        command_name: "_checkbw".to_string(),
+        transaction_id: 2.0,
+        command_object: crate::amf3::Amf3Value::Null,
+        additional_arguments: vec![],
+        format: crate::amf::AmfEncoding::Amf0,
+    };
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
+    let packet = serializer.serialize(&payload, false, false).unwrap();
+    let (responses, _) = split_results(
+        &mut deserializer,
+        session.handle_input(&packet.to_vec()[..]).unwrap(),
+    );
+    assert!(
+        matches!(
+            responses.as_slice(),
+            [(_, RtmpMessage::Amf3Command { command_name, transaction_id, .. })]
+                if command_name == "_error" && *transaction_id == 2.0
+        ),
+        "an AMF3 call is refused in AMF3 framing: {responses:?}"
+    );
+}
+
+#[test]
+fn delegated_command_is_answered_by_the_application() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+    session.delegate_command("_checkbw");
+
+    let (responses, events) = send_command(
+        "_checkbw",
+        7.0,
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    assert!(
+        responses.is_empty(),
+        "the session must not answer: {responses:?}"
+    );
+    let request_id = match events.as_slice() {
+        [
+            ServerSessionEvent::CommandRequested {
+                request_id,
+                command_name,
+                stream_id,
+                additional_values,
+                ..
+            },
+        ] if command_name == "_checkbw" && stream_id.get() == 0 => {
+            assert_eq!(
+                additional_values,
+                &vec![Amf0Value::Utf8String(TEST_STREAM_KEY.to_string())]
+            );
+            *request_id
+        }
+        other => panic!("the application must be asked: {other:?}"),
+    };
+
+    let (responses, _) = split_results(
+        &mut deserializer,
+        session
+            .accept_command(request_id, vec![Amf0Value::Number(42.0)])
+            .unwrap(),
+    );
+    match responses.as_slice() {
+        [
+            (
+                raw,
+                RtmpMessage::Amf0Command {
+                    command_name,
+                    transaction_id,
+                    command_object: Amf0Value::Null,
+                    additional_arguments,
+                },
+            ),
+        ] if command_name == "_result" => {
+            assert_eq!(*transaction_id, 7.0);
+            assert_eq!(raw.message_stream_id, 0);
+            assert_eq!(additional_arguments, &vec![Amf0Value::Number(42.0)]);
+        }
+        other => panic!("the application's answer must be sent: {other:?}"),
+    }
+    assert!(matches!(
+        session.accept_command(request_id, vec![]),
+        Err(ServerSessionError::InvalidRequestId)
+    ));
+}
+
+#[test]
+fn delegated_command_can_be_refused_or_accepted_empty() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+    // Delegation also replaces the session's no-op answer.
+    session.delegate_command("FCPublish");
+
+    let request = |transaction_id: f64,
+                   session: &mut ServerSession,
+                   serializer: &mut ChunkEncoder,
+                   deserializer: &mut ContiguousDecoder| {
+        let (responses, events) = send_command(
+            "FCPublish",
+            transaction_id,
+            session,
+            serializer,
+            deserializer,
+        );
+        assert!(responses.is_empty(), "{responses:?}");
+        match events.as_slice() {
+            [ServerSessionEvent::CommandRequested { request_id, .. }] => *request_id,
+            other => panic!("expected CommandRequested, got {other:?}"),
+        }
+    };
+
+    let refused = request(3.0, &mut session, &mut serializer, &mut deserializer);
+    let (responses, _) = split_results(
+        &mut deserializer,
+        session
+            .reject_request(refused, "NetStream.Publish.BadName", "unknown key")
+            .unwrap(),
+    );
+    assert!(is_command(&responses[0].1, "_error"), "{responses:?}");
+    let info = info_of(&responses[0].1);
+    assert_eq!(
+        info.get("code"),
+        Some(&Amf0Value::Utf8String(
+            "NetStream.Publish.BadName".to_string()
+        ))
+    );
+    assert_eq!(
+        info.get("level"),
+        Some(&Amf0Value::Utf8String("error".to_string()))
+    );
+
+    let accepted = request(4.0, &mut session, &mut serializer, &mut deserializer);
+    let (responses, _) =
+        split_results(&mut deserializer, session.accept_request(accepted).unwrap());
+    assert!(
+        matches!(
+            responses.as_slice(),
+            [(_, RtmpMessage::Amf0Command { command_name, transaction_id, additional_arguments, .. })]
+                if command_name == "_result"
+                    && *transaction_id == 4.0
+                    && additional_arguments == &vec![Amf0Value::Undefined]
+        ),
+        "{responses:?}"
+    );
+
+    // A delegated call that expects no answer is not the application's to answer.
+    let (_, events) = send_command(
+        "FCPublish",
+        0.0,
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    assert!(matches!(
+        events.as_slice(),
+        [ServerSessionEvent::UnhandledCommand { .. }]
+    ));
+}
+
+#[test]
+fn delegating_an_implemented_command_has_no_effect() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+    session.delegate_command("createStream");
+    // Still answered by the session with a stream id.
+    create_active_stream(&mut session, &mut serializer, &mut deserializer);
+}
+
+#[test]
+fn server_calls_are_matched_to_their_answers() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    assert!(matches!(
+        session.call("onBWCheck", vec![]),
+        Err(ServerSessionError::NotConnected)
+    ));
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+
+    let (first, results) = session
+        .call("onBWCheck", vec![Amf0Value::Number(1.0)])
+        .unwrap();
     let (responses, _) = split_results(&mut deserializer, results);
+    let sent_id = match responses.as_slice() {
+        [
+            (
+                raw,
+                RtmpMessage::Amf0Command {
+                    command_name,
+                    transaction_id,
+                    command_object: Amf0Value::Null,
+                    additional_arguments,
+                },
+            ),
+        ] if command_name == "onBWCheck" => {
+            assert_eq!(raw.message_stream_id, 0);
+            assert_eq!(additional_arguments, &vec![Amf0Value::Number(1.0)]);
+            *transaction_id
+        }
+        other => panic!("the call must be sent: {other:?}"),
+    };
+    assert_eq!(sent_id, f64::from(first.get()));
+    let (second, results) = session.call("onBWCheck", vec![]).unwrap();
+    consume_results(&mut deserializer, results);
+    assert_ne!(first, second);
 
-    for (_, message) in responses {
-        if let RtmpMessage::Amf0Command { command_name, .. } = message {
-            if command_name == "onBWDone" {
-                assert!(false, "onBWDone message received, but not expected");
+    for (answer, id, accepted) in [("_error", second, false), ("_result", first, true)] {
+        let (responses, events) = send_command(
+            answer,
+            f64::from(id.get()),
+            &mut session,
+            &mut serializer,
+            &mut deserializer,
+        );
+        assert!(
+            responses.is_empty(),
+            "an answer is never answered: {responses:?}"
+        );
+        match events.as_slice() {
+            [
+                ServerSessionEvent::CallAnswered {
+                    call_id,
+                    accepted: was_accepted,
+                    additional_values,
+                    ..
+                },
+            ] => {
+                assert_eq!(*call_id, id);
+                assert_eq!(*was_accepted, accepted);
+                assert_eq!(
+                    additional_values,
+                    &vec![Amf0Value::Utf8String(TEST_STREAM_KEY.to_string())]
+                );
+            }
+            other => panic!("expected CallAnswered for {id}, got {other:?}"),
+        }
+    }
+
+    // A second answer to the same call matches nothing.
+    let (_, events) = send_command(
+        "_result",
+        f64::from(first.get()),
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    assert!(matches!(
+        events.as_slice(),
+        [ServerSessionEvent::UnhandledCommand { .. }]
+    ));
+
+    let (responses, _) = split_results(
+        &mut deserializer,
+        session.notify("onBWDone", vec![]).unwrap(),
+    );
+    assert!(
+        matches!(
+            responses.as_slice(),
+            [(_, RtmpMessage::Amf0Command { command_name, transaction_id, .. })]
+                if command_name == "onBWDone" && *transaction_id == 0.0
+        ),
+        "a notification carries transaction id 0: {responses:?}"
+    );
+}
+
+#[test]
+fn on_bw_done_is_off_by_default() {
+    let (mut deserializer, mut serializer, mut session) = common_setup(&ServerSessionConfig::new());
+    let responses = connect_and_resolve(&mut session, &mut serializer, &mut deserializer, true);
+    assert!(
+        !responses.iter().any(|(_, m)| is_command(m, "onBWDone")),
+        "onBWDone is opt-in: {responses:?}"
+    );
+}
+
+#[test]
+fn a_reply_that_cannot_be_encoded_keeps_the_request() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+    session.delegate_command("_checkbw");
+    let (_, events) = send_command(
+        "_checkbw",
+        3.0,
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    let [ServerSessionEvent::CommandRequested { request_id, .. }] = events.as_slice() else {
+        panic!("expected CommandRequested, got {events:?}");
+    };
+
+    // AMF0 property names are limited to 65535 bytes.
+    let mut unencodable = Amf0Object::new();
+    unencodable.insert("x".repeat(70_000), Amf0Value::Null);
+    assert!(
+        session
+            .accept_command(*request_id, vec![Amf0Value::Object(unencodable)])
+            .is_err()
+    );
+
+    // The client is still waiting, and can still be answered.
+    let (responses, _) = split_results(
+        &mut deserializer,
+        session
+            .reject_request(*request_id, "NetConnection.Call.Failed", "failed")
+            .unwrap(),
+    );
+    assert!(is_command(&responses[0].1, "_error"), "{responses:?}");
+}
+
+#[test]
+fn deleting_a_stream_expires_its_delegated_commands() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+    let stream_id = create_active_stream(&mut session, &mut serializer, &mut deserializer);
+    session.delegate_command("custom");
+
+    let message = RtmpMessage::Amf0Command {
+        command_name: "custom".to_string(),
+        transaction_id: 3.0,
+        command_object: Amf0Value::Null,
+        additional_arguments: vec![],
+    };
+    let payload = message
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
+        .unwrap();
+    let packet = serializer.serialize(&payload, false, false).unwrap();
+    let (_, events) = split_results(
+        &mut deserializer,
+        session.handle_input(&packet.to_vec()[..]).unwrap(),
+    );
+    let [ServerSessionEvent::CommandRequested { request_id, .. }] = events.as_slice() else {
+        panic!("expected CommandRequested, got {events:?}");
+    };
+
+    let message = RtmpMessage::Amf0Command {
+        command_name: "deleteStream".to_string(),
+        transaction_id: 0.0,
+        command_object: Amf0Value::Null,
+        additional_arguments: vec![Amf0Value::Number(stream_id as f64)],
+    };
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
+    let packet = serializer.serialize(&payload, false, false).unwrap();
+    consume_results(
+        &mut deserializer,
+        session.handle_input(&packet.to_vec()[..]).unwrap(),
+    );
+
+    assert!(matches!(
+        session.accept_command(*request_id, vec![]),
+        Err(ServerSessionError::InvalidRequestId)
+    ));
+}
+
+#[test]
+fn requests_and_calls_share_one_limit() {
+    let mut config = get_basic_config();
+    config.session_limits.max_pending_requests = 1;
+    let (mut deserializer, mut serializer, mut session) = common_setup(&config);
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+    session.delegate_command("_checkbw");
+    let (_, events) = send_command(
+        "_checkbw",
+        3.0,
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    assert!(matches!(
+        events.as_slice(),
+        [ServerSessionEvent::CommandRequested { .. }]
+    ));
+
+    assert!(matches!(
+        session.call("onBWCheck", vec![]),
+        Err(ServerSessionError::LimitExceeded(_))
+    ));
+
+    // And the other way round: an unanswered call leaves no room for a
+    // request from the client.
+    let (mut deserializer, mut serializer, mut session) = common_setup(&config);
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+    session.delegate_command("_checkbw");
+    let (_, results) = session.call("onBWCheck", vec![]).unwrap();
+    consume_results(&mut deserializer, results);
+    let message = RtmpMessage::Amf0Command {
+        command_name: "_checkbw".to_string(),
+        transaction_id: 3.0,
+        command_object: Amf0Value::Null,
+        additional_arguments: vec![],
+    };
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
+    let packet = serializer.serialize(&payload, false, false).unwrap();
+    assert!(matches!(
+        session.handle_input(&packet.to_vec()[..]),
+        Err(ServerSessionError::LimitExceeded(_))
+    ));
+}
+
+#[test]
+fn only_a_net_connection_answer_completes_a_call() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+    let stream_id = create_active_stream(&mut session, &mut serializer, &mut deserializer);
+    let (call_id, results) = session.call("onBWCheck", vec![]).unwrap();
+    consume_results(&mut deserializer, results);
+
+    let answer = |message_stream_id: u32,
+                  session: &mut ServerSession,
+                  serializer: &mut ChunkEncoder,
+                  deserializer: &mut ContiguousDecoder| {
+        let message = RtmpMessage::Amf0Command {
+            command_name: "_result".to_string(),
+            transaction_id: f64::from(call_id.get()),
+            command_object: Amf0Value::Null,
+            additional_arguments: vec![],
+        };
+        let payload = message
+            .into_raw_message(RtmpTimestamp::new(0), message_stream_id)
+            .unwrap();
+        let packet = serializer.serialize(&payload, false, false).unwrap();
+        split_results(
+            deserializer,
+            session.handle_input(&packet.to_vec()[..]).unwrap(),
+        )
+        .1
+    };
+
+    let events = answer(stream_id, &mut session, &mut serializer, &mut deserializer);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [ServerSessionEvent::UnhandledCommand { .. }]
+        ),
+        "an answer on a media stream is not the call's: {events:?}"
+    );
+    let events = answer(0, &mut session, &mut serializer, &mut deserializer);
+    assert!(
+        matches!(events.as_slice(), [ServerSessionEvent::CallAnswered { call_id: id, .. }] if *id == call_id),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn delegated_reply_mirrors_the_framing_of_its_request() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    let connect_payload = create_connect_message(TEST_APP_NAME.to_string(), 15, 0, 3.0);
+    let connect_packet = serializer.serialize(&connect_payload, true, false).unwrap();
+    let (_, events) = split_results(
+        &mut deserializer,
+        session.handle_input(&connect_packet.to_vec()[..]).unwrap(),
+    );
+    let [ServerSessionEvent::ConnectionRequested { request_id, .. }] = events.as_slice() else {
+        panic!("connect must be requested: {events:?}");
+    };
+    consume_results(
+        &mut deserializer,
+        session.accept_request(*request_id).unwrap(),
+    );
+    session.delegate_command("custom");
+
+    // An AMF3-framed request...
+    let message = RtmpMessage::Amf3Command {
+        command_name: "custom".to_string(),
+        transaction_id: 2.0,
+        command_object: crate::amf3::Amf3Value::Null,
+        additional_arguments: vec![],
+        format: crate::amf::AmfEncoding::Amf0,
+    };
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
+    let packet = serializer.serialize(&payload, false, false).unwrap();
+    let (_, events) = split_results(
+        &mut deserializer,
+        session.handle_input(&packet.to_vec()[..]).unwrap(),
+    );
+    let [ServerSessionEvent::CommandRequested { request_id, .. }] = events.as_slice() else {
+        panic!("expected CommandRequested, got {events:?}");
+    };
+    // ...then an AMF0 command in between...
+    send_command(
+        "releaseStream",
+        3.0,
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+
+    // ...and the late answer still uses the request's AMF3 framing.
+    let (responses, _) = split_results(
+        &mut deserializer,
+        session.accept_command(*request_id, vec![]).unwrap(),
+    );
+    assert!(
+        matches!(
+            responses.as_slice(),
+            [(_, RtmpMessage::Amf3Command { command_name, transaction_id, .. })]
+                if command_name == "_result" && *transaction_id == 2.0
+        ),
+        "{responses:?}"
+    );
+}
+
+#[test]
+fn control_operations_combine_in_one_event_handler() {
+    // Drives the real pull loop, as an application does, rather than the
+    // draining test adapter.
+    use crate::sessions::{ServerEvent, ServerOutput, ServerSession as Session};
+
+    fn pump(
+        session: &mut Session,
+        mut input: Bytes,
+        decoder: &mut ContiguousDecoder,
+    ) -> Vec<String> {
+        let mut commands = Vec::new();
+        while let Some(output) = session.receive(&mut input).unwrap() {
+            match output {
+                ServerOutput::Packet(packet) => {
+                    let payload = decoder.get_next_message(&packet.to_vec()).unwrap().unwrap();
+                    match payload.to_rtmp_message().unwrap() {
+                        RtmpMessage::SetChunkSize { size } => {
+                            decoder.set_chunk_size(size as usize).unwrap();
+                        }
+                        RtmpMessage::Amf0Command { command_name, .. } => {
+                            commands.push(command_name)
+                        }
+                        _ => {}
+                    }
+                }
+                // Each handler answers and then calls the client straight away.
+                ServerOutput::Event(ServerEvent::ConnectionRequested { request_id, .. }) => {
+                    session.accept_request(request_id).unwrap();
+                    session.notify("onBWDone", vec![]).unwrap();
+                }
+                ServerOutput::Event(ServerEvent::CommandRequested { request_id, .. }) => {
+                    session
+                        .accept_command(request_id, vec![Amf0Value::Undefined])
+                        .unwrap();
+                    session.notify("onFCPublish", vec![]).unwrap();
+                    session.call("onBWCheck", vec![]).unwrap();
+                }
+                _ => {}
             }
         }
+        commands
+    }
+
+    let mut session = Session::new(get_basic_config()).unwrap();
+    session.delegate_command("FCPublish");
+    let mut serializer = ChunkEncoder::new();
+    let mut decoder = ContiguousDecoder::new();
+
+    let connect = create_connect_message(TEST_APP_NAME.to_string(), 15, 0, 0.0);
+    let bytes = Bytes::from(
+        serializer
+            .serialize(&connect, true, false)
+            .unwrap()
+            .to_vec(),
+    );
+    // The test config enables `onBWDone`; the handler's own follows it.
+    assert_eq!(
+        pump(&mut session, bytes, &mut decoder),
+        ["_result", "onBWDone", "onBWDone"]
+    );
+
+    let fc_publish = RtmpMessage::Amf0Command {
+        command_name: "FCPublish".to_string(),
+        transaction_id: 3.0,
+        command_object: Amf0Value::Null,
+        additional_arguments: vec![],
+    }
+    .into_raw_message(RtmpTimestamp::new(0), 0)
+    .unwrap();
+    let bytes = Bytes::from(
+        serializer
+            .serialize(&fc_publish, false, false)
+            .unwrap()
+            .to_vec(),
+    );
+    assert_eq!(
+        pump(&mut session, bytes, &mut decoder),
+        ["_result", "onFCPublish", "onBWCheck"]
+    );
+}
+
+#[test]
+fn control_sent_before_connect_is_readable_and_precedes_the_preamble() {
+    // A fresh decoder, as the client has: nothing has been sent yet.
+    let (_, mut serializer, mut session) = common_basic_setup();
+    let mut deserializer = ContiguousDecoder::new();
+
+    let ping = RtmpMessage::UserControl {
+        event_type: UserControlEventType::PingRequest,
+        timestamp: Some(RtmpTimestamp::new(7)),
+        stream_id: None,
+        buffer_length: None,
+    }
+    .into_raw_message(RtmpTimestamp::new(0), 0)
+    .unwrap();
+    let packet = serializer.serialize(&ping, true, false).unwrap();
+    let (responses, _) = split_results(
+        &mut deserializer,
+        session.handle_input(&packet.to_vec()[..]).unwrap(),
+    );
+    assert!(
+        matches!(
+            responses.as_slice(),
+            [(
+                _,
+                RtmpMessage::UserControl {
+                    event_type: UserControlEventType::PingResponse,
+                    ..
+                }
+            )]
+        ),
+        "{responses:?}"
+    );
+
+    // The preamble and connect result that follow still decode.
+    let responses = connect_and_resolve(&mut session, &mut serializer, &mut deserializer, true);
+    assert!(
+        is_command(&responses.last().unwrap().1, "onBWDone"),
+        "{responses:?}"
+    );
+}
+
+#[test]
+fn a_forgotten_call_frees_its_place() {
+    let mut config = get_basic_config();
+    config.session_limits.max_pending_requests = 1;
+    let (mut deserializer, mut serializer, mut session) = common_setup(&config);
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+
+    let (ignored, results) = session.call("onBWCheck", vec![]).unwrap();
+    consume_results(&mut deserializer, results);
+    assert!(session.forget_call(ignored));
+    assert!(!session.forget_call(ignored), "already forgotten");
+    let (_, results) = session.call("onBWCheck", vec![]).unwrap();
+    consume_results(&mut deserializer, results);
+
+    // A late answer to the forgotten call matches nothing.
+    let (_, events) = send_command(
+        "_result",
+        f64::from(ignored.get()),
+        &mut session,
+        &mut serializer,
+        &mut deserializer,
+    );
+    assert!(matches!(
+        events.as_slice(),
+        [ServerSessionEvent::UnhandledCommand { .. }]
+    ));
+}
+
+#[test]
+fn answers_and_calls_follow_amf3_framing() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    let connect_payload = create_connect_message(TEST_APP_NAME.to_string(), 15, 0, 3.0);
+    let connect_packet = serializer.serialize(&connect_payload, true, false).unwrap();
+    let (_, events) = split_results(
+        &mut deserializer,
+        session.handle_input(&connect_packet.to_vec()[..]).unwrap(),
+    );
+    let [ServerSessionEvent::ConnectionRequested { request_id, .. }] = events.as_slice() else {
+        panic!("connect must be requested: {events:?}");
+    };
+    consume_results(
+        &mut deserializer,
+        session.accept_request(*request_id).unwrap(),
+    );
+
+    // An AMF3-framed no-op is answered in AMF3...
+    let message = RtmpMessage::Amf3Command {
+        command_name: "releaseStream".to_string(),
+        transaction_id: 2.0,
+        command_object: crate::amf3::Amf3Value::Null,
+        additional_arguments: vec![],
+        format: crate::amf::AmfEncoding::Amf0,
+    };
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
+    let packet = serializer.serialize(&payload, false, false).unwrap();
+    let (responses, _) = split_results(
+        &mut deserializer,
+        session.handle_input(&packet.to_vec()[..]).unwrap(),
+    );
+    assert!(
+        matches!(
+            responses.as_slice(),
+            [(_, RtmpMessage::Amf3Command { command_name, transaction_id, .. })]
+                if command_name == "_result" && *transaction_id == 2.0
+        ),
+        "{responses:?}"
+    );
+
+    // ...and once the peer frames in AMF3, the server's own calls do too.
+    let (_, results) = session.call("onBWCheck", vec![]).unwrap();
+    let (call, _) = split_results(&mut deserializer, results);
+    let (notification, _) = split_results(
+        &mut deserializer,
+        session.notify("onBWDone", vec![]).unwrap(),
+    );
+    for (name, responses) in [("onBWCheck", call), ("onBWDone", notification)] {
+        assert!(
+            matches!(
+                responses.as_slice(),
+                [(_, RtmpMessage::Amf3Command { command_name, .. })] if command_name == name
+            ),
+            "{name}: {responses:?}"
+        );
+    }
+}
+
+#[test]
+fn a_connect_answer_that_cannot_be_encoded_changes_nothing() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    let connect_payload = create_connect_message(TEST_APP_NAME.to_string(), 15, 0, 0.0);
+    let connect_packet = serializer.serialize(&connect_payload, true, false).unwrap();
+    let (_, events) = split_results(
+        &mut deserializer,
+        session.handle_input(&connect_packet.to_vec()[..]).unwrap(),
+    );
+    let [ServerSessionEvent::ConnectionRequested { request_id, .. }] = events.as_slice() else {
+        panic!("connect must be requested: {events:?}");
+    };
+
+    // AMF0 property names are limited to 65535 bytes.
+    let mut unencodable = Amf0Object::new();
+    unencodable.insert("x".repeat(70_000), Amf0Value::Null);
+    assert!(
+        session
+            .accept_request_with_properties(*request_id, unencodable)
+            .is_err()
+    );
+    assert!(
+        matches!(
+            session.call("onBWCheck", vec![]),
+            Err(ServerSessionError::NotConnected)
+        ),
+        "a failed accept must not connect the session"
+    );
+
+    // The request is still outstanding, and its answer still decodes: the
+    // preamble was not used up by the failed attempt.
+    let (responses, _) = split_results(
+        &mut deserializer,
+        session.accept_request(*request_id).unwrap(),
+    );
+    let kinds: Vec<bool> = responses
+        .iter()
+        .map(|(_, message)| is_command(message, "_result"))
+        .collect();
+    assert_eq!(
+        kinds,
+        [false, false, false, false, true, false],
+        "{responses:?}"
+    );
+}
+
+#[test]
+fn unanswered_server_calls_are_bounded() {
+    let mut config = get_basic_config();
+    config.session_limits.max_pending_requests = 2;
+    let (mut deserializer, mut serializer, mut session) = common_setup(&config);
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+
+    for _ in 0..2 {
+        let (_, results) = session.call("onBWCheck", vec![]).unwrap();
+        consume_results(&mut deserializer, results);
+    }
+    assert!(matches!(
+        session.call("onBWCheck", vec![]),
+        Err(ServerSessionError::LimitExceeded(_))
+    ));
+}
+
+#[test]
+fn refusal_echoes_a_bounded_part_of_the_name() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+
+    let name = "x".repeat(10_000);
+    let (responses, _) = send_command(&name, 2.0, &mut session, &mut serializer, &mut deserializer);
+    // The long command crosses the acknowledgement window, so an
+    // `Acknowledgement` can precede the refusal.
+    let refusal = responses
+        .iter()
+        .find(|(_, m)| is_command(m, "_error"))
+        .expect("the call must be refused");
+    let Some(Amf0Value::Utf8String(description)) = info_of(&refusal.1).get("description") else {
+        panic!("the refusal needs a description: {responses:?}");
+    };
+    assert_eq!(
+        description,
+        &format!("Method not found ({}).", "x".repeat(64))
+    );
+}
+
+#[test]
+fn commands_that_expect_no_answer_get_none() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+    perform_connection("some_app", &mut session, &mut serializer, &mut deserializer);
+
+    // Transaction 0 asks for no answer, and `_result`/`_error` from the
+    // client are answers, not requests.
+    for (name, transaction_id) in [
+        ("releaseStream", 0.0),
+        ("_checkbw", 0.0),
+        ("_result", 9.0),
+        ("_error", 9.0),
+    ] {
+        let (responses, events) = send_command(
+            name,
+            transaction_id,
+            &mut session,
+            &mut serializer,
+            &mut deserializer,
+        );
+        assert!(
+            responses.is_empty(),
+            "{name} ({transaction_id}) must not be answered: {responses:?}"
+        );
+        assert_eq!(events.len(), 1, "{name} must still surface: {events:?}");
+    }
+}
+
+#[test]
+fn nothing_is_answered_before_connect() {
+    let (mut deserializer, mut serializer, mut session) = common_basic_setup();
+
+    for name in ["FCPublish", "_checkbw"] {
+        let (responses, events) =
+            send_command(name, 3.0, &mut session, &mut serializer, &mut deserializer);
+        assert!(
+            responses.is_empty(),
+            "{name} is not answered before connect: {responses:?}"
+        );
+        assert_eq!(events.len(), 1, "{name} must still surface: {events:?}");
     }
 }
 
@@ -71,7 +1158,9 @@ fn can_accept_connection_request() {
     );
 
     let (responses, _) = split_results(&mut deserializer, accept_results);
-    match responses[responses.len() - 1] {
+    // `onBWDone` follows the connect result, once the connection exists.
+    assert_is_on_bw_done(&responses[responses.len() - 1].1);
+    match responses[responses.len() - 2] {
         (
             _,
             RtmpMessage::Amf0Command {
@@ -234,7 +1323,9 @@ fn accepted_connection_responds_with_same_object_encoding_value_as_connection_re
     );
 
     let (responses, _) = split_results(&mut deserializer, accept_results);
-    match responses[responses.len() - 1] {
+    // `onBWDone` follows the connect result, once the connection exists.
+    assert_is_on_bw_done(&responses[responses.len() - 1].1);
+    match responses[responses.len() - 2] {
         (
             _,
             RtmpMessage::Amf0Command {
@@ -393,7 +1484,7 @@ fn can_accept_live_publishing_to_requested_stream_key() {
 
     match responses.remove(0) {
         (
-            _,
+            raw,
             RtmpMessage::UserControl {
                 event_type: UserControlEventType::StreamBegin,
                 stream_id: Some(received_stream_id),
@@ -404,6 +1495,10 @@ fn can_accept_live_publishing_to_requested_stream_key() {
             assert_eq!(
                 received_stream_id, stream_id,
                 "Stream begin did not contain the expected stream id"
+            );
+            assert_eq!(
+                raw.message_stream_id, 0,
+                "User Control messages travel on message stream 0"
             );
         }
 
@@ -930,11 +2025,18 @@ fn can_accept_play_command_with_no_optional_parameters_to_requested_stream_key()
     let (mut responses, _) = split_results(&mut deserializer, accept_results);
     assert_eq!(responses.len(), 5, "Unexpected number of messages received");
 
-    verify_is_onstatus(&responses.remove(0).1, "status", "NetStream.Play.Reset");
+    let (raw, reset) = responses.remove(0);
+    // The reset is serialized first because it is sent first; out of order,
+    // its compressed header would inherit the wrong message stream.
+    assert_eq!(
+        raw.message_stream_id, stream_id,
+        "the reset belongs to the stream"
+    );
+    verify_is_onstatus(&reset, "status", "NetStream.Play.Reset");
 
     match responses.remove(0) {
         (
-            _,
+            raw,
             RtmpMessage::UserControl {
                 event_type,
                 stream_id: sid,
@@ -950,9 +2052,13 @@ fn can_accept_play_command_with_no_optional_parameters_to_requested_stream_key()
             assert_eq!(sid, Some(stream_id), "Unexpected user control stream id");
             assert_eq!(buffer_length, None, "Unexpected user control buffer length");
             assert_eq!(timestamp, None, "Unexpected user control timestamp");
+            assert_eq!(
+                raw.message_stream_id, 0,
+                "User Control messages travel on message stream 0"
+            );
         }
 
-        x => println!("Expected stream begin message, instead received: {:?}", x),
+        x => panic!("Expected stream begin message, instead received: {:?}", x),
     }
 
     verify_is_onstatus(&responses.remove(0).1, "status", "NetStream.Play.Start");
@@ -2050,6 +3156,76 @@ fn start_playing(
 
     let accept_results = session.accept_request(request_id).unwrap();
     consume_results(deserializer, accept_results);
+}
+
+/// The info object of a command reply.
+fn info_of(message: &RtmpMessage) -> &Amf0Object {
+    match message {
+        RtmpMessage::Amf0Command {
+            additional_arguments,
+            ..
+        } => match additional_arguments.as_slice() {
+            [Amf0Value::Object(info)] => info,
+            other => panic!("expected one info object, got {other:?}"),
+        },
+        other => panic!("expected an AMF0 command, got {other:?}"),
+    }
+}
+
+fn is_command(message: &RtmpMessage, name: &str) -> bool {
+    matches!(message, RtmpMessage::Amf0Command { command_name, .. } if command_name == name)
+}
+
+fn assert_is_on_bw_done(message: &RtmpMessage) {
+    assert!(
+        is_command(message, "onBWDone"),
+        "expected onBWDone, got {message:?}"
+    );
+}
+
+/// Send `connect`, then accept or reject it, and return what the server sent.
+fn connect_and_resolve(
+    session: &mut ServerSession,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
+    accept: bool,
+) -> Vec<(RawMessage, RtmpMessage)> {
+    let connect_payload = create_connect_message(TEST_APP_NAME.to_string(), 15, 0, 0.0);
+    let connect_packet = serializer.serialize(&connect_payload, true, false).unwrap();
+    let results = session.handle_input(&connect_packet.to_vec()[..]).unwrap();
+    let (_, events) = split_results(deserializer, results);
+    let request_id = match events.as_slice() {
+        [ServerSessionEvent::ConnectionRequested { request_id, .. }] => *request_id,
+        other => panic!("connect must be requested, got {other:?}"),
+    };
+    let results = if accept {
+        session.accept_request(request_id).unwrap()
+    } else {
+        session
+            .reject_request(request_id, "NetConnection.Connect.Rejected", "refused")
+            .unwrap()
+    };
+    split_results(deserializer, results).0
+}
+
+/// Send a command with the stream key as its argument on stream 0.
+fn send_command(
+    name: &str,
+    transaction_id: f64,
+    session: &mut ServerSession,
+    serializer: &mut ChunkEncoder,
+    deserializer: &mut ContiguousDecoder,
+) -> (Vec<(RawMessage, RtmpMessage)>, Vec<ServerSessionEvent>) {
+    let message = RtmpMessage::Amf0Command {
+        command_name: name.to_string(),
+        transaction_id,
+        command_object: Amf0Value::Null,
+        additional_arguments: vec![Amf0Value::Utf8String(TEST_STREAM_KEY.to_string())],
+    };
+    let payload = message.into_raw_message(RtmpTimestamp::new(0), 0).unwrap();
+    let packet = serializer.serialize(&payload, false, false).unwrap();
+    let results = session.handle_input(&packet.to_vec()[..]).unwrap();
+    split_results(deserializer, results)
 }
 
 fn verify_is_onstatus(subject: &RtmpMessage, expected_status: &str, expected_code: &str) {

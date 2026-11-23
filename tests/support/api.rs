@@ -173,6 +173,34 @@ pub mod sessions {
             self.0.reject_request(id, code, description)?;
             self.drain()
         }
+        pub fn delegate_command(&mut self, name: &str) {
+            self.0.delegate_command(name);
+        }
+        pub fn accept_command(
+            &mut self,
+            id: RequestId,
+            values: Vec<rtmpx::amf0::Amf0Value>,
+        ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+            self.0.accept_command(id, values)?;
+            self.drain()
+        }
+        pub fn call(
+            &mut self,
+            name: &str,
+            arguments: Vec<rtmpx::amf0::Amf0Value>,
+        ) -> Result<(rtmpx::sessions::CallId, Vec<ServerSessionResult>), ServerSessionError>
+        {
+            let id = self.0.call(name, arguments)?;
+            Ok((id, self.drain()?))
+        }
+        pub fn notify(
+            &mut self,
+            name: &str,
+            arguments: Vec<rtmpx::amf0::Amf0Value>,
+        ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+            self.0.notify(name, arguments)?;
+            self.drain()
+        }
         pub fn send_video_data(
             &mut self,
             id: StreamId,

@@ -8,6 +8,12 @@ pub struct ServerSessionConfig {
     pub chunk_size: u32,
     pub peer_bandwidth: u32,
     pub window_ack_size: u32,
+    /// Call `onBWDone` on the client after accepting `connect`. Off by default.
+    ///
+    /// `onBWDone` is not part of RTMP 1.0. It reports a finished bandwidth
+    /// check, and librtmp and FFmpeg answer it by calling `_checkbw`, which
+    /// the session refuses unless the application implements it with
+    /// [`ServerSession::delegate_command`](super::ServerSession::delegate_command).
     pub send_on_bw_done_message_on_start: bool,
     /// Highest `objectEncoding` this server will agree to during `connect`.
     ///
@@ -36,7 +42,7 @@ impl ServerSessionConfig {
             peer_bandwidth: 2_500_000,
             window_ack_size: 1_073_741_824,
             chunk_size: 4096,
-            send_on_bw_done_message_on_start: true,
+            send_on_bw_done_message_on_start: false,
             max_object_encoding: AmfEncoding::Amf3,
             payload_pool: None,
             decoder_limits: DecoderLimits::default(),

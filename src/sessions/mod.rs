@@ -134,7 +134,7 @@ impl StreamMetadata {
 mod data;
 mod ids;
 pub use data::{DataMessage, DataMessageType};
-pub use ids::{RequestId, StreamId};
+pub use ids::{CallId, RequestId, StreamId};
 
 pub use client::CommandStatus;
 
