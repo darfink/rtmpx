@@ -1,6 +1,6 @@
 use super::PublishMode;
 use crate::amf0::Amf0Value;
-use crate::sessions::{DataMessage, RequestId, StreamHandle, StreamId};
+use crate::sessions::{CallId, DataMessage, RequestId, StreamHandle, StreamId};
 use crate::time::RtmpTimestamp;
 use std::sync::Arc;
 
@@ -38,13 +38,6 @@ pub enum ServerEvent<D = crate::Payload> {
         /// info maps) - so it can forward the publisher's capabilities to the
         /// backend instead of silently downgrading the negotiation.
         additional_properties: crate::amf0::Amf0Object,
-    },
-
-    /// The client is requesting a stream key be released for use.
-    ReleaseStreamRequested {
-        request_id: RequestId,
-        app_name: Arc<str>,
-        stream_key: Arc<str>,
     },
 
     /// The client is requesting the ability to publish on the specified stream key,
@@ -98,11 +91,57 @@ pub enum ServerEvent<D = crate::Payload> {
         timestamp: RtmpTimestamp,
     },
 
-    /// The client sent a command that the session could not handle
+    /// The client sent a command the session does not implement, and no
+    /// answer from the application is needed.
+    ///
+    /// This is informational. The session has already done what RTMP 1.0
+    /// requires: commands in
+    /// [`ServerSession::NO_OP_COMMANDS`](super::ServerSession::NO_OP_COMMANDS)
+    /// were answered with `_result`. Nothing is answered for transaction id 0,
+    /// for a `_result`/`_error` that matches no
+    /// [`call`](super::ServerSession::call), or before `connect` is accepted.
+    /// Commands the session refuses raise [`ServerEvent::CommandRefused`]
+    /// instead.
     UnhandledCommand {
         stream_id: StreamId,
         command_name: String,
         transaction_id: f64,
+        command_object: Amf0Value,
+        additional_values: Vec<Amf0Value>,
+    },
+
+    /// The client called a method the session does not implement, and the
+    /// session refused it with `_error` (`NetConnection.Call.Failed`).
+    ///
+    /// Informational. To answer such a method in the application instead, see
+    /// [`ServerSession::delegate_command`](super::ServerSession::delegate_command).
+    CommandRefused {
+        stream_id: StreamId,
+        command_name: String,
+        transaction_id: f64,
+    },
+
+    /// The client called a method delegated to the application with
+    /// [`ServerSession::delegate_command`](super::ServerSession::delegate_command).
+    ///
+    /// The client waits for an answer: accept it with
+    /// [`ServerSession::accept_command`](super::ServerSession::accept_command)
+    /// or [`ServerSession::accept_request`](super::ServerSession::accept_request),
+    /// or refuse it with
+    /// [`ServerSession::reject_request`](super::ServerSession::reject_request).
+    CommandRequested {
+        request_id: RequestId,
+        stream_id: StreamId,
+        command_name: String,
+        command_object: Amf0Value,
+        additional_values: Vec<Amf0Value>,
+    },
+
+    /// The client answered a [`ServerSession::call`](super::ServerSession::call).
+    CallAnswered {
+        call_id: CallId,
+        /// `true` for `_result`, `false` for `_error`.
+        accepted: bool,
         command_object: Amf0Value,
         additional_values: Vec<Amf0Value>,
     },
@@ -150,14 +189,38 @@ impl<D> ServerEvent<D> {
                 app_name,
                 additional_properties,
             },
-            Self::ReleaseStreamRequested {
+            Self::CommandRefused {
+                stream_id,
+                command_name,
+                transaction_id,
+            } => ServerEvent::CommandRefused {
+                stream_id,
+                command_name,
+                transaction_id,
+            },
+            Self::CommandRequested {
                 request_id,
-                app_name,
-                stream_key,
-            } => ServerEvent::ReleaseStreamRequested {
+                stream_id,
+                command_name,
+                command_object,
+                additional_values,
+            } => ServerEvent::CommandRequested {
                 request_id,
-                app_name,
-                stream_key,
+                stream_id,
+                command_name,
+                command_object,
+                additional_values,
+            },
+            Self::CallAnswered {
+                call_id,
+                accepted,
+                command_object,
+                additional_values,
+            } => ServerEvent::CallAnswered {
+                call_id,
+                accepted,
+                command_object,
+                additional_values,
             },
             Self::PublishStreamRequested {
                 stream,

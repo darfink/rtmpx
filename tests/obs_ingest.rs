@@ -6,10 +6,12 @@
 //! `connect` (FMLE-style `flashVer`, `tcUrl`, capabilities) ->
 //! `releaseStream` -> `FCPublish` -> `createStream` -> `publish` ->
 //! `@setDataFrame onMetaData` -> audio/video -> `FCUnpublish` ->
-//! `deleteStream`. `releaseStream`/`FCPublish`/`FCUnpublish` have no RTMP
-//! semantics on our side; they must surface as `UnhandledCommand`
-//! and leave the session usable, exactly as the live ffmpeg leg already
-//! proves for ffmpeg's own `releaseStream`/`FCPublish`.
+//! `deleteStream`. `releaseStream`/`FCPublish`/`FCUnpublish` are not RTMP 1.0
+//! commands and carry no state on our side. The session answers each with a
+//! no-op `_result`, because a call with a transaction id expects an answer,
+//! and still surfaces them as `UnhandledCommand`.
+//! The session must stay usable, as the live ffmpeg leg already proves for
+//! ffmpeg's own `releaseStream`/`FCPublish`.
 //!
 //! No network, no binaries: raw chunk bytes in-process, mirroring
 //! `tests/data_events.rs`.
@@ -202,11 +204,11 @@ fn obs_connect_sequence_ingests_media() {
     );
 
     // releaseStream + FCPublish: OBS sends both before createStream.
-    // They carry no server-side semantics; the session must surface them
-    // as unhandleable and stay usable — never error, never drop the peer.
+    // They carry no server-side state. The session answers each with a
+    // `_result` for its transaction, surfaces it, and stays usable.
     let key = "obs-quirk-key";
     for (name, tid) in [("releaseStream", 2.0), ("FCPublish", 3.0)] {
-        let (_, events) = send_to_server(
+        let (responses, events) = send_to_server(
             &mut session,
             &mut serializer,
             &mut deserializer,
@@ -218,6 +220,10 @@ fn obs_connect_sequence_ingests_media() {
         assert!(
             events.iter().any(|e| matches!(e, ServerSessionEvent::UnhandledCommand { command_name, .. } if command_name == name)),
             "{name} must surface as UnhandledCommand, saw {events:?}"
+        );
+        assert!(
+            responses.iter().any(|m| matches!(m, RtmpMessage::Amf0Command { command_name, transaction_id, .. } if command_name == "_result" && *transaction_id == tid)),
+            "{name} must be answered with _result for transaction {tid}, saw {responses:?}"
         );
     }
 
@@ -340,7 +346,7 @@ fn obs_connect_sequence_ingests_media() {
     );
 
     // Teardown quirks must not error either.
-    let (_, events) = send_to_server(
+    let (responses, events) = send_to_server(
         &mut session,
         &mut serializer,
         &mut deserializer,
@@ -353,7 +359,11 @@ fn obs_connect_sequence_ingests_media() {
         0,
         false,
     );
-    assert!(events.iter().any(|e| matches!(e, ServerSessionEvent::UnhandledCommand { command_name, .. } if command_name == "FCUnpublish")), "FCUnpublish must be unhandleable-but-harmless, saw {events:?}");
+    assert!(events.iter().any(|e| matches!(e, ServerSessionEvent::UnhandledCommand { command_name, .. } if command_name == "FCUnpublish")), "FCUnpublish must surface and stay harmless, saw {events:?}");
+    assert!(
+        responses.iter().any(|m| matches!(m, RtmpMessage::Amf0Command { command_name, transaction_id, .. } if command_name == "_result" && *transaction_id == 6.0)),
+        "FCUnpublish must be answered with _result, saw {responses:?}"
+    );
     let (_, events) = send_to_server(
         &mut session,
         &mut serializer,

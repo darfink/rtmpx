@@ -107,9 +107,6 @@ async fn write_server_results(
                 ServerSessionEvent::VideoDataReceived { data, .. } => {
                     collected.video.push(data.to_vec());
                 }
-                ServerSessionEvent::ReleaseStreamRequested { .. } => {
-                    // Informational only: no outstanding request to accept.
-                }
                 other => {
                     // `FCUnpublish` on clean EOS lands here: tolerated, like OBS.
                     eprintln!("gstreamer harness: ignoring gstreamer event: {other:?}");

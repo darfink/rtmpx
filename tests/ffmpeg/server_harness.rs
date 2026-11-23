@@ -88,9 +88,6 @@ async fn write_server_results(
                 ServerSessionEvent::VideoDataReceived { data, .. } => {
                     collected.video.push(data.to_vec());
                 }
-                ServerSessionEvent::ReleaseStreamRequested { .. } => {
-                    // Informational only: no outstanding request to accept.
-                }
                 other => {
                     eprintln!("ffmpeg harness: ignoring ffmpeg event: {other:?}");
                 }

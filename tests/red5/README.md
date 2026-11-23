@@ -74,7 +74,7 @@ These tests run on every `cargo test` and cover contracts that third-party live 
 | --- | --- | --- |
 | `tests/amf3_loopback.rs` | AMF3 client publishing to `ServerSession` mirrors framing (`objectEncoding 3` without premature type-15/17) | FFmpeg and OBS are AMF0-only, and Red5 does not publish *to* us |
 | `tests/enhanced_loopback.rs` | Byte-exact two-session relay of `hvc1` (AMF0) and `av01` (AMF3) alongside legacy media | Red5 lacks an Enhanced relay path |
-| `tests/obs_ingest.rs` | OBS `connect -> releaseStream -> FCPublish -> createStream -> publish -> onMetaData -> A/V -> FCUnpublish -> deleteStream` | Verifies OBS-specific command quirks surface cleanly as `UnhandledCommand` |
+| `tests/obs_ingest.rs` | OBS `connect -> releaseStream -> FCPublish -> createStream -> publish -> onMetaData -> A/V -> FCUnpublish -> deleteStream` | Verifies OBS setup commands are answered with `_result` and surface as `UnhandledCommand` |
 | `tests/session_quirks.rs` | Extended timestamps past `0xFFFFFF`, GStreamer string `deleteStream`, and command-specific `_error` / `onStatus` refusal shapes | Avoids 4.6-hour live runs and tests edge-case error framing directly |
 
 ## Manual OBS probe

@@ -9,7 +9,7 @@ Create `ClientSession::new(config)` or `ServerSession::new(config)` once the RTM
 Control and request-decision methods return `Result<()>` and queue their outbound packets inside the session:
 
 - **Client:** `connect`, `connect_with_properties`, `delete_stream`
-- **Server:** `accept_request`, `accept_request_with_properties`, `reject_request`
+- **Server:** `accept_request`, `accept_request_with_properties`, `reject_request`, `accept_command`, `call`, `notify`
 
 Both sessions drive progress through a single pull method, `receive(&mut Bytes) -> Result<Option<Output>, Error>`, yielding `ClientOutput` or `ServerOutput`:
 

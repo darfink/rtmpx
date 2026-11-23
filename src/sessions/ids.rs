@@ -37,6 +37,25 @@ impl std::fmt::Display for StreamId {
         self.0.fmt(f)
     }
 }
+/// Identifies a call the server made with
+/// [`ServerSession::call`](crate::sessions::ServerSession::call), so its answer
+/// can be matched in [`ServerEvent::CallAnswered`](crate::sessions::ServerEvent::CallAnswered).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct CallId(pub(crate) u32);
+
+impl CallId {
+    /// The transaction id the call was sent with.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CallId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl std::fmt::Display for RequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
