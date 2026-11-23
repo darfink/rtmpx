@@ -43,6 +43,10 @@ ffmpeg-live = []
 #   cargo test --test gstreamer --features gstreamer-live
 gstreamer-live = []
 
+# Opt-in live interop suite against real OBS Studio (Linux, needs a display).
+#   xvfb-run -a cargo test --test obs --features obs-live
+obs-live = []
+
 [[test]]
 name = "red5"
 path = "tests/red5/main.rs"
@@ -57,3 +61,8 @@ required-features = ["ffmpeg-live"]
 name = "gstreamer"
 path = "tests/gstreamer/main.rs"
 required-features = ["gstreamer-live"]
+
+[[test]]
+name = "obs"
+path = "tests/obs/main.rs"
+required-features = ["obs-live"]

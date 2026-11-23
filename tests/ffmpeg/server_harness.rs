@@ -28,6 +28,9 @@ pub struct IngestedMedia {
     pub audio: Vec<Vec<u8>>,
     pub video: Vec<Vec<u8>>,
     pub negotiated: AmfEncoding,
+    /// Commands the session refused with `_error`. An encoder that works must
+    /// never need one refused.
+    pub refused: Vec<String>,
 }
 
 pub async fn ffmpeg_available() -> bool {
@@ -87,6 +90,9 @@ async fn write_server_results(
                 }
                 ServerSessionEvent::VideoDataReceived { data, .. } => {
                     collected.video.push(data.to_vec());
+                }
+                ServerSessionEvent::CommandRefused { command_name, .. } => {
+                    collected.refused.push(command_name);
                 }
                 other => {
                     eprintln!("ffmpeg harness: ignoring ffmpeg event: {other:?}");
@@ -225,6 +231,7 @@ pub async fn ingest_from_ffmpeg(stream_key: &str, wall_clock: Duration) -> Resul
             audio: Vec::new(),
             video: Vec::new(),
             negotiated: AmfEncoding::Amf0,
+            refused: Vec::new(),
         };
         if !carry.is_empty() {
             let results = session
@@ -346,6 +353,7 @@ pub async fn ingest_enhanced_from_ffmpeg(
             audio: Vec::new(),
             video: Vec::new(),
             negotiated: AmfEncoding::Amf0,
+            refused: Vec::new(),
         };
         if !carry.is_empty() {
             let results = session.handle_input(&carry).map_err(|e| format!("ffmpeg sent unreadable RTMP: {e:?}"))?;
@@ -618,6 +626,7 @@ pub async fn relay_our_publish_to_ffmpeg(
             audio: Vec::new(),
             video: Vec::new(),
             negotiated: AmfEncoding::Amf0,
+            refused: Vec::new(),
         };
         if !carry.is_empty() {
             let results = session

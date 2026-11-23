@@ -27,6 +27,11 @@ async fn ffmpeg_ingest_body() -> Result<()> {
     }
     let key = stream_key("ffmpeg");
     let got = server_harness::ingest_from_ffmpeg(&key, Duration::from_secs(60)).await?;
+    assert!(
+        got.refused.is_empty(),
+        "ffmpeg must not need any command refused, refused {:?}",
+        got.refused
+    );
     assert_eq!(got.app, "live", "ffmpeg must land on the live app");
     assert_eq!(got.stream_key, key, "stream key must survive ingest");
     assert!(
@@ -80,6 +85,11 @@ async fn ffmpeg_enhanced_ingest_body() -> Result<()> {
     }
     let key = stream_key("ffmpeg-hvc1");
     let got = server_harness::ingest_enhanced_from_ffmpeg(&key, Duration::from_secs(60)).await?;
+    assert!(
+        got.refused.is_empty(),
+        "ffmpeg must not need any command refused, refused {:?}",
+        got.refused
+    );
     assert_eq!(got.app, "live", "ffmpeg must land on the live app");
     assert_eq!(
         got.stream_key, key,

@@ -27,7 +27,8 @@ rtmpx/
       mod.rs
       driver.rs
     ffmpeg/                   # opt-in FFmpeg/ffprobe server interop (`--features ffmpeg-live`)
-    gstreamer/                # opt-in GStreamer server interop (`--features gstreamer-live`)
+    gstreamer/                # opt-in GStreamer server interop, rtmpsink and rtmp2sink (`--features gstreamer-live`)
+    obs/                      # opt-in OBS Studio server interop, Linux only (`--features obs-live`)
     red5/
       README.md               # this file
       red5.dockerfile         # pinned Red5 2.0.40 image (built from release tarball)

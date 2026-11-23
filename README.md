@@ -125,8 +125,9 @@ Opt-in interoperability suites test against independent implementations:
 
 - **[Red5](tests/red5/README.md)** (`--test red5 --features red5-live`): AMF0/AMF3 publish and playback, including publish → delete → play → delete → publish on a single connection.
 - **FFmpeg** (`--test ffmpeg --features ffmpeg-live`): Legacy AVC/AAC and Enhanced HEVC ingest plus relay playback verified with `ffprobe`.
-- **GStreamer** (`--test gstreamer --features gstreamer-live`): Connect properties, chunking, repeated metadata, and teardown.
-- **OBS**: Automated connect-sequence tests plus a manual live probe (`examples/obs_ingest_probe.rs`).
+- **GStreamer** (`--test gstreamer --features gstreamer-live`): Connect properties, chunking, repeated metadata, and teardown, through both `rtmpsink` (librtmp) and `rtmp2sink` (GStreamer's own client).
+- **OBS** (`--test obs --features obs-live`, Linux under `xvfb-run`): Real OBS Studio streaming to the server from a throwaway profile, plus a manual live probe (`examples/obs_ingest_probe.rs`).
+- Every encoder leg fails if the server refuses any command the encoder sends.
 
 ## License
 
